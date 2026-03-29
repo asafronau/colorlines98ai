@@ -129,8 +129,37 @@ class TestBuildObsBoardsOnly:
                     else:
                         assert obs[b, v - 1, r, c] == 1.0
 
-    def test_next_ball_channels_zero(self, dataset):
-        """Afterstate obs should have zero next_ball channels (8-11)."""
+    def test_boards_only_has_no_next_balls(self, dataset):
+        """_build_obs_boards_only should have zero next_ball channels."""
         boards = dataset.good_boards[:4]
         obs = dataset._build_obs_boards_only(boards)
         assert obs[:, 8:12].abs().sum() == 0.0
+
+
+class TestAfterStateNextBalls:
+    """Verify collate_pairwise includes next_balls in afterstate obs."""
+
+    @pytest.fixture
+    def dataset(self):
+        import os
+        path = 'alphatrain/data/alphatrain_pairwise.pt'
+        if not os.path.exists(path):
+            pytest.skip("Pairwise tensor file not available")
+        from alphatrain.dataset import TensorDatasetGPU
+        return TensorDatasetGPU(path, augment=True, device='cpu')
+
+    def test_afterstate_has_next_balls(self, dataset):
+        """Afterstate obs from collate_pairwise must have next_balls (ch 8-11)."""
+        indices = list(range(32))
+        _, _, _, good_obs, bad_obs, _ = dataset.collate_pairwise(indices)
+        assert good_obs[:, 8:12].abs().sum() > 0, \
+            "Afterstate good_obs missing next_balls"
+        assert bad_obs[:, 8:12].abs().sum() > 0, \
+            "Afterstate bad_obs missing next_balls"
+
+    def test_good_bad_share_next_balls(self, dataset):
+        """Good and bad afterstates from same parent must have same next_balls."""
+        indices = list(range(32))
+        _, _, _, good_obs, bad_obs, _ = dataset.collate_pairwise(indices)
+        assert torch.allclose(good_obs[:, 8:12], bad_obs[:, 8:12]), \
+            "Good/bad afterstates should share next_balls from same parent"
