@@ -214,10 +214,21 @@ def main():
         # Strip torch.compile prefix if present in checkpoint
         if any(k.startswith('_orig_mod.') for k in state):
             state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
-        # strict=False allows mismatched value_fc2 (e.g., 64 bins → 1 scalar)
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        # Filter out size-mismatched keys (e.g., value_fc2: 64 bins → 1 scalar)
+        model_state = model.state_dict()
+        filtered = {}
+        skipped = []
+        for k, v in state.items():
+            if k in model_state and v.shape == model_state[k].shape:
+                filtered[k] = v
+            else:
+                skipped.append(k)
+        missing, _ = model.load_state_dict(filtered, strict=False)
+        if skipped:
+            print(f"  Skipped (shape mismatch): {skipped}", flush=True)
         if missing:
-            print(f"  Randomly initialized: {missing}", flush=True)
+            print(f"  Randomly initialized: {[k for k in missing if k not in skipped]}",
+                  flush=True)
         if not args.warm_start and 'optimizer' in ckpt:
             start_epoch = ckpt['epoch'] + 1
             best_val = ckpt.get('best_val_loss', float('inf'))

@@ -121,3 +121,58 @@ class TestFP16:
         x = torch.randn(2, 18, 9, 9).to(memory_format=torch.channels_last)
         policy, value = model(x)
         assert policy.shape == (2, NUM_MOVES)
+
+
+class TestScalarValueHead:
+    def test_scalar_construction(self):
+        model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1)
+        assert model.num_value_bins == 1
+        assert model.value_fc2.weight.shape == (1, 256)
+
+    def test_scalar_forward(self):
+        model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1)
+        x = torch.randn(4, 18, 9, 9)
+        pol, val = model(x)
+        assert pol.shape == (4, NUM_MOVES)
+        assert val.shape == (4, 1)
+
+    def test_scalar_predict_value(self):
+        model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1)
+        x = torch.randn(4, 18, 9, 9)
+        _, val = model(x)
+        scalar = model.predict_value(val)
+        assert scalar.shape == (4,)
+
+    def test_warm_start_categorical_to_scalar(self):
+        """Loading categorical checkpoint into scalar model must not crash."""
+        cat_model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=64)
+        cat_state = cat_model.state_dict()
+
+        scalar_model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1)
+        model_state = scalar_model.state_dict()
+
+        # Filter out mismatched keys (simulating warm start logic)
+        filtered = {k: v for k, v in cat_state.items()
+                    if k in model_state and v.shape == model_state[k].shape}
+        missing, _ = scalar_model.load_state_dict(filtered, strict=False)
+
+        # value_fc2 should be in missing (shape mismatch: 64→1)
+        assert 'value_fc2.weight' in missing
+        assert 'value_fc2.bias' in missing
+        # But backbone should load fine
+        assert 'stem.0.weight' not in missing
+
+    def test_scalar_gradient_flow(self):
+        model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1)
+        x1 = torch.randn(4, 18, 9, 9)
+        x2 = torch.randn(4, 18, 9, 9)
+        _, v1 = model(x1)
+        _, v2 = model(x2)
+        s1 = model.predict_value(v1)
+        s2 = model.predict_value(v2)
+        import torch.nn.functional as F
+        loss = F.relu(5.0 - (s1 - s2)).mean()
+        loss.backward()
+        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                       for p in model.parameters())
+        assert has_grad
