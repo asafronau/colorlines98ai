@@ -22,7 +22,7 @@ def cross_entropy_soft(logits, targets):
 
 
 def train_epoch(model, loader, optimizer, device, max_score=500.0,
-                scaler=None, pairwise=False,
+                scaler=None, pairwise=False, scalar_value=False,
                 val_weight=1.0, rank_weight=1.0, log_interval=100):
     model.train()
     total_loss = 0
@@ -44,8 +44,14 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
         with torch.amp.autocast('cuda', enabled=use_amp):
             pol_logits, val_logits = model(obs)
             pol_loss = cross_entropy_soft(pol_logits, pol_tgt)
-            val_loss = cross_entropy_soft(val_logits, val_tgt)
-            loss = pol_loss + val_weight * val_loss
+
+            # Value CE loss: only for categorical head (bins > 1)
+            if scalar_value:
+                val_loss = torch.tensor(0.0, device=device)
+                loss = pol_loss
+            else:
+                val_loss = cross_entropy_soft(val_logits, val_tgt)
+                loss = pol_loss + val_weight * val_loss
 
             if pairwise:
                 good_obs = good_obs.to(device)
@@ -57,8 +63,7 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
                 good_val, bad_val = pair_val.chunk(2, dim=0)
                 v_good = model.predict_value(good_val, max_val=max_score)
                 v_bad = model.predict_value(bad_val, max_val=max_score)
-                # Ranking: V(good) must exceed V(bad) by a proportional margin
-                # Scale tournament margins → value-head scale (mean margin → 5 pts)
+                # Ranking: V(good) must exceed V(bad) by scaled margin
                 margin_scaled = margin * (5.0 / (margin.mean() + 1e-8))
                 rank_loss = F.relu(margin_scaled - (v_good - v_bad)).mean()
                 loss = loss + rank_weight * rank_loss
@@ -143,6 +148,8 @@ def main():
                    help='Weight for pairwise ranking loss (default 1.0)')
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
+    p.add_argument('--value-bins', type=int, default=64,
+                   help='Value head output size (1=scalar for pure ranking, 64=categorical)')
     p.add_argument('--val-split', type=float, default=0.05)
     p.add_argument('--gpu-data', action='store_true')
     p.add_argument('--amp', action='store_true')
@@ -187,7 +194,9 @@ def main():
     print(f"Train: {n_train:,}, Val: {n_val:,}, max_score: {max_score:.0f}"
           f"{pairwise_str}", flush=True)
 
-    model = AlphaTrainNet(num_blocks=args.num_blocks, channels=args.channels).to(device)
+    model = AlphaTrainNet(num_blocks=args.num_blocks, channels=args.channels,
+                          num_value_bins=args.value_bins).to(device)
+    scalar_value = (args.value_bins == 1)
     n_params = count_parameters(model)
     # channels_last gives better perf for small spatial dims on CUDA
     if device.type == 'cuda':
@@ -205,7 +214,10 @@ def main():
         # Strip torch.compile prefix if present in checkpoint
         if any(k.startswith('_orig_mod.') for k in state):
             state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
-        model.load_state_dict(state)
+        # strict=False allows mismatched value_fc2 (e.g., 64 bins → 1 scalar)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  Randomly initialized: {missing}", flush=True)
         if not args.warm_start and 'optimizer' in ckpt:
             start_epoch = ckpt['epoch'] + 1
             best_val = ckpt.get('best_val_loss', float('inf'))
@@ -254,7 +266,7 @@ def main():
 
         tl, tp, tv = train_epoch(model, train_loader, optimizer, device,
                                   max_score=max_score, scaler=scaler,
-                                  pairwise=pairwise,
+                                  pairwise=pairwise, scalar_value=scalar_value,
                                   val_weight=args.val_weight,
                                   rank_weight=args.rank_weight)
         vl, vp, vv, vm = validate(model, val_loader, device,

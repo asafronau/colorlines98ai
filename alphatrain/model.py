@@ -72,7 +72,9 @@ class AlphaTrainNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_conv2 = nn.Conv2d(policy_channels, 81, 1)
 
-        # Value head: conv → fc → categorical
+        # Value head: conv → fc → output
+        # num_value_bins=1: scalar output for pure ranking (no categorical)
+        # num_value_bins>1: categorical output with two-hot targets
         self.value_conv = nn.Conv2d(channels, 8, 1, bias=False)
         self.value_bn = nn.BatchNorm2d(8)
         self.value_fc1 = nn.Linear(8 * BOARD_SIZE * BOARD_SIZE, 256)
@@ -98,7 +100,13 @@ class AlphaTrainNet(nn.Module):
         return policy_logits, value_logits
 
     def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
-        """Decode categorical value logits to scalar score."""
+        """Decode value head output to scalar.
+
+        For scalar head (num_value_bins=1): returns raw output directly.
+        For categorical head (num_value_bins>1): softmax over bins.
+        """
+        if self.num_value_bins == 1:
+            return value_logits.squeeze(-1)
         probs = F.softmax(value_logits, dim=-1)
         bins = torch.linspace(min_val, max_val, self.num_value_bins,
                               device=value_logits.device)
