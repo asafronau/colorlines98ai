@@ -49,7 +49,7 @@ def bench_collate(tensor_file, device_name, batch_sizes=(256, 1024, 4096)):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--tensor-file', default='data/alphatrain_pairwise.pt')
+    p.add_argument('--tensor-file', default='alphatrain/data/alphatrain_pairwise.pt')
     p.add_argument('--device', default=None)
     args = p.parse_args()
 

@@ -42,7 +42,7 @@ def bench(dataset, collate_fn, batch_size, device_name, label, n_batches=10):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--tensor-file', default='data/alphatrain_pairwise.pt')
+    p.add_argument('--tensor-file', default='alphatrain/data/alphatrain_pairwise.pt')
     p.add_argument('--device', default=None)
     p.add_argument('--batch-size', type=int, default=4096)
     args = p.parse_args()

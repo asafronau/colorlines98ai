@@ -20,7 +20,7 @@ BENCHMARKS = [
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--tensor-file', default='data/alphatrain_pairwise.pt')
+    p.add_argument('--tensor-file', default='alphatrain/data/alphatrain_pairwise.pt')
     args = p.parse_args()
 
     print("=" * 60)

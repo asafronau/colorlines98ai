@@ -16,7 +16,7 @@ from alphatrain.train import cross_entropy_soft
 
 
 def main():
-    path = 'data/alphatrain_pairwise.pt'
+    path = 'alphatrain/data/alphatrain_pairwise.pt'
     if not os.path.exists(path):
         print(f"ERROR: {path} not found")
         return

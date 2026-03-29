@@ -2,6 +2,7 @@
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pytest
 from alphatrain.model import AlphaTrainNet
 
@@ -13,7 +14,7 @@ class TestPairwiseCollate:
     def dataset(self):
         """Load pairwise dataset if available."""
         import os
-        path = 'data/alphatrain_pairwise.pt'
+        path = 'alphatrain/data/alphatrain_pairwise.pt'
         if not os.path.exists(path):
             pytest.skip("Pairwise tensor file not available")
         from alphatrain.dataset import TensorDatasetGPU
@@ -87,11 +88,11 @@ class TestMarginRankingLoss:
         obs2 = torch.randn(4, 18, 9, 9)
         _, val1 = net(obs1)
         _, val2 = net(obs2)
-        v1 = net.predict_value(val1, max_val=500.0)
-        v2 = net.predict_value(val2, max_val=500.0)
-        target = torch.ones(4)
-        loss_fn = torch.nn.MarginRankingLoss(margin=0.0)
-        loss = loss_fn(v1, v2, target)
+        v_good = net.predict_value(val1, max_val=500.0)
+        v_bad = net.predict_value(val2, max_val=500.0)
+        # Match actual training loss: F.relu(margin - (v_good - v_bad))
+        margin = torch.tensor([5.0, 10.0, 3.0, 8.0])
+        loss = F.relu(margin - (v_good - v_bad)).mean()
         loss.backward()
         has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                        for p in net.parameters())
@@ -104,7 +105,7 @@ class TestBuildObsBoardsOnly:
     @pytest.fixture
     def dataset(self):
         import os
-        path = 'data/alphatrain_pairwise.pt'
+        path = 'alphatrain/data/alphatrain_pairwise.pt'
         if not os.path.exists(path):
             pytest.skip("Pairwise tensor file not available")
         from alphatrain.dataset import TensorDatasetGPU
