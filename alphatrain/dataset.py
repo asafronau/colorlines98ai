@@ -642,10 +642,19 @@ class TensorDatasetGPU(Dataset):
         # Sample afterstate pairs (randomly from the pair pool)
         B = len(indices)
         pair_idx = torch.randint(0, self.n_pairs, (B,), device=self.device)
-        # Fuse good+bad into single obs build (1 CPU round-trip instead of 2)
+        base = self.pair_base_idx[pair_idx]
+
+        # Fuse good+bad into single obs build with parent's next_balls
+        # (next_balls are known information — visible in UI before the move)
         both_boards = torch.cat([self.good_boards[pair_idx],
                                   self.bad_boards[pair_idx]], dim=0)
-        both_obs = self._build_obs_boards_only(both_boards)
+        both_next_pos = self.next_pos[base].repeat(2, 1, 1)
+        both_next_col = self.next_col[base].repeat(2, 1)
+        both_n_next = self.n_next[base].repeat(2)
+        both_obs = self._build_obs_core(both_boards,
+                                         next_pos=both_next_pos,
+                                         next_col=both_next_col,
+                                         n_next=both_n_next)
         good_obs, bad_obs = both_obs.chunk(2, dim=0)
         margin = self.margins[pair_idx]
 
