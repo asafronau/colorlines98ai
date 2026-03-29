@@ -207,21 +207,79 @@ better features from the more meaningful value signal.
 
 ---
 
-## Pillar 2b: Pairwise Ranked Value Head (IN PROGRESS)
+## Pillar 2b: Pairwise Ranked Value Head (FAILED)
 
-### Architecture change
+### What we built
 Added **pairwise margin ranking loss** alongside existing policy + value losses:
-1. For each training state with 2+ top moves, compute afterstates (board after move + clears, before spawn)
-2. Best move → good_afterstate, worse move → bad_afterstate
-3. Loss: `MarginRankingLoss(V(good), V(bad))` weighted by tournament score margin
-4. Total loss = policy_CE + value_CE + ranking_loss
+1. Afterstate computation: board after move + line clears, before ball spawning (deterministic)
+2. For each state with 2+ top moves, pair best vs worse afterstate
+3. Loss: `F.relu(margin_scaled - (V(good) - V(bad)))` with tournament score margins
+4. Total: `pol_CE + 0.5 * val_CE + rank_loss`
+5. Warm start from Pillar 2a checkpoint (policy=494)
+6. 1.31M afterstate pairs, mean margin=14.3 tournament score points
 
-1.31M afterstate pairs generated. Mean margin = 14.3 tournament score points.
+### Training attempts
 
-### What we expect
-- Rank correlation should jump from -0.08 to **> 0.3** (ideally > 0.5)
-- Value spread across moves should increase from 25 to 100+
-- This would unblock MCTS (Pillar 3)
+**Attempt 1: From scratch, margin=0 (dead ranking loss)**
+- Colab A100, 30 epochs at 20K s/s (later cancelled at epoch 8)
+- rank_loss collapsed to 0.0000 by epoch 6 — model satisfied V(good) > V(bad) trivially
+- Value head overfitting: val_loss 4.43 (epoch 3) → 11.34 (epoch 7)
+- Policy regressed: 494 → 158 (only 3 epochs, not converged)
+- Root cause: margin=0 requires only correct direction, not meaningful separation
+
+**Attempt 2: Warm start from 2a, proportional margins**
+- Fixed: margin scaled so mean=5 on value head's [0,500] range
+- Fixed: warm start preserves 494-scoring policy backbone
+- Colab A100, 20 epochs, lr=3e-4, val_weight=0.5
+- rank_loss: 11.2 → 0.45 → 0.13 (declining as expected, NOT collapsing to 0)
+- pol_loss stable: ~1.71 train, ~2.0 val (backbone not corrupted)
+- BUT val_loss increasing from epoch 1: 2.54 → 2.62 → 2.66 (overfitting immediately)
+- Best checkpoint: epoch 1 only
+
+### Results (epoch 1 best)
+| Metric | Pillar 2a | Pillar 2b (1 epoch pairwise) |
+|---|---|---|
+| Policy mean | 494 | 325 (regressed — 1 epoch not enough) |
+| Value spread | 2 pts | 18 pts (9x better) |
+| **Rank correlation** | **-0.083** | **-0.081 (no improvement)** |
+
+### Why it failed
+
+**1. Afterstate observations lack discriminative signal.**
+Two afterstates from the same position differ by one ball moved. The 18-channel observation
+(mostly color one-hot + empty) looks nearly identical for both. Without next_balls (channels 8-11
+are zero for afterstates), the model has even less context. The backbone can't see why one
+afterstate is better — the difference is in downstream consequences (pathfinding, future line
+setups) that aren't visible in the immediate board state.
+
+**2. The ranking signal doesn't generalize.**
+The model learned to spread training pair values (spread went 2 → 18) but in the wrong
+direction (correlation still -0.08). It memorized training-set-specific patterns rather
+than learning general move quality features.
+
+**3. Overfitting from epoch 1.**
+With 1.31M pairs but 12.1M model parameters, the value head can memorize training pairs
+without learning generalizable features. Lower lr and val_weight didn't help.
+
+### Performance optimizations (valuable regardless of outcome)
+- GPU line potentials via shift operations: eliminated CPU↔GPU sync
+- GPU component area via shift-based label propagation: 4x faster
+- Fused good+bad afterstate obs build: single call
+- torch.compile: 64% faster model forward/backward on H100
+- Total collate speedup: 20K → 52K s/s MPS, 11K → 20K s/s CUDA
+
+### Lessons learned
+19. **Pairwise ranking on afterstates fails when afterstate obs are nearly identical.**
+    Moving one ball on a 9×9 board barely changes the 18-channel representation. The signal
+    is in downstream consequences, not the immediate board state.
+20. **Warm start is essential for fine-tuning but 1 epoch isn't enough.** The policy regressed
+    because the new loss landscape differs from the original. Need many epochs to reconverge,
+    but the value head overfits before the policy can recover.
+21. **The value head overfitting problem may be fundamental.** With 12.1M shared params and
+    the value head trying to predict small differences between similar boards, overfitting
+    starts immediately regardless of lr, weight decay, or loss weighting.
+22. **Performance optimization pays off even when experiments fail.** The GPU line potentials
+    and component area optimizations benefit all future training runs.
 
 ---
 

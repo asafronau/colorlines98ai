@@ -192,12 +192,32 @@ def main():
     # channels_last gives better perf for small spatial dims on CUDA
     if device.type == 'cuda':
         model = model.to(memory_format=torch.channels_last)
-    # torch.compile fuses kernels — major speedup for small convolutions
+    print(f"Model: {args.num_blocks}b x {args.channels}ch, "
+          f"{n_params:,} params, {model.in_channels}ch input", flush=True)
+
+    # Load weights BEFORE torch.compile (compile wraps state dict keys)
+    start_epoch = 0
+    best_val = float('inf')
+
+    if args.resume and os.path.exists(args.resume):
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        state = ckpt['model']
+        # Strip torch.compile prefix if present in checkpoint
+        if any(k.startswith('_orig_mod.') for k in state):
+            state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
+        model.load_state_dict(state)
+        if not args.warm_start and 'optimizer' in ckpt:
+            start_epoch = ckpt['epoch'] + 1
+            best_val = ckpt.get('best_val_loss', float('inf'))
+            print(f"Resumed weights from epoch {start_epoch - 1}", flush=True)
+        else:
+            print(f"Warm start: loaded weights from epoch {ckpt.get('epoch', '?')}, "
+                  f"fresh optimizer/scheduler", flush=True)
+
+    # torch.compile AFTER loading weights
     if args.compile and hasattr(torch, 'compile'):
         model = torch.compile(model)
         print("torch.compile enabled", flush=True)
-    print(f"Model: {args.num_blocks}b x {args.channels}ch, "
-          f"{n_params:,} params, {model.in_channels}ch input", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                    weight_decay=args.weight_decay)
@@ -211,25 +231,11 @@ def main():
         optimizer, [warmup_sched, cosine_sched],
         milestones=[args.warmup_epochs])
 
-    start_epoch = 0
-    best_val = float('inf')
-
-    if args.resume and os.path.exists(args.resume):
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        state = ckpt['model']
-        # Strip torch.compile prefix if present
-        if any(k.startswith('_orig_mod.') for k in state):
-            state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
-        model.load_state_dict(state)
-        if 'optimizer' in ckpt and not args.warm_start:
+    # Restore optimizer/scheduler state for full resume (not warm start)
+    if args.resume and os.path.exists(args.resume) and not args.warm_start:
+        if 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
             scheduler.load_state_dict(ckpt['scheduler'])
-            start_epoch = ckpt['epoch'] + 1
-            best_val = ckpt.get('best_val_loss', float('inf'))
-            print(f"Resumed from epoch {start_epoch}", flush=True)
-        else:
-            print(f"Warm start: loaded weights from epoch {ckpt.get('epoch', '?')}, "
-                  f"fresh optimizer/scheduler", flush=True)
         print(f"Resumed from epoch {start_epoch}", flush=True)
 
     os.makedirs(args.save_dir, exist_ok=True)
