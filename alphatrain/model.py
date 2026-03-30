@@ -102,11 +102,11 @@ class AlphaTrainNet(nn.Module):
     def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
         """Decode value head output to scalar.
 
-        For scalar head (num_value_bins=1): returns raw output directly.
+        For scalar head (num_value_bins=1): sigmoid clamped to [0, max_val].
         For categorical head (num_value_bins>1): softmax over bins.
         """
         if self.num_value_bins == 1:
-            return value_logits.squeeze(-1)
+            return torch.sigmoid(value_logits.squeeze(-1)) * max_val
         probs = F.softmax(value_logits, dim=-1)
         bins = torch.linspace(min_val, max_val, self.num_value_bins,
                               device=value_logits.device)

@@ -22,16 +22,21 @@ def cross_entropy_soft(logits, targets):
 
 
 def train_epoch(model, loader, optimizer, device, max_score=500.0,
-                scaler=None, pairwise=False, scalar_value=False,
-                val_weight=1.0, rank_weight=1.0, log_interval=100):
+                num_value_bins=64, scaler=None, pairwise=False,
+                scalar_value=False, val_weight=1.0, rank_weight=1.0,
+                anchor_weight=0.0, log_interval=100):
     model.train()
     total_loss = 0
     total_pol = 0
     total_val = 0
     total_rank = 0
+    total_anchor = 0
     n = 0
     t0 = time.time()
     use_amp = scaler is not None
+    # Precompute bin centers for decoding two-hot targets to scalar
+    if anchor_weight > 0 and scalar_value:
+        anchor_bins = torch.linspace(0, max_score, num_value_bins, device=device)
     for bi, batch in enumerate(loader):
         if pairwise:
             obs, pol_tgt, val_tgt, good_obs, bad_obs, margin = batch
@@ -52,6 +57,15 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
             else:
                 val_loss = cross_entropy_soft(val_logits, val_tgt)
                 loss = pol_loss + val_weight * val_loss
+
+            # Anchor loss: MSE between sigmoid-clamped prediction and TD target
+            if anchor_weight > 0 and scalar_value:
+                v_pred = model.predict_value(val_logits, max_val=max_score)
+                true_scalar = (val_tgt * anchor_bins).sum(dim=-1)
+                anchor_loss = F.mse_loss(v_pred, true_scalar)
+                loss = loss + anchor_weight * anchor_loss
+            else:
+                anchor_loss = torch.tensor(0.0, device=device)
 
             if pairwise:
                 good_obs = good_obs.to(device)
@@ -83,6 +97,7 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
         total_loss += loss.item()
         total_pol += pol_loss.item()
         total_val += val_loss.item()
+        total_anchor += anchor_loss.item()
         if pairwise:
             total_rank += rank_loss.item()
         n += 1
@@ -92,23 +107,27 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
             sps = (bi + 1) * loader.batch_size / elapsed
             eta = (len(loader) - bi - 1) * loader.batch_size / max(sps, 1)
             rank_str = f" rank={total_rank/n:.4f}" if pairwise else ""
+            anchor_str = f" anchor={total_anchor/n:.4f}" if anchor_weight > 0 else ""
             print(f"  [{bi+1}/{len(loader)}] "
                   f"loss={total_loss/n:.4f} "
                   f"(pol={total_pol/n:.4f} val={total_val/n:.4f}"
-                  f"{rank_str}) "
+                  f"{rank_str}{anchor_str}) "
                   f"{sps:.0f} s/s ETA {eta/60:.0f}m", flush=True)
 
     return total_loss / n, total_pol / n, total_val / n
 
 
 @torch.no_grad()
-def validate(model, loader, device, max_score=30000.0, use_amp=False):
+def validate(model, loader, device, max_score=30000.0, num_value_bins=64,
+             use_amp=False, scalar_value=False):
     model.eval()
     total_loss = 0
     total_pol = 0
     total_val = 0
     total_mae = 0
     n = 0
+    # Bin centers for decoding two-hot to scalar
+    bins = torch.linspace(0, max_score, num_value_bins, device=device)
 
     for obs, pol_tgt, val_tgt in loader:
         obs = obs.to(device)
@@ -118,10 +137,13 @@ def validate(model, loader, device, max_score=30000.0, use_amp=False):
         with torch.amp.autocast('cuda', enabled=use_amp):
             pol_logits, val_logits = model(obs)
             pol_loss = cross_entropy_soft(pol_logits, pol_tgt)
-            val_loss = cross_entropy_soft(val_logits, val_tgt)
+            if scalar_value:
+                val_loss = torch.tensor(0.0, device=device)
+            else:
+                val_loss = cross_entropy_soft(val_logits, val_tgt)
 
+        # MAE: scalar head uses sigmoid output vs decoded two-hot target
         pred = model.predict_value(val_logits, max_val=max_score)
-        bins = torch.linspace(0, max_score, model.num_value_bins, device=device)
         true = (val_tgt * bins).sum(dim=-1)
         mae = (pred - true).abs().mean()
 
@@ -146,6 +168,8 @@ def main():
                    help='Weight for value CE loss (default 1.0)')
     p.add_argument('--rank-weight', type=float, default=1.0,
                    help='Weight for pairwise ranking loss (default 1.0)')
+    p.add_argument('--anchor-weight', type=float, default=0.0,
+                   help='Weight for anchor MSE loss (scalar head only, default 0.0)')
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
     p.add_argument('--value-bins', type=int, default=64,
@@ -276,12 +300,18 @@ def main():
         print(f"\nEpoch {epoch+1}/{args.epochs} (lr={lr:.2e})", flush=True)
 
         tl, tp, tv = train_epoch(model, train_loader, optimizer, device,
-                                  max_score=max_score, scaler=scaler,
+                                  max_score=max_score,
+                                  num_value_bins=dataset.num_value_bins,
+                                  scaler=scaler,
                                   pairwise=pairwise, scalar_value=scalar_value,
                                   val_weight=args.val_weight,
-                                  rank_weight=args.rank_weight)
+                                  rank_weight=args.rank_weight,
+                                  anchor_weight=args.anchor_weight)
         vl, vp, vv, vm = validate(model, val_loader, device,
-                                   max_score=max_score, use_amp=use_amp)
+                                   max_score=max_score,
+                                   num_value_bins=dataset.num_value_bins,
+                                   use_amp=use_amp,
+                                   scalar_value=scalar_value)
         scheduler.step()
 
         print(f"  Train: loss={tl:.4f} (pol={tp:.4f} val={tv:.4f})", flush=True)
@@ -300,11 +330,16 @@ def main():
         }
         latest_path = os.path.join(args.save_dir, 'latest.pt')
         torch.save(ckpt, latest_path)
+        # Save per-epoch checkpoint (never overwritten)
+        epoch_path = os.path.join(args.save_dir, f'epoch_{epoch+1}.pt')
+        torch.save(ckpt, epoch_path)
         if args.copy_to:
             import shutil
-            # Always save latest to Drive for crash recovery
             copy_dir = os.path.dirname(args.copy_to) or '.'
+            # Always save latest to Drive for crash recovery
             shutil.copy2(latest_path, os.path.join(copy_dir, 'alphatrain_td_latest.pt'))
+            # Save per-epoch to Drive too
+            shutil.copy2(epoch_path, os.path.join(copy_dir, f'alphatrain_td_epoch_{epoch+1}.pt'))
         if vl < best_val:
             best_val = vl
             best_path = os.path.join(args.save_dir, 'best.pt')
