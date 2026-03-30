@@ -143,6 +143,19 @@ class TestScalarValueHead:
         scalar = model.predict_value(val)
         assert scalar.shape == (4,)
 
+    def test_scalar_sigmoid_bounded(self):
+        """Scalar value head must be bounded to [0, max_val] via sigmoid."""
+        model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1)
+        model.eval()
+        x = torch.randn(100, 18, 9, 9)
+        with torch.no_grad():
+            _, val = model(x)
+            # Test with various max_val
+            for max_val in [500.0, 1000.0, 30000.0]:
+                scores = model.predict_value(val, max_val=max_val)
+                assert scores.min() >= 0, f"Below 0: {scores.min()}"
+                assert scores.max() <= max_val, f"Above {max_val}: {scores.max()}"
+
     def test_warm_start_categorical_to_scalar(self):
         """Loading categorical checkpoint into scalar model must not crash."""
         cat_model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=64)
@@ -164,14 +177,11 @@ class TestScalarValueHead:
 
     def test_scalar_gradient_flow(self):
         model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1)
-        x1 = torch.randn(4, 18, 9, 9)
-        x2 = torch.randn(4, 18, 9, 9)
-        _, v1 = model(x1)
-        _, v2 = model(x2)
-        s1 = model.predict_value(v1)
-        s2 = model.predict_value(v2)
-        import torch.nn.functional as F
-        loss = F.relu(5.0 - (s1 - s2)).mean()
+        x = torch.randn(4, 18, 9, 9)
+        _, v = model(x)
+        s = model.predict_value(v, max_val=500.0)
+        # MSE against arbitrary target — always produces gradients
+        loss = ((s - 210.0) ** 2).mean()
         loss.backward()
         has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                        for p in model.parameters())
