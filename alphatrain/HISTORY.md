@@ -283,6 +283,60 @@ without learning generalizable features. Lower lr and val_weight didn't help.
 
 ---
 
+## Pillar 2c-2e: Scalar Value Head Journey
+
+### 2c: Pure Ranking (unbounded scalar, no categorical CE)
+Dropped categorical CE entirely. Scalar value head (bins=1) with ranking loss only.
+- **rho=0.158 (p=0.016) at epoch 8** — first statistically significant ranking!
+- But: values drifted to 594-650 (unbounded), memorized training pairs
+- rank_loss collapsed to 0.0025 while generalization stalled
+- Lost epoch 8 checkpoint — overwritten by later epochs with lower val_loss but worse rho
+
+### 2d: Sigmoid Clamp
+Added `sigmoid(x) * max_score` to bound output to [0, 500].
+- Prevented drift, but: **sigmoid saturation** — all values compressed to [483, 498]
+- rho=0.125 (p=0.057) — borderline, gradient vanished near ceiling
+- Root cause: no "gravity" pulling values toward true mean, network pushed everything up
+
+### 2e: Sigmoid + Anchor MSE Loss
+Added small MSE loss (`weight=0.001`) comparing sigmoid output to true TD targets.
+- **anchor_weight=0.1**: anchor overwhelmed everything (537→1.9 total loss). Way too strong.
+- **anchor_weight=0.001**: balanced losses (pol≈1.7, rank≈0.3, anchor≈0.3). MAE: 187→18!
+- **rho≈0** — within-position move ranking near random
+- BUT: excellent absolute state evaluation (MAE=18 on [0,500] scale)
+
+### MCTS Test (Pillar 2e anchor checkpoint)
+**The breakthrough: value head works for MCTS despite zero within-position ranking.**
+
+| Seed | Policy (greedy) | MCTS (400 sims) | Change |
+|------|----------------|-----------------|--------|
+| 42 | 389 | **835** | +115% |
+| 43 | 176 | **1767** | +904% |
+| 44 | 174 | **2250** | +1193% |
+| 45 | 489 | 390 | -20% |
+| 46 | 342 | **1636** | +378% |
+| **Mean** | **314** | **1376** | **+338%** |
+
+**Caveat:** Each result is a single game (not averaged). High variance from random ball spawns.
+
+**Key insight:** MCTS uses policy to pick moves, value to evaluate resulting states. The value
+head doesn't need within-position ranking — it needs cross-state discrimination. MAE=18 means
+"state worth 300" vs "state worth 100" is clearly distinguished. The debug_value_head rho metric
+was measuring the wrong thing.
+
+### Lessons learned
+23. **Within-position rho is misleading for MCTS evaluation.** A value head that can't rank moves
+    from one board state can still dramatically improve tree search by accurately evaluating
+    different game states reached across the tree.
+24. **Sigmoid prevents drift but needs an anchor to avoid saturation.** Without absolute target
+    information, sigmoid outputs cluster at the boundary where gradients vanish.
+25. **Anchor MSE weight must be calibrated carefully.** MSE scale (~2500) means weight=0.1
+    contributes 250 to loss, dwarfing policy (1.7) and rank (0.3). Weight=0.001 gives balance.
+26. **Per-epoch checkpoint saving is essential.** Peak quality (rho, correlation) doesn't always
+    coincide with best val_loss. Save every epoch and evaluate each one.
+
+---
+
 ## Key Lessons Learned
 
 1. **Tactical precision > strategic vision in rollout quality.** The heuristic wins because it never
