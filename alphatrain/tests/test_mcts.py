@@ -4,8 +4,7 @@ import numpy as np
 import torch
 import pytest
 from game.board import ColorLinesGame
-from alphatrain.mcts import (Node, MCTS, _build_obs_for_game,
-                              _build_afterstate_obs, _get_legal_priors)
+from alphatrain.mcts import Node, MCTS, _build_obs_for_game, _get_legal_priors
 
 
 class DummyNet:
@@ -59,24 +58,11 @@ def test_build_obs_shape():
     assert obs.dtype == np.float32
 
 
-def test_build_afterstate_obs_shape():
-    game = ColorLinesGame(seed=42)
-    game.reset()
-    # Use a simple board as "afterstate"
-    board = game.board.copy()
-    obs = _build_afterstate_obs(board, game.next_balls)
-    assert obs.shape == (18, 9, 9)
-    assert obs.dtype == np.float32
-
-
-def test_afterstate_obs_has_next_balls():
-    """Afterstate obs must include parent's next_balls in channels 8-11."""
-    game = ColorLinesGame(seed=42)
-    game.reset()
-    board = game.board.copy()
-    obs = _build_afterstate_obs(board, game.next_balls)
-    # Channel 11 is next_ball mask — should have nonzero values
-    assert obs[11].sum() > 0
+def test_node_expanded():
+    n = Node()
+    assert not n.expanded()
+    n.children[((0, 0), (1, 1))] = Node(prior=0.5)
+    assert n.expanded()
 
 
 # -- Legal priors --
@@ -164,12 +150,12 @@ def test_mcts_none_on_full_board():
     assert move is None
 
 
-def test_mcts_afterstate_expansion():
-    """Expanded nodes should have children with informed Q-values."""
+def test_mcts_multiple_simulations():
+    """More simulations should not crash."""
     game = ColorLinesGame(seed=42)
     game.reset()
     net = DummyNet(value=100.0)
-    mcts = MCTS(net, torch.device('cpu'), num_simulations=10,
+    mcts = MCTS(net, torch.device('cpu'), num_simulations=50,
                 top_k=10, max_score=500.0)
     move = mcts.search(game)
     assert move is not None
