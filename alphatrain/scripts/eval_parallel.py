@@ -133,16 +133,7 @@ def main():
     # ── MCTS evaluation ──
     mcts_results = []
     if not args.policy_only:
-        # Choose strategy: local MPS (serial, fastest per-game) or
-        # GPU server (parallel, higher throughput for many games)
-        use_server = (total > 4)
-
-        if use_server:
-            mcts_results = _run_mcts_server(
-                args, task_seeds, total, n_workers)
-        else:
-            mcts_results = _run_mcts_local(
-                args, task_seeds, total)
+        mcts_results = _run_mcts_local(args, task_seeds, total)
 
     # ── Results ──
     _print_results_table(seeds, n_per, pol_results, mcts_results,
