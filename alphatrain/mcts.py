@@ -1,16 +1,15 @@
-"""Afterstate MCTS for Color Lines 98 (Open-Loop).
+"""Neural MCTS for Color Lines 98.
 
-Rigorous stochastic MCTS with afterstate evaluation:
-- Tree nodes represent game states (post-spawn)
-- At leaf expansion: get policy priors from game state, create children
-- Leaf VALUE is computed from the afterstate (pre-spawn, deterministic)
-  which is what the NN was trained on
-- Spawns happen naturally via game.clone() + game.move() during traversal
-- 400 simulations average over spawn distributions (Monte Carlo sampling)
+AlphaZero-style Monte Carlo Tree Search using the trained ResNet:
+- Policy head provides move priors (which moves to explore)
+- Value head evaluates leaf positions (replaces heuristic rollouts)
+- PUCT selection balances exploration vs exploitation
+- Virtual loss batching: collect B leaves per batch, one NN forward pass
+- Determinized: each simulation samples independent ball spawns via game.clone()
+- MuZero-style Q normalization for score-based (not win/loss) values
 
-This is the formal "Open-Loop MCTS" for stochastic games: the tree
-traverses through random spawns, and Q-values converge to the true
-expected value across the spawn distribution.
+Nodes represent post-spawn game states — matching the NN's training
+distribution. 400 simulations average over spawn outcomes.
 
 Usage:
     python -m alphatrain.evaluate --player mcts --simulations 400 --games 20
@@ -21,7 +20,6 @@ import numpy as np
 import torch
 
 from alphatrain.observation import build_observation
-from alphatrain.afterstate import compute_afterstate
 
 BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4  # 6561
@@ -62,25 +60,11 @@ def _build_obs_for_game(game):
     return build_observation(game.board, nr, nc, ncol, nn)
 
 
-def _build_afterstate_obs(afterstate_board, parent_next_balls):
-    """Build 18-channel observation for an afterstate.
-
-    Uses the afterstate board and the parent state's next_balls
-    (visible balls that will spawn onto this board).
-    """
-    nr = np.zeros(3, dtype=np.intp)
-    nc = np.zeros(3, dtype=np.intp)
-    ncol = np.zeros(3, dtype=np.intp)
-    nn = min(len(parent_next_balls), 3)
-    for i, ((r, c), col) in enumerate(parent_next_balls):
-        if i >= 3:
-            break
-        nr[i], nc[i], ncol[i] = r, c, col
-    return build_observation(afterstate_board, nr, nc, ncol, nn)
-
-
 def _get_legal_priors(game, pol_logits_np, top_k):
-    """Extract legal move priors from policy logits, keep top-K."""
+    """Extract legal move priors from policy logits, keep top-K.
+
+    Vectorized: builds all legal moves at once via numpy indexing.
+    """
     source_mask = game.get_source_mask()
     src_rows, src_cols = np.where(source_mask > 0)
 
@@ -127,10 +111,8 @@ def _get_legal_priors(game, pol_logits_np, top_k):
 
 
 class MCTS:
-    """Open-loop afterstate MCTS with virtual loss batching.
-
-    Leaf evaluation uses afterstates (deterministic, what the NN was
-    trained on). Tree traversal goes through spawns via game.clone().
+    """Neural MCTS with PUCT selection, virtual loss batching, and value-head
+    leaf evaluation.
 
     Args:
         net: AlphaTrainNet model (eval mode, on device)
@@ -138,7 +120,7 @@ class MCTS:
         num_simulations: simulations per search (default 400)
         c_puct: exploration constant (default 2.5)
         top_k: max children per node (default 30)
-        batch_size: max leaves per NN batch (default 16)
+        batch_size: leaves per batched NN eval (default 16)
     """
 
     def __init__(self, net, device, max_score=30000.0,
@@ -152,31 +134,17 @@ class MCTS:
         self.batch_size = batch_size
         self._obs_buf = torch.empty(batch_size, 18, 9, 9, device=device)
 
-    def _expand_node(self, node, game):
-        """Expand node: get policy priors, create children."""
+    def _nn_evaluate_single(self, game):
+        """Single NN forward pass -> (priors dict, value scalar)."""
         obs = torch.from_numpy(
             _build_obs_for_game(game)
         ).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            pol_logits, _ = self.net(obs)
+            pol_logits, val_logits = self.net(obs)
+            value = self.net.predict_value(val_logits, max_val=self.max_score).item()
         priors = _get_legal_priors(
             game, pol_logits[0].cpu().numpy(), self.top_k)
-        for action, prior in priors.items():
-            node.children[action] = Node(prior=prior)
-
-    def _evaluate_afterstate(self, game, action):
-        """Compute afterstate value: score_delta + NN prediction.
-
-        The afterstate is the board after move + line clears, before spawns.
-        This is deterministic and is what the NN was trained on.
-        """
-        (sr, sc), (tr, tc) = action
-        board_int64 = game.board.astype(np.int64)
-        after_board, score_delta = compute_afterstate(
-            board_int64, sr, sc, tr, tc)
-        obs = _build_afterstate_obs(
-            after_board.astype(np.int8), game.next_balls)
-        return obs, int(score_delta)
+        return priors, value
 
     def _select_child(self, node, min_q, max_q):
         """PUCT selection with MuZero-style Q normalization."""
@@ -202,24 +170,27 @@ class MCTS:
         return best_action, best_child
 
     def search(self, game):
-        """Run open-loop afterstate MCTS from current game state."""
+        """Run batched MCTS with virtual loss from current game state."""
         root = Node()
 
-        # Expand root
-        self._expand_node(root, game)
-        if not root.children:
+        # Expand root with single eval
+        priors, root_value = self._nn_evaluate_single(game)
+        if not priors:
             return None
+        for action, prior in priors.items():
+            root.children[action] = Node(prior=prior)
         root.visit_count = 1
+        root.value_sum = root_value
 
-        min_q = 0.0
-        max_q = self.max_score
+        min_q = root_value
+        max_q = root_value
 
         sims_done = 0
         while sims_done < self.num_simulations:
             bs = min(self.batch_size, self.num_simulations - sims_done)
             batch_paths = []
-            batch_actions = []  # the action that led to each leaf
-            batch_games = []    # parent game state at each leaf
+            batch_games = []
+            batch_leaf_nodes = []
             batch_game_over = []
             obs_count = 0
 
@@ -228,65 +199,55 @@ class MCTS:
                 node = root
                 sim_game = game.clone()
                 path = [node]
-                last_action = None
 
                 # Descend while expanded
                 while node.expanded() and not sim_game.game_over:
                     action, child = self._select_child(node, min_q, max_q)
-                    last_action = action
-                    # Save pre-move game for afterstate computation at leaf
-                    parent_game_board = sim_game.board.copy()
-                    parent_next_balls = list(sim_game.next_balls)
-                    # Execute move (includes spawns — for tree traversal)
                     sim_game.move(action[0], action[1])
                     path.append(child)
                     node = child
 
-                # Apply virtual loss
+                # Apply virtual loss to diversify subsequent selections
                 for n in path:
                     n.visit_count += 1
                     n.value_sum -= VIRTUAL_LOSS
 
                 batch_paths.append(path)
+                batch_leaf_nodes.append(node)
                 batch_games.append(sim_game)
 
                 if sim_game.game_over:
                     batch_game_over.append(True)
-                    batch_actions.append(None)
                 else:
                     batch_game_over.append(False)
-                    # Compute afterstate observation for the leaf
-                    # (the move that led here, evaluated on pre-spawn board)
-                    (sr, sc), (tr, tc) = last_action
-                    after_board, score_delta = compute_afterstate(
-                        parent_game_board.astype(np.int64), sr, sc, tr, tc)
                     self._obs_buf[obs_count] = torch.from_numpy(
-                        _build_afterstate_obs(
-                            after_board.astype(np.int8), parent_next_balls))
-                    batch_actions.append(
-                        (score_delta, obs_count))
+                        _build_obs_for_game(sim_game))
                     obs_count += 1
 
-            # === BATCH EVALUATE afterstates + EXPAND leaves ===
-            nn_values = None
+            # === BATCH EVALUATE all non-terminal leaves ===
             if obs_count > 0:
                 with torch.no_grad():
-                    _, val_logits = self.net(self._obs_buf[:obs_count])
-                    nn_values = self.net.predict_value(
-                        val_logits, max_val=self.max_score).cpu().numpy()
+                    pol_logits, val_logits = self.net(self._obs_buf[:obs_count])
+                    values_t = self.net.predict_value(
+                        val_logits, max_val=self.max_score)
+                pol_np = pol_logits.cpu().numpy()
+                val_np = values_t.cpu().numpy()
 
+            # === EXPAND + UNDO VIRTUAL LOSS + BACKUP ===
+            nn_idx = 0
             for b in range(bs):
                 path = batch_paths[b]
-                leaf = path[-1]
 
                 if batch_game_over[b]:
-                    value = 0.0
+                    value = float(batch_games[b].score)
                 else:
-                    score_delta, obs_idx = batch_actions[b]
-                    value = int(score_delta) + float(nn_values[obs_idx])
-                    # Expand the leaf for future traversals
-                    if not leaf.expanded():
-                        self._expand_node(leaf, batch_games[b])
+                    value = float(val_np[nn_idx])
+                    node = batch_leaf_nodes[b]
+                    priors = _get_legal_priors(
+                        batch_games[b], pol_np[nn_idx], self.top_k)
+                    for act, prior in priors.items():
+                        node.children[act] = Node(prior=prior)
+                    nn_idx += 1
 
                 min_q = min(min_q, value)
                 max_q = max(max_q, value)
