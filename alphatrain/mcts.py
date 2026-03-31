@@ -186,14 +186,17 @@ def _get_legal_priors(game, pol_logits_np, top_k):
         game.board, pol_logits_np, top_k)
     if k == 0:
         return {}
-    result = {}
-    for i in range(k):
-        flat = int(flat_idx[i])
-        src, tgt = divmod(flat, 81)
-        sr, sc = divmod(src, 9)
-        tr, tc = divmod(tgt, 9)
-        result[((sr, sc), (tr, tc))] = float(priors[i])
-    return result
+    # Vectorized index → action conversion (avoids Python loop)
+    idx = flat_idx[:k].astype(np.int32)
+    src_flat = idx // 81
+    tgt_flat = idx % 81
+    sr = src_flat // 9
+    sc = src_flat % 9
+    tr = tgt_flat // 9
+    tc = tgt_flat % 9
+    pri = priors[:k]
+    return {((int(sr[i]), int(sc[i])), (int(tr[i]), int(tc[i]))): float(pri[i])
+            for i in range(k)}
 
 
 class MCTS:
@@ -333,9 +336,8 @@ class MCTS:
                 if self.inference_client is not None:
                     pol_np, val_np = self.inference_client.evaluate_batch(
                         obs_np_buf, obs_count)
-                    # Make copies since shared memory may be overwritten
-                    pol_np = pol_np.copy()
-                    val_np = val_np.copy()
+                    # No copy needed — shared memory is safe until next
+                    # evaluate_batch call (worker is single-threaded)
                 else:
                     with torch.no_grad():
                         pol_logits, val_logits = self.net(
