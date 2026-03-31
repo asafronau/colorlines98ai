@@ -337,6 +337,61 @@ was measuring the wrong thing.
 
 ---
 
+## MCTS Performance Engineering
+
+### Optimization journey (3500ms/turn → 265ms/turn)
+
+| Optimization | ms/turn | Speedup |
+|---|---|---|
+| CPU sequential (baseline) | 3500ms | 1x |
+| Virtual loss batching (bs=16, MPS) | 218ms | 16x |
+| + Vectorized legal priors (numpy) | 195ms | 18x |
+| GPU inference server (shared memory) | 120ms (1 worker) | 29x |
+| + FP16 + JIT trace | 99ms (1 worker) | 35x |
+| Final config: local MPS, fp16+jit, bs=8 | 265ms | 13x |
+
+Note: bs=8 is slower than bs=32 but **critical for quality** (see below).
+
+### Key finding: batch_size controls quality/speed tradeoff
+
+| Batch size | Mean score | ms/turn |
+|---|---|---|
+| 8 | **863** | 265ms |
+| 16 | 512 | 150ms |
+| 32 | 475 | 120ms |
+
+Virtual loss at bs=32 degrades PUCT selection — with ~30 root children, 32 simultaneous
+virtual losses make selection near-random. bs=8 preserves search quality.
+
+### Simulation count matters
+
+| Sims | Games | Mean | Median | Max | ms/turn |
+|---|---|---|---|---|---|
+| 400 | 50 | **863** | 812 | 2789 | 265ms |
+| 800 | 28 | **1268** | 1160 | 2818 | 550ms |
+
+800 sims gives +47% over 400, but 2x slower. Both beat policy (mean=314) by 3-4x.
+
+### Infrastructure built
+- **GPU inference server** (`inference_server.py`): shared memory IPC, centralized MPS
+  inference, cross-worker batching. 12,500 evals/s with fp16+jit.
+- **Parallel eval** (`eval_parallel.py`): local MPS mode (quality) or server mode (throughput)
+- **Profiling tools**: `profile_mcts.py`, `profile_server_mcts.py`, `bench_worker_scaling.py`
+- **JIT legal priors**: numba-compiled connected components + softmax + top-K
+
+### Lessons learned
+27. **Virtual loss batch size controls quality.** Large batches (32+) degrade PUCT selection
+    when the tree has few children at the root. bs=8 is the sweet spot for 30-child trees.
+28. **FP16 inference is free quality.** No measurable score difference, 2x GPU throughput.
+29. **GPU inference server needs batch caps.** Without caps, 18 workers create batch=256
+    which is past MPS's efficient range. GPU_BATCH_CAP=128 keeps per-eval latency low.
+30. **torch.set_num_threads(1) is mandatory for CPU multiprocessing.** Without it, 18 workers
+    × 8 threads = 144 threads on 18 cores, causing 5x slowdown from cache contention.
+31. **Profile before optimizing.** NN forward was 97% of CPU time — all other optimizations
+    combined saved <3%. Moving inference to GPU was the only meaningful improvement.
+
+---
+
 ## Key Lessons Learned
 
 1. **Tactical precision > strategic vision in rollout quality.** The heuristic wins because it never
