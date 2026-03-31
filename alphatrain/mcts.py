@@ -18,6 +18,7 @@ Usage:
 import math
 import numpy as np
 import torch
+from numba import njit
 
 from alphatrain.observation import build_observation
 
@@ -25,6 +26,121 @@ BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4  # 6561
 
 VIRTUAL_LOSS = 1.0
+
+
+@njit(cache=True)
+def _legal_priors_jit(board, pol_logits, top_k):
+    """Compute top-K legal move priors entirely in JIT.
+
+    Returns (count, flat_indices[top_k], priors[top_k]).
+    """
+    # Label connected components of empty cells
+    labels = np.zeros((9, 9), dtype=np.int8)
+    queue = np.empty(162, dtype=np.int32)
+    current = np.int8(0)
+    for sr in range(9):
+        for sc in range(9):
+            if board[sr, sc] != 0 or labels[sr, sc] != 0:
+                continue
+            current += 1
+            labels[sr, sc] = current
+            queue[0] = sr * 9 + sc
+            head = 0
+            tail = 1
+            while head < tail:
+                pos = queue[head]
+                head += 1
+                r = pos // 9
+                c = pos % 9
+                for d in range(4):
+                    if d == 0:
+                        nr, nc = r, c + 1
+                    elif d == 1:
+                        nr, nc = r, c - 1
+                    elif d == 2:
+                        nr, nc = r + 1, c
+                    else:
+                        nr, nc = r - 1, c
+                    if 0 <= nr < 9 and 0 <= nc < 9:
+                        if board[nr, nc] == 0 and labels[nr, nc] == 0:
+                            labels[nr, nc] = current
+                            queue[tail] = nr * 9 + nc
+                            tail += 1
+
+    # Collect legal moves and logits
+    move_idx = np.empty(6561, dtype=np.int32)
+    move_log = np.empty(6561, dtype=np.float32)
+    n_moves = 0
+
+    for sr in range(9):
+        for sc in range(9):
+            if board[sr, sc] == 0:
+                continue
+            # Find reachable component labels
+            adj = np.zeros(82, dtype=np.int8)
+            for d in range(4):
+                if d == 0:
+                    nr, nc = sr, sc + 1
+                elif d == 1:
+                    nr, nc = sr, sc - 1
+                elif d == 2:
+                    nr, nc = sr + 1, sc
+                else:
+                    nr, nc = sr - 1, sc
+                if 0 <= nr < 9 and 0 <= nc < 9:
+                    lbl = labels[nr, nc]
+                    if lbl > 0:
+                        adj[lbl] = 1
+
+            base = (sr * 9 + sc) * 81
+            for tr in range(9):
+                for tc in range(9):
+                    if labels[tr, tc] > 0 and adj[labels[tr, tc]] == 1:
+                        idx = base + tr * 9 + tc
+                        move_idx[n_moves] = idx
+                        move_log[n_moves] = pol_logits[idx]
+                        n_moves += 1
+
+    if n_moves == 0:
+        return 0, move_idx[:0], move_log[:0]
+
+    # Softmax
+    max_l = move_log[0]
+    for i in range(1, n_moves):
+        if move_log[i] > max_l:
+            max_l = move_log[i]
+    total = np.float32(0.0)
+    probs = np.empty(n_moves, dtype=np.float32)
+    for i in range(n_moves):
+        p = np.exp(move_log[i] - max_l)
+        probs[i] = p
+        total += p
+    for i in range(n_moves):
+        probs[i] /= total
+
+    # Top-K selection
+    k = min(top_k, n_moves)
+    out_idx = np.empty(k, dtype=np.int32)
+    out_pri = np.empty(k, dtype=np.float32)
+    used = np.zeros(n_moves, dtype=np.int8)
+    total_p = np.float32(0.0)
+    for j in range(k):
+        best_i = -1
+        best_v = np.float32(-1.0)
+        for i in range(n_moves):
+            if used[i] == 0 and probs[i] > best_v:
+                best_v = probs[i]
+                best_i = i
+        used[best_i] = 1
+        out_idx[j] = move_idx[best_i]
+        out_pri[j] = probs[best_i]
+        total_p += probs[best_i]
+    # Renormalize
+    if total_p > 0:
+        for i in range(k):
+            out_pri[i] /= total_p
+
+    return k, out_idx, out_pri
 
 
 class Node:
@@ -63,51 +179,21 @@ def _build_obs_for_game(game):
 def _get_legal_priors(game, pol_logits_np, top_k):
     """Extract legal move priors from policy logits, keep top-K.
 
-    Vectorized: builds all legal moves at once via numpy indexing.
+    Uses JIT-compiled function for speed (computes connected components,
+    legal moves, softmax, and top-K entirely in numba).
     """
-    source_mask = game.get_source_mask()
-    src_rows, src_cols = np.where(source_mask > 0)
-
-    if len(src_rows) == 0:
+    k, flat_idx, priors = _legal_priors_jit(
+        game.board, pol_logits_np, top_k)
+    if k == 0:
         return {}
-
-    all_sr, all_sc, all_tr, all_tc = [], [], [], []
-    for i in range(len(src_rows)):
-        sr, sc = int(src_rows[i]), int(src_cols[i])
-        target_mask = game.get_target_mask((sr, sc))
-        tgt_rows, tgt_cols = np.where(target_mask > 0)
-        n = len(tgt_rows)
-        if n > 0:
-            all_sr.append(np.full(n, sr, dtype=np.int32))
-            all_sc.append(np.full(n, sc, dtype=np.int32))
-            all_tr.append(tgt_rows.astype(np.int32))
-            all_tc.append(tgt_cols.astype(np.int32))
-
-    if not all_sr:
-        return {}
-
-    sr_arr = np.concatenate(all_sr)
-    sc_arr = np.concatenate(all_sc)
-    tr_arr = np.concatenate(all_tr)
-    tc_arr = np.concatenate(all_tc)
-
-    indices = (sr_arr * 9 + sc_arr) * 81 + tr_arr * 9 + tc_arr
-    logits = pol_logits_np[indices]
-    logits -= logits.max()
-    probs = np.exp(logits)
-    probs /= probs.sum()
-
-    if len(probs) > top_k:
-        top_idx = np.argpartition(probs, -top_k)[-top_k:]
-        sr_arr = sr_arr[top_idx]
-        sc_arr = sc_arr[top_idx]
-        tr_arr = tr_arr[top_idx]
-        tc_arr = tc_arr[top_idx]
-        probs = probs[top_idx]
-        probs /= probs.sum()
-
-    return {((int(sr_arr[i]), int(sc_arr[i])), (int(tr_arr[i]), int(tc_arr[i]))): float(probs[i])
-            for i in range(len(probs))}
+    result = {}
+    for i in range(k):
+        flat = int(flat_idx[i])
+        src, tgt = divmod(flat, 81)
+        sr, sc = divmod(src, 9)
+        tr, tc = divmod(tgt, 9)
+        result[((sr, sc), (tr, tc))] = float(priors[i])
+    return result
 
 
 class MCTS:
