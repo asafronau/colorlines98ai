@@ -153,6 +153,10 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     from alphatrain.evaluate import load_model
     net, max_score = load_model(model_path, device)
 
+    # Pre-allocate GPU-side batch buffer (avoids per-batch tensor allocation)
+    max_total = num_workers * max_batch
+    gpu_obs = torch.empty(max_total, 18, 9, 9, device=device)
+
     total_evals = 0
     total_batches = 0
     t_start = time.time()
@@ -178,29 +182,30 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
             except Empty:
                 break
 
-        # Gather observations from shared memory into one batch
-        obs_parts = []
+        # Gather obs from shared memory directly into pre-allocated GPU tensor
+        total_count = 0
         for slot_id, count in pending:
-            obs_parts.append(obs_buf[slot_id, :count].copy())
-        obs_all = np.concatenate(obs_parts, axis=0)
-        obs_tensor = torch.from_numpy(obs_all).to(device)
+            # No .copy() needed — worker is blocked waiting for response
+            gpu_obs[total_count:total_count + count] = torch.from_numpy(
+                obs_buf[slot_id, :count])
+            total_count += count
 
         # One forward pass
         with torch.no_grad():
-            pol_logits, val_logits = net(obs_tensor)
+            pol_logits, val_logits = net(gpu_obs[:total_count])
             values = net.predict_value(val_logits, max_val=max_score)
-        pol_np = pol_logits.cpu().numpy()
-        val_np = values.cpu().numpy()
 
-        # Scatter results back to shared memory and signal workers
+        # Write results directly to shared memory (avoid intermediate numpy)
+        pol_cpu = pol_logits.cpu()
+        val_cpu = values.cpu()
         offset = 0
         for slot_id, count in pending:
-            pol_buf[slot_id, :count] = pol_np[offset:offset + count]
-            val_buf[slot_id, :count] = val_np[offset:offset + count]
+            pol_buf[slot_id, :count] = pol_cpu[offset:offset + count].numpy()
+            val_buf[slot_id, :count] = val_cpu[offset:offset + count].numpy()
             offset += count
-            response_queues[slot_id].put(1)  # signal done (int, no serialization)
+            response_queues[slot_id].put(1)
 
-        total_evals += obs_all.shape[0]
+        total_evals += total_count
         total_batches += 1
         if total_batches % 200 == 0:
             elapsed = time.time() - t_start
