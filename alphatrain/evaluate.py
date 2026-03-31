@@ -18,11 +18,33 @@ from alphatrain.observation import build_observation
 
 BOARD_SIZE = 9
 
+
+class _JitWrapper:
+    """Wraps a JIT-traced model, keeping predict_value from the original."""
+
+    def __init__(self, net, dummy_input):
+        self.predict_value = net.predict_value
+        self.num_value_bins = net.num_value_bins
+        self._traced = torch.jit.trace(net, dummy_input)
+
+    def __call__(self, x):
+        return self._traced(x)
+
+    def parameters(self):
+        return self._traced.parameters()
+
+    def train(self, mode):
+        return self
+
 Player = Callable[[ColorLinesGame], Optional[tuple[tuple[int, int], tuple[int, int]]]]
 
 
-def load_model(model_path, device):
+def load_model(model_path, device, fp16=False, jit_trace=False):
     """Load AlphaTrainNet from checkpoint, auto-detecting architecture.
+
+    Args:
+        fp16: convert to half precision (2x faster on MPS/CUDA)
+        jit_trace: apply torch.jit.trace (10-15% faster forward pass)
 
     Returns (net, max_score) where max_score is the value head's bin range.
     """
@@ -47,9 +69,22 @@ def load_model(model_path, device):
     max_score = float(ckpt.get('max_score', 30000.0))
     epoch = ckpt.get('epoch', '?')
     val_loss = ckpt.get('val_loss', None)
+
+    opts = []
+    if fp16 and device.type in ('mps', 'cuda'):
+        net = net.half()
+        opts.append('fp16')
+    if jit_trace:
+        dtype = torch.float16 if fp16 and device.type in ('mps', 'cuda') else torch.float32
+        dummy = torch.randn(1, in_ch, 9, 9, device=device, dtype=dtype)
+        net = _JitWrapper(net, dummy)
+        opts.append('jit')
+
+    opt_str = f" [{'+'.join(opts)}]" if opts else ""
     print(f"Loaded {model_path}: {nb}b x {ch}ch, epoch={epoch}, "
           f"max_score={max_score:.0f}"
-          + (f", val_loss={val_loss:.4f}" if val_loss else ""), flush=True)
+          + (f", val_loss={val_loss:.4f}" if val_loss else "")
+          + opt_str, flush=True)
     return net, max_score
 
 

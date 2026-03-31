@@ -133,62 +133,131 @@ def main():
     # ── MCTS evaluation ──
     mcts_results = []
     if not args.policy_only:
-        from alphatrain.inference_server import InferenceServer
+        # Choose strategy: local MPS (serial, fastest per-game) or
+        # GPU server (parallel, higher throughput for many games)
+        use_server = (total > 4)
 
-        print(f"\n{'='*60}", flush=True)
-        print(f"MCTS player ({total} games, {n_workers} workers + GPU, "
-              f"{args.simulations} sims, bs={args.batch_size})", flush=True)
-        print(f"{'='*60}", flush=True)
-
-        ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
-        max_score = float(ckpt.get('max_score', 30000.0))
-        del ckpt
-
-        server = InferenceServer(args.model, n_workers,
-                                 max_batch_per_worker=args.batch_size)
-        server.start()
-
-        t0 = time.time()
-        remaining = list(task_seeds)
-
-        while remaining:
-            batch = remaining[:n_workers]
-            remaining = remaining[len(batch):]
-
-            processes = []
-            result_queues = []
-            for i, seed in enumerate(batch):
-                rq = Queue()
-                result_queues.append(rq)
-                proc = Process(
-                    target=_mcts_worker,
-                    args=(seed, i,
-                          server._obs_shm.name, server._pol_shm.name,
-                          server._val_shm.name,
-                          n_workers, args.batch_size,
-                          server.request_queue, server.response_queues[i],
-                          args.simulations, args.c_puct, args.top_k,
-                          max_score, rq))
-                proc.start()
-                processes.append(proc)
-
-            for proc, rq in zip(processes, result_queues):
-                result = rq.get(timeout=1800)
-                mcts_results.append(result)
-                proc.join()
-
-        mcts_time = time.time() - t0
-        print(f"MCTS done: {mcts_time:.0f}s ({mcts_time/total:.0f}s/game)",
-              flush=True)
-        server.shutdown()
+        if use_server:
+            mcts_results = _run_mcts_server(
+                args, task_seeds, total, n_workers)
+        else:
+            mcts_results = _run_mcts_local(
+                args, task_seeds, total)
 
     # ── Results ──
-    _print_results(seeds, n_per, pol_results, mcts_results,
+    _print_results_table(seeds, n_per, pol_results, mcts_results,
                    show_pol=not args.mcts_only,
                    show_mcts=not args.policy_only)
 
 
-def _print_results(seeds, n_per, pol_results, mcts_results,
+def _run_mcts_local(args, task_seeds, total):
+    """Run MCTS games sequentially on local MPS with fp16+jit."""
+    from alphatrain.evaluate import load_model, play_game
+    from alphatrain.mcts import make_mcts_player
+    from game.board import ColorLinesGame
+
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"MCTS player ({total} games, local {device}, fp16+jit, "
+          f"{args.simulations} sims, bs={args.batch_size})", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    net, max_score = load_model(args.model, device, fp16=True, jit_trace=True)
+    player = make_mcts_player(
+        net, device, max_score=max_score,
+        num_simulations=args.simulations,
+        c_puct=args.c_puct, top_k=args.top_k,
+        batch_size=args.batch_size)
+
+    results = []
+    t0 = time.time()
+    for i, seed in enumerate(task_seeds):
+        gt = time.time()
+        game = ColorLinesGame(seed=seed)
+        game.reset()
+        while not game.game_over:
+            move = player(game)
+            if move is None:
+                break
+            r = game.move(move[0], move[1])
+            if not r['valid']:
+                break
+        elapsed_game = time.time() - gt
+        elapsed_total = time.time() - t0
+        eta = elapsed_total / (i + 1) * (total - i - 1)
+        ms_per_turn = elapsed_game / max(game.turns, 1) * 1000
+        print(f"  [{i+1}/{total}] seed={seed}: score={game.score}, "
+              f"turns={game.turns}, {elapsed_game:.0f}s "
+              f"({ms_per_turn:.0f}ms/turn, ETA {eta:.0f}s)", flush=True)
+        results.append((seed, game.score, game.turns))
+
+    mcts_time = time.time() - t0
+    print(f"MCTS done: {mcts_time:.0f}s ({mcts_time/total:.0f}s/game)",
+          flush=True)
+    return results
+
+
+def _run_mcts_server(args, task_seeds, total, n_workers):
+    """Run MCTS games in parallel via GPU inference server."""
+    from alphatrain.inference_server import InferenceServer
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"MCTS player ({total} games, {n_workers} workers + GPU, "
+          f"{args.simulations} sims, bs={args.batch_size})", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
+    max_score = float(ckpt.get('max_score', 30000.0))
+    del ckpt
+
+    server = InferenceServer(args.model, n_workers,
+                             max_batch_per_worker=args.batch_size)
+    server.start()
+
+    results = []
+    t0 = time.time()
+    remaining = list(task_seeds)
+
+    while remaining:
+        batch = remaining[:n_workers]
+        remaining = remaining[len(batch):]
+
+        processes = []
+        result_queues = []
+        for i, seed in enumerate(batch):
+            rq = Queue()
+            result_queues.append(rq)
+            proc = Process(
+                target=_mcts_worker,
+                args=(seed, i,
+                      server._obs_shm.name, server._pol_shm.name,
+                      server._val_shm.name,
+                      n_workers, args.batch_size,
+                      server.request_queue, server.response_queues[i],
+                      args.simulations, args.c_puct, args.top_k,
+                      max_score, rq))
+            proc.start()
+            processes.append(proc)
+
+        for proc, rq in zip(processes, result_queues):
+            result = rq.get(timeout=1800)
+            results.append(result)
+            proc.join()
+
+    mcts_time = time.time() - t0
+    print(f"MCTS done: {mcts_time:.0f}s ({mcts_time/total:.0f}s/game)",
+          flush=True)
+    server.shutdown()
+    return results
+
+
+def _print_results_table(seeds, n_per, pol_results, mcts_results,
                    show_pol=True, show_mcts=True):
     print(f"\n{'='*60}", flush=True)
     print(f"Results: {n_per} games per seed", flush=True)

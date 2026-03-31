@@ -223,8 +223,17 @@ class MCTS:
         self.top_k = top_k
         self.batch_size = batch_size
         self.inference_client = inference_client
+        self._fp16 = False
         if net is not None and device is not None:
-            self._obs_buf = torch.empty(batch_size, 18, 9, 9, device=device)
+            # Detect fp16 model (JIT traced or .half())
+            try:
+                p = next(net.parameters())
+                self._fp16 = (p.dtype == torch.float16)
+            except (StopIteration, AttributeError):
+                pass
+            dtype = torch.float16 if self._fp16 else torch.float32
+            self._obs_buf = torch.empty(batch_size, 18, 9, 9,
+                                        device=device, dtype=dtype)
 
     def _nn_evaluate_single(self, game):
         """Single NN forward pass -> (priors dict, value scalar).
@@ -237,11 +246,13 @@ class MCTS:
             priors = _get_legal_priors(game, pol_np, self.top_k)
             return priors, value
         obs = torch.from_numpy(obs_np).unsqueeze(0).to(self.device)
-        with torch.no_grad():
+        if self._fp16:
+            obs = obs.half()
+        with torch.inference_mode():
             pol_logits, val_logits = self.net(obs)
             value = self.net.predict_value(val_logits, max_val=self.max_score).item()
-        priors = _get_legal_priors(
-            game, pol_logits[0].cpu().numpy(), self.top_k)
+        pol_np = pol_logits[0].float().cpu().numpy()
+        priors = _get_legal_priors(game, pol_np, self.top_k)
         return priors, value
 
     def _select_child(self, node, min_q, max_q):
@@ -328,7 +339,10 @@ class MCTS:
                     if self.inference_client is not None:
                         obs_np_buf[obs_count] = obs
                     else:
-                        self._obs_buf[obs_count] = torch.from_numpy(obs)
+                        t = torch.from_numpy(obs)
+                        if self._fp16:
+                            t = t.half()
+                        self._obs_buf[obs_count] = t
                     obs_count += 1
 
             # === BATCH EVALUATE ===
@@ -339,12 +353,12 @@ class MCTS:
                     # No copy needed — shared memory is safe until next
                     # evaluate_batch call (worker is single-threaded)
                 else:
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         pol_logits, val_logits = self.net(
                             self._obs_buf[:obs_count])
                         values_t = self.net.predict_value(
                             val_logits, max_val=self.max_score)
-                    pol_np = pol_logits.cpu().numpy()
+                    pol_np = pol_logits.float().cpu().numpy()  # fp32 for JIT
                     val_np = values_t.cpu().numpy()
 
             # === EXPAND + BACKUP ===
