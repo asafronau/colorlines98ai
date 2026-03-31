@@ -278,21 +278,39 @@ class MCTS:
 
         return best_action, best_child
 
-    def search(self, game):
+    def search(self, game, temperature=0.0, dirichlet_alpha=0.0,
+               dirichlet_weight=0.0, return_policy=False):
         """Run batched MCTS with virtual loss from current game state.
 
-        Works in both local mode (net + device) and server mode (inference_client).
+        Args:
+            temperature: move selection temperature (0=argmax, >0=proportional
+                to visit counts). Used for self-play exploration.
+            dirichlet_alpha: Dirichlet noise parameter for root priors (0=off).
+            dirichlet_weight: weight for Dirichlet noise (e.g., 0.25).
+            return_policy: if True, return (action, policy_target) where
+                policy_target is a (6561,) array of normalized visit counts.
+
+        Returns:
+            action tuple, or (action, policy_target) if return_policy=True.
         """
         root = Node()
 
         # Expand root
         priors, root_value = self._nn_evaluate_single(game)
         if not priors:
-            return None
+            return (None, None) if return_policy else None
         for action, prior in priors.items():
             root.children[action] = Node(prior=prior)
         root.visit_count = 1
         root.value_sum = root_value
+
+        # Dirichlet noise at root for exploration
+        if dirichlet_alpha > 0 and dirichlet_weight > 0:
+            noise = np.random.dirichlet(
+                [dirichlet_alpha] * len(root.children))
+            for i, child in enumerate(root.children.values()):
+                child.prior = ((1 - dirichlet_weight) * child.prior
+                               + dirichlet_weight * noise[i])
 
         min_q = root_value
         max_q = root_value
@@ -385,9 +403,37 @@ class MCTS:
 
             sims_done += bs
 
-        # Return most-visited child
-        return max(root.children.items(),
-                   key=lambda x: x[1].visit_count)[0]
+        # Build policy target from visit counts
+        if return_policy or temperature > 0:
+            actions = list(root.children.keys())
+            visits = np.array([root.children[a].visit_count
+                               for a in actions], dtype=np.float32)
+
+        if return_policy:
+            # Build full 6561-dim policy target
+            policy_target = np.zeros(NUM_MOVES, dtype=np.float32)
+            visit_sum = visits.sum()
+            if visit_sum > 0:
+                for i, a in enumerate(actions):
+                    (sr, sc), (tr, tc) = a
+                    idx = (sr * 9 + sc) * 81 + tr * 9 + tc
+                    policy_target[idx] = visits[i] / visit_sum
+
+        # Select move
+        if temperature > 0 and len(root.children) > 0:
+            # Temperature-weighted sampling
+            adjusted = visits ** (1.0 / temperature)
+            probs = adjusted / adjusted.sum()
+            chosen_idx = np.random.choice(len(actions), p=probs)
+            action = actions[chosen_idx]
+        else:
+            # Greedy argmax
+            action = max(root.children.items(),
+                         key=lambda x: x[1].visit_count)[0]
+
+        if return_policy:
+            return action, policy_target
+        return action
 
 
 def make_mcts_player(net, device, max_score=30000.0,
