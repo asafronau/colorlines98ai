@@ -123,8 +123,9 @@ class MCTS:
         batch_size: leaves per batched NN eval (default 16)
     """
 
-    def __init__(self, net, device, max_score=30000.0,
-                 num_simulations=400, c_puct=2.5, top_k=30, batch_size=16):
+    def __init__(self, net=None, device=None, max_score=30000.0,
+                 num_simulations=400, c_puct=2.5, top_k=30, batch_size=16,
+                 inference_client=None):
         self.net = net
         self.device = device
         self.max_score = max_score
@@ -132,13 +133,21 @@ class MCTS:
         self.c_puct = c_puct
         self.top_k = top_k
         self.batch_size = batch_size
-        self._obs_buf = torch.empty(batch_size, 18, 9, 9, device=device)
+        self.inference_client = inference_client
+        if net is not None and device is not None:
+            self._obs_buf = torch.empty(batch_size, 18, 9, 9, device=device)
 
     def _nn_evaluate_single(self, game):
-        """Single NN forward pass -> (priors dict, value scalar)."""
-        obs = torch.from_numpy(
-            _build_obs_for_game(game)
-        ).unsqueeze(0).to(self.device)
+        """Single NN forward pass -> (priors dict, value scalar).
+
+        Uses inference_client if available, otherwise direct net call.
+        """
+        obs_np = _build_obs_for_game(game)
+        if self.inference_client is not None:
+            pol_np, value = self.inference_client.evaluate(obs_np)
+            priors = _get_legal_priors(game, pol_np, self.top_k)
+            return priors, value
+        obs = torch.from_numpy(obs_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
             pol_logits, val_logits = self.net(obs)
             value = self.net.predict_value(val_logits, max_val=self.max_score).item()
@@ -170,10 +179,13 @@ class MCTS:
         return best_action, best_child
 
     def search(self, game):
-        """Run batched MCTS with virtual loss from current game state."""
+        """Run batched MCTS with virtual loss from current game state.
+
+        Works in both local mode (net + device) and server mode (inference_client).
+        """
         root = Node()
 
-        # Expand root with single eval
+        # Expand root
         priors, root_value = self._nn_evaluate_single(game)
         if not priors:
             return None
@@ -184,6 +196,11 @@ class MCTS:
 
         min_q = root_value
         max_q = root_value
+
+        # Pre-allocate obs buffer for server mode
+        if self.inference_client is not None:
+            obs_np_buf = np.empty(
+                (self.batch_size, 18, 9, 9), dtype=np.float32)
 
         sims_done = 0
         while sims_done < self.num_simulations:
@@ -200,14 +217,12 @@ class MCTS:
                 sim_game = game.clone()
                 path = [node]
 
-                # Descend while expanded
                 while node.expanded() and not sim_game.game_over:
                     action, child = self._select_child(node, min_q, max_q)
                     sim_game.move(action[0], action[1])
                     path.append(child)
                     node = child
 
-                # Apply virtual loss to diversify subsequent selections
                 for n in path:
                     n.visit_count += 1
                     n.value_sum -= VIRTUAL_LOSS
@@ -220,20 +235,31 @@ class MCTS:
                     batch_game_over.append(True)
                 else:
                     batch_game_over.append(False)
-                    self._obs_buf[obs_count] = torch.from_numpy(
-                        _build_obs_for_game(sim_game))
+                    obs = _build_obs_for_game(sim_game)
+                    if self.inference_client is not None:
+                        obs_np_buf[obs_count] = obs
+                    else:
+                        self._obs_buf[obs_count] = torch.from_numpy(obs)
                     obs_count += 1
 
-            # === BATCH EVALUATE all non-terminal leaves ===
+            # === BATCH EVALUATE ===
             if obs_count > 0:
-                with torch.no_grad():
-                    pol_logits, val_logits = self.net(self._obs_buf[:obs_count])
-                    values_t = self.net.predict_value(
-                        val_logits, max_val=self.max_score)
-                pol_np = pol_logits.cpu().numpy()
-                val_np = values_t.cpu().numpy()
+                if self.inference_client is not None:
+                    pol_np, val_np = self.inference_client.evaluate_batch(
+                        obs_np_buf, obs_count)
+                    # Make copies since shared memory may be overwritten
+                    pol_np = pol_np.copy()
+                    val_np = val_np.copy()
+                else:
+                    with torch.no_grad():
+                        pol_logits, val_logits = self.net(
+                            self._obs_buf[:obs_count])
+                        values_t = self.net.predict_value(
+                            val_logits, max_val=self.max_score)
+                    pol_np = pol_logits.cpu().numpy()
+                    val_np = values_t.cpu().numpy()
 
-            # === EXPAND + UNDO VIRTUAL LOSS + BACKUP ===
+            # === EXPAND + BACKUP ===
             nn_idx = 0
             for b in range(bs):
                 path = batch_paths[b]
@@ -252,7 +278,6 @@ class MCTS:
                 min_q = min(min_q, value)
                 max_q = max(max_q, value)
 
-                # Undo virtual loss, apply real value
                 for n in path:
                     n.value_sum += VIRTUAL_LOSS + value
 
