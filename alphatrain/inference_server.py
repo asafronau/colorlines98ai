@@ -153,16 +153,26 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     from alphatrain.evaluate import load_model
     net, max_score = load_model(model_path, device)
 
-    # Pre-allocate GPU-side batch buffer (avoids per-batch tensor allocation)
+    # FP16 inference: ~2x faster forward pass on MPS
+    net = net.half()
+
+    # JIT trace for forward pass (~10-15% faster, no control flow in ResNet)
+    # Keep original net for predict_value (not part of forward)
+    net_traced = torch.jit.trace(net, torch.randn(1, 18, 9, 9, device=device).half())
+
+    # Pre-allocate GPU-side batch buffer in fp16
     max_total = num_workers * max_batch
-    gpu_obs = torch.empty(max_total, 18, 9, 9, device=device)
+    gpu_obs = torch.empty(max_total, 18, 9, 9, device=device, dtype=torch.float16)
 
     total_evals = 0
     total_batches = 0
     t_start = time.time()
 
-    print(f"GPU inference server ready ({device_str}, "
+    print(f"GPU inference server ready ({device_str}, fp16+jit, "
           f"{num_workers} slots, max_batch={max_batch})", flush=True)
+
+    # Cap GPU batch — too large hurts per-eval latency on MPS
+    GPU_BATCH_CAP = 128
 
     while True:
         # Block on first request
@@ -170,34 +180,35 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
         if item is None:
             break
         pending = [item]  # list of (slot_id, count)
+        pending_obs = item[1]
 
-        # Drain additional pending requests
-        while len(pending) < num_workers:
+        # Drain additional pending requests (cap total obs)
+        while pending_obs < GPU_BATCH_CAP:
             try:
                 item = request_queue.get_nowait()
                 if item is None:
                     request_queue.put(None)
                     break
                 pending.append(item)
+                pending_obs += item[1]
             except Empty:
                 break
 
-        # Gather obs from shared memory directly into pre-allocated GPU tensor
+        # Gather obs from shared memory → fp16 GPU tensor
         total_count = 0
         for slot_id, count in pending:
-            # No .copy() needed — worker is blocked waiting for response
             gpu_obs[total_count:total_count + count] = torch.from_numpy(
-                obs_buf[slot_id, :count])
+                obs_buf[slot_id, :count]).half()
             total_count += count
 
-        # One forward pass
-        with torch.no_grad():
-            pol_logits, val_logits = net(gpu_obs[:total_count])
+        # One forward pass (fp16, JIT traced)
+        with torch.inference_mode():
+            pol_logits, val_logits = net_traced(gpu_obs[:total_count])
             values = net.predict_value(val_logits, max_val=max_score)
 
-        # Write results directly to shared memory (avoid intermediate numpy)
-        pol_cpu = pol_logits.cpu()
-        val_cpu = values.cpu()
+        # Write results to shared memory (cast back to fp32 for workers)
+        pol_cpu = pol_logits.float().cpu()
+        val_cpu = values.float().cpu()
         offset = 0
         for slot_id, count in pending:
             pol_buf[slot_id, :count] = pol_cpu[offset:offset + count].numpy()
