@@ -45,7 +45,7 @@ cd "$HOME"
 # Install system dependencies
 echo "Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq python3 python3-venv python3-pip > /dev/null
+sudo apt-get install -y -qq python3 python3-venv python3-pip tar gzip > /dev/null
 
 # Extract code tarball
 if [ -f colorlines98.tar.gz ]; then
