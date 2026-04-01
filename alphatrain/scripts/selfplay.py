@@ -135,8 +135,61 @@ def _limit_threads():
     torch.set_num_threads(1)
 
 
+def _server_worker(slot_id, seed_queue, result_queue,
+                   obs_shm_name, pol_shm_name, val_shm_name,
+                   num_workers, max_batch,
+                   request_queue, response_queue,
+                   num_sims, batch_size, max_score,
+                   temperature_moves, dirichlet_alpha, dirichlet_weight, gamma):
+    """Persistent worker for GPU server mode self-play.
+
+    Pulls seeds from seed_queue, plays games using shared-memory GPU
+    inference, pushes results to result_queue. Exits on None sentinel.
+    """
+    torch.set_num_threads(1)
+
+    from multiprocessing.shared_memory import SharedMemory
+    from alphatrain.inference_server import InferenceClient, OBS_SHAPE, POL_SIZE
+
+    obs_shm = SharedMemory(name=obs_shm_name)
+    pol_shm = SharedMemory(name=pol_shm_name)
+    val_shm = SharedMemory(name=val_shm_name)
+
+    N, B = num_workers, max_batch
+    obs_buf = np.ndarray((N, B) + OBS_SHAPE, dtype=np.float32, buffer=obs_shm.buf)
+    pol_buf = np.ndarray((N, B, POL_SIZE), dtype=np.float32, buffer=pol_shm.buf)
+    val_buf = np.ndarray((N, B), dtype=np.float32, buffer=val_shm.buf)
+
+    client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
+                             request_queue, response_queue)
+    mcts = MCTS(inference_client=client, max_score=max_score,
+                num_simulations=num_sims, batch_size=batch_size,
+                top_k=30, c_puct=2.5)
+
+    while True:
+        seed = seed_queue.get()
+        if seed is None:
+            break
+
+        result = play_selfplay_game(
+            mcts, seed,
+            temperature_moves=temperature_moves,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_weight=dirichlet_weight,
+            gamma=gamma)
+
+        print(f"  [w{slot_id}] seed={seed}: score={result['score']}, "
+              f"turns={result['turns']}, {result['time']:.0f}s", flush=True)
+
+        result_queue.put(result)
+
+    obs_shm.close()
+    pol_shm.close()
+    val_shm.close()
+
+
 def _worker_play(args):
-    """Worker function for multiprocessing."""
+    """Worker function for CPU multiprocessing."""
     seed, model_path, device_str, num_sims, batch_size, \
         temperature_moves, dirichlet_alpha, dirichlet_weight, gamma = args
 
@@ -265,8 +318,8 @@ def main():
             print(f"  [{i+1}/{n_games}] seed={seed}: score={result['score']}, "
                   f"turns={result['turns']}, {result['time']:.0f}s "
                   f"(ETA {eta/60:.0f}m)", flush=True)
-    else:
-        # CPU multiprocessing — set env vars before Pool so children inherit
+    elif device_str == 'cpu':
+        # CPU multiprocessing — env vars already set at module top
         _limit_threads()
         from multiprocessing import Pool
         worker_args = [
@@ -297,6 +350,75 @@ def main():
 
                 print(f"  [{i+1}/{n_games}] saved game_{result['seed']:06d}.pt "
                       f"(ETA {eta/60:.0f}m)", flush=True)
+
+    else:
+        # GPU server mode: workers>1 + MPS/CUDA
+        # N CPU workers share one GPU via InferenceServer.
+        # Each game runs identical MCTS (SBS=8), GPU batches across games (IBS=8*N).
+        from multiprocessing import Process, Queue as MPQueue
+        from alphatrain.inference_server import InferenceServer
+
+        _limit_threads()
+
+        # Get max_score from checkpoint
+        ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
+        max_score = float(ckpt.get('max_score', 30000.0))
+        del ckpt
+
+        server = InferenceServer(args.model, args.workers,
+                                 device=device_str,
+                                 max_batch_per_worker=args.batch_size)
+        server.start()
+
+        seed_queue = MPQueue()
+        for s in seeds:
+            seed_queue.put(s)
+        for _ in range(args.workers):
+            seed_queue.put(None)  # sentinels
+
+        result_queue = MPQueue()
+
+        workers = []
+        for i in range(args.workers):
+            p = Process(
+                target=_server_worker,
+                args=(i, seed_queue, result_queue,
+                      server._obs_shm.name, server._pol_shm.name,
+                      server._val_shm.name,
+                      args.workers, args.batch_size,
+                      server.request_queue, server.response_queues[i],
+                      args.sims, args.batch_size, max_score,
+                      args.temperature_moves, args.dirichlet_alpha,
+                      args.dirichlet_weight, args.gamma))
+            p.start()
+            workers.append(p)
+
+        try:
+            for i in range(n_games):
+                result = result_queue.get(timeout=7200)
+
+                save_path = os.path.join(
+                    args.save_dir, f'game_{result["seed"]:06d}.pt')
+                torch.save({
+                    'observations': torch.from_numpy(result['observations']),
+                    'policy_targets': torch.from_numpy(result['policy_targets']),
+                    'value_targets': torch.from_numpy(result['value_targets']),
+                    'score': result['score'],
+                    'turns': result['turns'],
+                    'seed': result['seed'],
+                }, save_path)
+
+                total_states += result['turns']
+                total_score += result['score']
+                elapsed = time.time() - t0
+                eta = elapsed / (i + 1) * (n_games - i - 1)
+
+                print(f"  [{i+1}/{n_games}] saved game_{result['seed']:06d}.pt "
+                      f"(ETA {eta/60:.0f}m)", flush=True)
+        finally:
+            for p in workers:
+                p.join(timeout=30)
+            server.shutdown()
 
     elapsed = time.time() - t0
     mean_score = total_score / max(n_games, 1)

@@ -123,6 +123,10 @@ class InferenceServer:
             slot_id, self.obs_buf, self.pol_buf, self.val_buf,
             self.request_queue, self.response_queues[slot_id])
 
+    def is_alive(self):
+        """Check if the GPU inference process is still running."""
+        return self._process is not None and self._process.is_alive()
+
     def shutdown(self):
         self.request_queue.put(None)
         if self._process is not None:
