@@ -1,4 +1,4 @@
-"""Parallel MCTS evaluation with centralized GPU inference.
+"""Parallel evaluation: Policy and MCTS players.
 
 CPU workers handle game simulation + batched virtual loss MCTS.
 One GPU process handles all NN inference via shared memory.
@@ -6,14 +6,29 @@ One GPU process handles all NN inference via shared memory.
 Usage:
     python -m alphatrain.scripts.eval_parallel \
         --model alphatrain/data/alphatrain_td_best.pt \
-        --seeds 42 43 44 45 46 --games-per-seed 5 --simulations 400
+        --seeds 42 43 44 45 46 --games-per-seed 10 --simulations 800
+
+    # GPU server mode (faster with multiple workers):
+    python -m alphatrain.scripts.eval_parallel \
+        --model alphatrain/data/alphatrain_td_best.pt \
+        --seeds 42 43 44 45 46 --games-per-seed 10 --simulations 800 \
+        --device mps --workers 4
 """
+
+# Force single-threaded BLAS before imports (for CPU workers)
+import os
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMBA_NUM_THREADS'] = '1'
+os.environ['PYTHONUNBUFFERED'] = '1'
 
 import time
 import argparse
 import numpy as np
 import torch
-from multiprocessing import Process, Pool, Queue, cpu_count
+from multiprocessing import Process, Pool, Queue as MPQueue, cpu_count
 
 
 # ── Policy worker (CPU with local model) ────────────────────────────
@@ -33,12 +48,13 @@ def _play_policy(seed):
     return seed, result['score'], result['turns']
 
 
-# ── MCTS worker (CPU, model-free, shared memory inference) ──────────
+# ── MCTS eval worker (persistent, shared-memory GPU inference) ──────
 
-def _mcts_worker(seed, slot_id, obs_shm_name, pol_shm_name, val_shm_name,
-                 num_workers, max_batch, request_queue, response_queue,
-                 num_sims, c_puct, top_k, max_score, result_queue):
-    """Run one MCTS game using shared memory inference client."""
+def _eval_mcts_worker(slot_id, seed_queue, result_queue,
+                      obs_shm_name, pol_shm_name, val_shm_name,
+                      num_workers, max_batch, request_queue, response_queue,
+                      num_sims, c_puct, top_k, max_score):
+    """Persistent worker: pull seeds, play greedy MCTS games, push results."""
     torch.set_num_threads(1)
 
     from multiprocessing.shared_memory import SharedMemory
@@ -46,7 +62,6 @@ def _mcts_worker(seed, slot_id, obs_shm_name, pol_shm_name, val_shm_name,
     from alphatrain.mcts import MCTS
     from game.board import ColorLinesGame
 
-    # Attach to shared memory
     obs_shm = SharedMemory(name=obs_shm_name)
     pol_shm = SharedMemory(name=pol_shm_name)
     val_shm = SharedMemory(name=val_shm_name)
@@ -62,34 +77,38 @@ def _mcts_worker(seed, slot_id, obs_shm_name, pol_shm_name, val_shm_name,
                 num_simulations=num_sims, c_puct=c_puct, top_k=top_k,
                 batch_size=max_batch)
 
-    game = ColorLinesGame(seed=seed)
-    game.reset()
-    t0 = time.time()
-
-    while not game.game_over:
-        move = mcts.search(game)
-        if move is None:
+    while True:
+        seed = seed_queue.get()
+        if seed is None:
             break
-        result = game.move(move[0], move[1])
-        if not result['valid']:
-            break
-        if game.turns % 100 == 0:
-            elapsed = time.time() - t0
-            print(f"    [w{slot_id}] seed={seed} turn={game.turns} "
-                  f"score={game.score} {elapsed:.0f}s "
-                  f"({elapsed/game.turns*1000:.0f}ms/turn)", flush=True)
 
-    elapsed = time.time() - t0
-    ms_per_turn = elapsed / max(game.turns, 1) * 1000
-    print(f"  MCTS seed={seed}: score={game.score}, "
-          f"turns={game.turns}, {elapsed:.0f}s "
-          f"({ms_per_turn:.0f}ms/turn)", flush=True)
+        game = ColorLinesGame(seed=seed)
+        game.reset()
+        t0 = time.time()
+
+        while not game.game_over:
+            move = mcts.search(game)
+            if move is None:
+                break
+            r = game.move(move[0], move[1])
+            if not r['valid']:
+                break
+            if game.turns % 500 == 0:
+                elapsed = time.time() - t0
+                print(f"    [w{slot_id}] seed={seed} turn={game.turns} "
+                      f"score={game.score} {elapsed:.0f}s", flush=True)
+
+        elapsed = time.time() - t0
+        ms_per_turn = elapsed / max(game.turns, 1) * 1000
+        print(f"  [w{slot_id}] seed={seed}: score={game.score}, "
+              f"turns={game.turns}, {elapsed:.0f}s "
+              f"({ms_per_turn:.0f}ms/turn)", flush=True)
+
+        result_queue.put((seed, game.score, game.turns))
 
     obs_shm.close()
     pol_shm.close()
     val_shm.close()
-
-    result_queue.put((seed, game.score, game.turns))
 
 
 def main():
@@ -100,15 +119,28 @@ def main():
     p.add_argument('--simulations', type=int, default=400)
     p.add_argument('--c-puct', type=float, default=2.5)
     p.add_argument('--top-k', type=int, default=30)
-    p.add_argument('--batch-size', type=int, default=16)
+    p.add_argument('--batch-size', type=int, default=8)
+    p.add_argument('--device', default=None,
+                   help='Force device (mps/cuda/cpu). Auto-detect if not set.')
+    p.add_argument('--workers', type=int, default=1,
+                   help='MCTS workers (1=sequential, >1=GPU server mode)')
     p.add_argument('--policy-only', action='store_true')
     p.add_argument('--mcts-only', action='store_true')
     args = p.parse_args()
 
+    if args.device:
+        device_str = args.device
+    elif torch.backends.mps.is_available():
+        device_str = 'mps'
+    elif torch.cuda.is_available():
+        device_str = 'cuda'
+    else:
+        device_str = 'cpu'
+
     seeds = args.seeds
     n_per = args.games_per_seed
     total = len(seeds) * n_per
-    n_workers = min(cpu_count(), total)
+    n_cpu = min(cpu_count(), total)
 
     print(f"Evaluation: {len(seeds)} seeds x {n_per} games = {total} games",
           flush=True)
@@ -122,10 +154,10 @@ def main():
     pol_results = []
     if not args.mcts_only:
         print(f"\n{'='*60}", flush=True)
-        print(f"Policy player ({total} games, {n_workers} CPU workers)", flush=True)
+        print(f"Policy player ({total} games, {n_cpu} CPU workers)", flush=True)
         print(f"{'='*60}", flush=True)
         t0 = time.time()
-        with Pool(n_workers, initializer=_init_policy_worker,
+        with Pool(n_cpu, initializer=_init_policy_worker,
                   initargs=(args.model,)) as pool:
             pol_results = pool.map(_play_policy, task_seeds)
         print(f"Policy done: {time.time()-t0:.1f}s", flush=True)
@@ -133,7 +165,10 @@ def main():
     # ── MCTS evaluation ──
     mcts_results = []
     if not args.policy_only:
-        mcts_results = _run_mcts_local(args, task_seeds, total)
+        if args.workers > 1 and device_str != 'cpu':
+            mcts_results = _run_mcts_server(args, task_seeds, total, device_str)
+        else:
+            mcts_results = _run_mcts_local(args, task_seeds, total, device_str)
 
     # ── Results ──
     _print_results_table(seeds, n_per, pol_results, mcts_results,
@@ -141,25 +176,21 @@ def main():
                    show_mcts=not args.policy_only)
 
 
-def _run_mcts_local(args, task_seeds, total):
-    """Run MCTS games sequentially on local MPS with fp16+jit."""
-    from alphatrain.evaluate import load_model, play_game
+def _run_mcts_local(args, task_seeds, total, device_str):
+    """Run MCTS games sequentially on local device."""
+    from alphatrain.evaluate import load_model
     from alphatrain.mcts import make_mcts_player
     from game.board import ColorLinesGame
 
-    if torch.backends.mps.is_available():
-        device = torch.device('mps')
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-    else:
-        device = torch.device('cpu')
+    device = torch.device(device_str)
 
     print(f"\n{'='*60}", flush=True)
     print(f"MCTS player ({total} games, local {device}, fp16+jit, "
           f"{args.simulations} sims, bs={args.batch_size})", flush=True)
     print(f"{'='*60}", flush=True)
 
-    net, max_score = load_model(args.model, device, fp16=True, jit_trace=True)
+    net, max_score = load_model(args.model, device,
+                                fp16=(device_str != 'cpu'), jit_trace=True)
     player = make_mcts_player(
         net, device, max_score=max_score,
         num_simulations=args.simulations,
@@ -194,12 +225,14 @@ def _run_mcts_local(args, task_seeds, total):
     return results
 
 
-def _run_mcts_server(args, task_seeds, total, n_workers):
-    """Run MCTS games in parallel via GPU inference server."""
+def _run_mcts_server(args, task_seeds, total, device_str):
+    """Run MCTS games in parallel via GPU inference server with persistent workers."""
     from alphatrain.inference_server import InferenceServer
 
+    n_workers = args.workers
+
     print(f"\n{'='*60}", flush=True)
-    print(f"MCTS player ({total} games, {n_workers} workers + GPU, "
+    print(f"MCTS player ({total} games, {n_workers} workers + {device_str} GPU, "
           f"{args.simulations} sims, bs={args.batch_size})", flush=True)
     print(f"{'='*60}", flush=True)
 
@@ -207,44 +240,50 @@ def _run_mcts_server(args, task_seeds, total, n_workers):
     max_score = float(ckpt.get('max_score', 30000.0))
     del ckpt
 
-    server = InferenceServer(args.model, n_workers,
+    server = InferenceServer(args.model, n_workers, device=device_str,
                              max_batch_per_worker=args.batch_size)
     server.start()
 
+    seed_queue = MPQueue()
+    for s in task_seeds:
+        seed_queue.put(s)
+    for _ in range(n_workers):
+        seed_queue.put(None)
+
+    result_queue = MPQueue()
+
+    workers = []
+    for i in range(n_workers):
+        proc = Process(
+            target=_eval_mcts_worker,
+            args=(i, seed_queue, result_queue,
+                  server._obs_shm.name, server._pol_shm.name,
+                  server._val_shm.name,
+                  n_workers, args.batch_size,
+                  server.request_queue, server.response_queues[i],
+                  args.simulations, args.c_puct, args.top_k, max_score))
+        proc.start()
+        workers.append(proc)
+
     results = []
     t0 = time.time()
-    remaining = list(task_seeds)
+    try:
+        for i in range(total):
+            seed, score, turns = result_queue.get(timeout=7200)
+            results.append((seed, score, turns))
 
-    while remaining:
-        batch = remaining[:n_workers]
-        remaining = remaining[len(batch):]
-
-        processes = []
-        result_queues = []
-        for i, seed in enumerate(batch):
-            rq = Queue()
-            result_queues.append(rq)
-            proc = Process(
-                target=_mcts_worker,
-                args=(seed, i,
-                      server._obs_shm.name, server._pol_shm.name,
-                      server._val_shm.name,
-                      n_workers, args.batch_size,
-                      server.request_queue, server.response_queues[i],
-                      args.simulations, args.c_puct, args.top_k,
-                      max_score, rq))
-            proc.start()
-            processes.append(proc)
-
-        for proc, rq in zip(processes, result_queues):
-            result = rq.get(timeout=1800)
-            results.append(result)
-            proc.join()
+            elapsed = time.time() - t0
+            eta = elapsed / (i + 1) * (total - i - 1)
+            print(f"  [{i+1}/{total}] seed={seed}: score={score}, "
+                  f"turns={turns} (ETA {eta:.0f}s)", flush=True)
+    finally:
+        for proc in workers:
+            proc.join(timeout=30)
+        server.shutdown()
 
     mcts_time = time.time() - t0
     print(f"MCTS done: {mcts_time:.0f}s ({mcts_time/total:.0f}s/game)",
           flush=True)
-    server.shutdown()
     return results
 
 
