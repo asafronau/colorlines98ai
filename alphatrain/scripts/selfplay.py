@@ -15,7 +15,18 @@ Usage:
         --seed-start 500 --seed-end 1000 --sims 800 --device cpu --workers 88
 """
 
+# Force single-threaded BLAS/OpenMP BEFORE importing numpy/torch.
+# Critical for CPU multiprocessing: without this, each worker spawns
+# hidden BLAS threads causing contention that destroys MCTS quality.
+# On Linux (fork), env vars must be set before library initialization.
 import os
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMBA_NUM_THREADS'] = '1'
+os.environ['PYTHONUNBUFFERED'] = '1'
+
 import time
 import argparse
 import numpy as np
@@ -119,12 +130,17 @@ def play_selfplay_game(mcts, seed, temperature_moves=30,
     }
 
 
+def _limit_threads():
+    """Force single-threaded torch (env vars already set at module top)."""
+    torch.set_num_threads(1)
+
+
 def _worker_play(args):
     """Worker function for multiprocessing."""
     seed, model_path, device_str, num_sims, batch_size, \
         temperature_moves, dirichlet_alpha, dirichlet_weight, gamma = args
 
-    torch.set_num_threads(1)
+    _limit_threads()
     device = torch.device(device_str)
 
     # Load model (each worker loads independently)
@@ -176,8 +192,26 @@ def main():
         device_str = 'cpu'
 
     seeds = list(range(args.seed_start, args.seed_end))
-    n_games = len(seeds)
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # Resume: skip seeds with existing game files
+    completed = set()
+    for f in os.listdir(args.save_dir):
+        if f.startswith('game_') and f.endswith('.pt'):
+            try:
+                completed.add(int(f[5:11]))
+            except ValueError:
+                pass
+    if completed:
+        before = len(seeds)
+        seeds = [s for s in seeds if s not in completed]
+        print(f"Resume: {len(completed)} games found, "
+              f"skipping {before - len(seeds)} seeds", flush=True)
+    n_games = len(seeds)
+
+    if n_games == 0:
+        print("All games already completed!", flush=True)
+        return
 
     print(f"Self-play: {n_games} games (seeds {args.seed_start}-{args.seed_end-1})",
           flush=True)
@@ -194,7 +228,9 @@ def main():
     total_score = 0
 
     if args.workers <= 1:
-        # Local mode: single process, MPS/CUDA
+        # Local mode: single process
+        if device_str == 'cpu':
+            _limit_threads()
         net, max_score = load_model(args.model, torch.device(device_str),
                                     fp16=(device_str != 'cpu'),
                                     jit_trace=True)
@@ -230,7 +266,8 @@ def main():
                   f"turns={result['turns']}, {result['time']:.0f}s "
                   f"(ETA {eta/60:.0f}m)", flush=True)
     else:
-        # CPU multiprocessing
+        # CPU multiprocessing — set env vars before Pool so children inherit
+        _limit_threads()
         from multiprocessing import Pool
         worker_args = [
             (seed, args.model, 'cpu', args.sims, args.batch_size,
