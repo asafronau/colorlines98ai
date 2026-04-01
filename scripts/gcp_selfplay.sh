@@ -42,6 +42,11 @@ echo "Sims: $SIMS, batch_size: $BS"
 
 cd "$HOME"
 
+# Install system dependencies
+echo "Installing system packages..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq python3 python3-venv python3-pip > /dev/null
+
 # Extract code tarball
 if [ -f colorlines98.tar.gz ]; then
     echo "Extracting code..."
@@ -60,7 +65,7 @@ if [ ! -d .venv ]; then
 fi
 source .venv/bin/activate
 
-echo "Installing dependencies (CPU-only torch)..."
+echo "Installing Python dependencies (CPU-only torch)..."
 pip install -q --upgrade pip
 pip install -q torch --index-url https://download.pytorch.org/whl/cpu
 pip install -q numpy numba scipy pytest
