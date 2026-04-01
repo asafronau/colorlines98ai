@@ -1,17 +1,33 @@
 #!/bin/bash
 # GCP self-play deployment script.
 #
-# Run from local machine:
-#   1. gcloud compute instances start coloreval98 --zone=us-central1-b
-#   2. gcloud compute scp alphatrain/data/alphatrain_td_best.pt coloreval98:~/model.pt --zone=us-central1-b
-#   3. gcloud compute ssh coloreval98 --zone=us-central1-b -- bash -s < scripts/gcp_selfplay.sh
-#   4. gcloud compute ssh coloreval98 --zone=us-central1-b -- tail -f ~/selfplay.log
-#   5. gcloud compute scp --recurse coloreval98:~/selfplay_data/ data/selfplay/ --zone=us-central1-b
-#   6. gcloud compute instances stop coloreval98 --zone=us-central1-b
+# From local machine:
+#
+#   # 1. Start instance
+#   gcloud compute instances start coloreval98 --zone=us-central1-b
+#
+#   # 2. Build tarball and upload code + model
+#   tar czf /tmp/colorlines98.tar.gz \
+#       --exclude='.venv' --exclude='data' --exclude='alphatrain/data' \
+#       --exclude='*.tar.gz' --exclude='__pycache__' --exclude='.git' \
+#       -C /Users/andreis/local/source colorlines98
+#   gcloud compute scp /tmp/colorlines98.tar.gz coloreval98:~ --zone=us-central1-b
+#   gcloud compute scp alphatrain/data/alphatrain_td_best.pt coloreval98:~/model.pt --zone=us-central1-b
+#
+#   # 3. SSH and run setup + selfplay
+#   gcloud compute ssh coloreval98 --zone=us-central1-b -- bash -s < scripts/gcp_selfplay.sh
+#
+#   # 4. Monitor
+#   gcloud compute ssh coloreval98 --zone=us-central1-b -- tail -f ~/selfplay.log
+#
+#   # 5. Download results
+#   gcloud compute scp --recurse coloreval98:~/selfplay_data/ data/selfplay/ --zone=us-central1-b
+#
+#   # 6. Stop instance
+#   gcloud compute instances stop coloreval98 --zone=us-central1-b
 
 set -euo pipefail
 
-REPO="https://github.com/anthropics/colorlines98.git"
 GAMES=300
 SEED_START=0
 SIMS=800
@@ -24,18 +40,20 @@ echo "vCPUs: $WORKERS"
 echo "Games: $GAMES (seeds $SEED_START-$((SEED_START + GAMES - 1)))"
 echo "Sims: $SIMS, batch_size: $BS"
 
-# Clone or pull repo
 cd "$HOME"
-if [ -d colorlines98 ]; then
-    echo "Updating repo..."
-    cd colorlines98 && git pull
+
+# Extract code tarball
+if [ -f colorlines98.tar.gz ]; then
+    echo "Extracting code..."
+    tar xzf colorlines98.tar.gz
 else
-    echo "Cloning repo..."
-    git clone "$REPO" colorlines98
-    cd colorlines98
+    echo "ERROR: ~/colorlines98.tar.gz not found. Upload it first."
+    exit 1
 fi
 
-# Setup venv with CPU-only torch (smaller, faster install)
+cd colorlines98
+
+# Setup venv with CPU-only torch
 if [ ! -d .venv ]; then
     echo "Creating venv..."
     python3 -m venv .venv
@@ -51,14 +69,13 @@ pip install -q numpy numba scipy pytest
 if [ -f "$HOME/model.pt" ]; then
     mkdir -p alphatrain/data
     cp "$HOME/model.pt" alphatrain/data/alphatrain_td_best.pt
-    echo "Model copied to alphatrain/data/"
+    echo "Model copied."
 else
-    echo "ERROR: ~/model.pt not found. Upload it first:"
-    echo "  gcloud compute scp alphatrain/data/alphatrain_td_best.pt coloreval98:~/model.pt --zone=us-central1-b"
+    echo "ERROR: ~/model.pt not found. Upload it first."
     exit 1
 fi
 
-# Quick sanity test
+# Sanity test
 echo "Running tests..."
 python -m pytest alphatrain/tests/test_mcts.py -v --tb=short 2>&1 | tail -3
 
@@ -69,7 +86,6 @@ SEED_END=$((SEED_START + GAMES))
 echo ""
 echo "=== Starting Self-Play ==="
 echo "Output: ~/selfplay.log"
-echo "Monitor: tail -f ~/selfplay.log"
 echo ""
 
 nohup python -m alphatrain.scripts.selfplay \
@@ -84,5 +100,5 @@ nohup python -m alphatrain.scripts.selfplay \
     > "$HOME/selfplay.log" 2>&1 &
 
 echo "Self-play started (PID: $!)"
-echo "Check progress: tail -f ~/selfplay.log"
-echo "Check games: ls $SAVE_DIR/game_*.pt | wc -l"
+echo "Monitor: tail -f ~/selfplay.log"
+echo "Check: ls $SAVE_DIR/game_*.pt 2>/dev/null | wc -l"
