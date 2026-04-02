@@ -663,3 +663,69 @@ class TensorDatasetGPU(Dataset):
     @property
     def num_bins(self):
         return self.num_value_bins
+
+
+class SelfPlayDataset(Dataset):
+    """GPU-resident dataset for self-play training data.
+
+    Pre-computed observations + dense policy targets + scalar value targets.
+    Supports 8x dihedral augmentation (reuses TensorDatasetGPU LUTs).
+    """
+
+    def __init__(self, tensor_path, augment=True, device='cuda'):
+        print(f"Loading self-play tensors to {device}...", flush=True)
+        t0 = time.time()
+        data = torch.load(tensor_path, weights_only=False)
+
+        self.device = torch.device(device)
+        self.obs = data['observations'].to(self.device)     # (N, 18, 9, 9)
+        self.pol = data['policy_targets'].to(self.device)    # (N, 6561)
+        self.val = data['value_targets'].to(self.device)     # (N,) scalar
+        self.max_score = float(data['max_score'])
+        self.num_value_bins = 1  # scalar value head
+        self.has_pairs = False
+
+        self.augment = augment
+        self.augment_factor = 8 if augment else 1
+
+        # Dihedral LUTs on GPU (reuse module-level tables)
+        self._obs_luts = torch.tensor(
+            np.stack(_OBS_LUTS), dtype=torch.long, device=self.device)
+        self._pol_luts = torch.tensor(
+            np.stack(_POL_LUTS), dtype=torch.long, device=self.device)
+
+        n = self.obs.shape[0]
+        print(f"Loaded {n:,} states in {time.time()-t0:.1f}s "
+              f"(x{self.augment_factor} = {n * self.augment_factor:,} effective)",
+              flush=True)
+
+    def __len__(self):
+        return self.obs.shape[0] * self.augment_factor
+
+    def __getitem__(self, idx):
+        return idx
+
+    def collate(self, indices):
+        """Build batch: (obs, policy, value_scalar)."""
+        indices = torch.tensor(indices, dtype=torch.long, device=self.device)
+        base = indices // self.augment_factor
+        transforms = indices % self.augment_factor
+
+        obs = self.obs[base].clone()
+        pol = self.pol[base].clone()
+        val = self.val[base]
+
+        # Apply dihedral augmentation
+        for t in range(1, 8 if self.augment else 1):
+            mask = transforms == t
+            if not mask.any():
+                continue
+            obs[mask] = obs[mask].reshape(-1, NUM_CHANNELS, 81
+                )[:, :, self._obs_luts[t]].reshape(-1, NUM_CHANNELS, 9, 9)
+            pol[mask] = pol[mask][:, self._pol_luts[t]]
+
+        return obs, pol, val
+
+    @property
+    def num_bins(self):
+        return self.num_value_bins
