@@ -413,3 +413,81 @@ virtual losses make selection near-random. bs=8 preserves search quality.
    in `alphatrain/scripts/` and run with `python -m`.
 
 7. **Validate value head rank-correlation before building search on top of it.**
+
+---
+
+## Phase 4: Self-Play Infrastructure & Training Iterations
+
+### Self-Play Data Generation (493 games, 800 sims)
+- Built GPU server mode: N CPU workers share one GPU via InferenceServer
+- 16 workers on M5 Max: ~7900 evals/s, avg IBS=63
+- Generated 493 games (seeds 0-499): 277K states, mean score 1161, max 6896
+- Resume-safe: each game saved individually, skips completed seeds
+
+### CPU Threading Bug Fix
+CPU self-play scored 60 (vs MPS 1216) for same seed. Root cause: hidden BLAS
+threads (OpenBLAS/Accelerate) not controlled by `torch.set_num_threads(1)`.
+Fix: set OMP/MKL/OPENBLAS/VECLIB/NUMBA_NUM_THREADS=1 at module top, before
+importing numpy/torch. Verified: CPU scores 2580+ at turn 1200.
+
+### Evaluation Baselines (50 games each, seeds 42-46 × 10)
+| Player              | Sims | Mean | Median | Min | Max  |
+|---------------------|------|------|--------|-----|------|
+| Policy (greedy)     | —    |  314 |    342 | 174 |  489 |
+| MCTS (400 sims)     | 400  |  911 |    795 | 311 | 2023 |
+| MCTS (800 sims)     | 800  | 1053 |    918 | 269 | 3337 |
+
+### Self-Play Training Iteration 1a: Pure Self-Play (FAILED)
+- Data: 277K self-play states only, raw MCTS visit distributions (T=1.0)
+- Config: lr=3e-4, 10 epochs, warm start
+- **Result: Policy 314 → 118 (-62%)**
+- Policy loss flat at 3.82 (matched target entropy, never improved)
+- Diagnosis: soft targets + no expert anchoring = catastrophic forgetting
+
+### Iteration 1b: 50/50 Mixed + Sharpened (FAILED)
+- Data: 277K expert + 277K self-play, T=0.1 sharpening (entropy 3.82 → 0.28)
+- Config: lr=1e-4, 10 epochs, warm start, val_weight=1.0
+- **Result: Policy 314 → 245 (-22%), MCTS 911 → 362 (-60%)**
+- Root cause: value loss (860) was 600x policy loss (1.4)
+- Value gradients destroyed backbone features through shared ResNet
+
+### Iteration 1c: Rebalanced + From Scratch (FAILED)
+- Data: 200K expert + 200K elite self-play (score>1000), T=0.1
+- Config: lr=1e-3, 20 epochs, **from scratch**, val_weight=0.002
+- **Result: Policy 111 (worst yet)**
+- Train/val gap: pol 1.18/2.20 — massive overfitting
+- Training from scratch threw away valuable backbone features
+
+### Frozen Backbone Experiment (FAILED)
+- Froze backbone + policy head, trained value head only on expert pairwise data
+- **Result: Value head couldn't learn (rank=0.0012 flat, MAE=18→19)**
+- Backbone features optimized for policy don't carry sufficient value signal
+- Confirms: value head NEEDS its own adapted features
+
+### Key Insight: The Backbone Conflict
+The shared ResNet backbone is the root cause of all failures:
+- Value head needs backbone adaptation → but that destroys policy features
+- Frozen backbone prevents policy damage → but value can't learn
+- Loss imbalance (value 600x policy) makes the conflict worse
+
+**Decision: Decouple into separate PolicyNet and ValueNet.**
+- PolicyNet: current best model (policy=314), frozen during value training
+- ValueNet: trained from scratch on self-play MCTS Q-values
+- No shared backbone → no gradient conflict
+- Self-improvement loop: MCTS (policy priors + value eval) → self-play → train value → repeat
+
+### Lessons Learned (Phase 4)
+8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
+   value gradients steamroll policy features in shared backbone. Always check loss magnitudes.
+
+9. **Training from scratch requires massive data.** 400K states with 8x augmentation is not enough
+   for a 12M param model. Fine-tuning preserves valuable features.
+
+10. **The "Dumber Teacher" problem.** Self-play MCTS (1100 mean) is weaker than the heuristic
+    teacher (5700 mean). Training on weaker data regresses the model.
+
+11. **Shared backbones create gradient conflicts.** Policy and value heads need different features.
+    When one dominates training, it corrupts features needed by the other.
+
+12. **Separate networks solve the backbone war.** Independent PolicyNet and ValueNet eliminate
+    gradient conflicts entirely. This is the correct architecture for AlphaZero.
