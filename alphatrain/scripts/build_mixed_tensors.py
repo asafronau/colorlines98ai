@@ -87,17 +87,48 @@ def main():
                    help='Temperature for sharpening self-play policy (0.1=sharp)')
     p.add_argument('--max-expert', type=int, default=0,
                    help='Max expert states to use (0=match selfplay count)')
+    p.add_argument('--min-game-score', type=int, default=0,
+                   help='Only include self-play games scoring above this (0=all)')
     p.add_argument('--max-score', type=float, default=500.0)
     args = p.parse_args()
 
-    # ── Load self-play data ──
+    # ── Load self-play data (with optional elite filtering) ──
     print("Loading self-play data...", flush=True)
-    sp = torch.load(args.selfplay, weights_only=False)
-    sp_obs = sp['observations']
-    sp_pol = sp['policy_targets']
-    sp_val = sp['value_targets']
-    n_sp = sp_obs.shape[0]
-    print(f"  Self-play: {n_sp:,} states", flush=True)
+    if args.min_game_score > 0:
+        # Load individual games and filter by score
+        import glob
+        games_dir = os.path.dirname(args.selfplay) or 'data/selfplay'
+        # Try loading from merged tensor first, fall back to individual games
+        sp = torch.load(args.selfplay, weights_only=False)
+        if 'game_scores' in sp:
+            # Merged file with per-game info — not supported yet, use raw games
+            pass
+        # Reload from individual game files for filtering
+        game_files = sorted(glob.glob(os.path.join('data/selfplay', 'game_*.pt')))
+        sp_obs_list, sp_pol_list, sp_val_list = [], [], []
+        n_filtered = 0
+        for gf in game_files:
+            g = torch.load(gf, weights_only=False)
+            if g['score'] >= args.min_game_score and g['turns'] > 0:
+                sp_obs_list.append(g['observations'])
+                sp_pol_list.append(g['policy_targets'])
+                sp_val_list.append(g['value_targets'])
+            else:
+                n_filtered += 1
+        sp_obs = torch.cat(sp_obs_list)
+        sp_pol = torch.cat(sp_pol_list)
+        sp_val = torch.cat(sp_val_list)
+        n_sp = sp_obs.shape[0]
+        print(f"  Self-play: {n_sp:,} states from {len(sp_obs_list)} games "
+              f"(filtered {n_filtered} games below score {args.min_game_score})",
+              flush=True)
+    else:
+        sp = torch.load(args.selfplay, weights_only=False)
+        sp_obs = sp['observations']
+        sp_pol = sp['policy_targets']
+        sp_val = sp['value_targets']
+        n_sp = sp_obs.shape[0]
+        print(f"  Self-play: {n_sp:,} states", flush=True)
 
     # Sharpen self-play policy targets
     if args.policy_temperature < 1.0:
