@@ -162,7 +162,7 @@ def main():
         best_val = ckpt.get('best_val_loss', float('inf'))
         print(f"Resumed from epoch {start_epoch}", flush=True)
 
-    if args.compile and hasattr(torch, 'compile'):
+    if args.compile and hasattr(torch, 'compile') and device.type == 'cuda':
         model = torch.compile(model)
         print("torch.compile enabled", flush=True)
 

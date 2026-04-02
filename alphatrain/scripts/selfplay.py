@@ -228,6 +228,8 @@ def main():
                    help='Force device (mps/cuda/cpu). Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
                    help='Parallel workers (1=local MPS, >1=CPU multiprocessing)')
+    p.add_argument('--value-model', default=None,
+                   help='Separate ValueNet checkpoint (if None, use value head from --model)')
     p.add_argument('--save-dir', default='data/selfplay')
     p.add_argument('--temperature-moves', type=int, default=30)
     p.add_argument('--dirichlet-alpha', type=float, default=0.3)
@@ -284,9 +286,15 @@ def main():
         # Local mode: single process
         if device_str == 'cpu':
             _limit_threads()
-        net, max_score = load_model(args.model, torch.device(device_str),
-                                    fp16=(device_str != 'cpu'),
-                                    jit_trace=True)
+        if args.value_model:
+            from alphatrain.evaluate import load_dual_model
+            net, max_score = load_dual_model(
+                args.model, args.value_model, torch.device(device_str),
+                fp16=(device_str != 'cpu'), jit_trace=True)
+        else:
+            net, max_score = load_model(args.model, torch.device(device_str),
+                                        fp16=(device_str != 'cpu'),
+                                        jit_trace=True)
         mcts = MCTS(net, torch.device(device_str), max_score=max_score,
                      num_simulations=args.sims, batch_size=args.batch_size,
                      top_k=30, c_puct=2.5)
@@ -367,7 +375,8 @@ def main():
 
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
-                                 max_batch_per_worker=args.batch_size)
+                                 max_batch_per_worker=args.batch_size,
+                                 value_model_path=args.value_model)
         server.start()
 
         seed_queue = MPQueue()
