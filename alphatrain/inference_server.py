@@ -69,8 +69,10 @@ class InferenceClient:
 class InferenceServer:
     """Manages shared memory and GPU inference process."""
 
-    def __init__(self, model_path, num_workers, device=None, max_batch_per_worker=MAX_BATCH):
+    def __init__(self, model_path, num_workers, device=None,
+                 max_batch_per_worker=MAX_BATCH, value_model_path=None):
         self.model_path = model_path
+        self.value_model_path = value_model_path
         self.num_workers = num_workers
         self.max_batch = max_batch_per_worker
 
@@ -113,7 +115,8 @@ class InferenceServer:
             args=(self.model_path, self.device_str,
                   self.num_workers, self.max_batch,
                   self._obs_shm.name, self._pol_shm.name, self._val_shm.name,
-                  self.request_queue, self.response_queues),
+                  self.request_queue, self.response_queues,
+                  self.value_model_path),
             daemon=True)
         self._process.start()
 
@@ -140,7 +143,7 @@ class InferenceServer:
 
 def _gpu_loop(model_path, device_str, num_workers, max_batch,
               obs_shm_name, pol_shm_name, val_shm_name,
-              request_queue, response_queues):
+              request_queue, response_queues, value_model_path=None):
     """GPU inference process main loop."""
     # Attach to shared memory
     obs_shm = SharedMemory(name=obs_shm_name)
@@ -156,13 +159,19 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     device = torch.device(device_str)
     from alphatrain.evaluate import load_model
     net, max_score = load_model(model_path, device)
-
-    # FP16 inference: ~2x faster forward pass on MPS
     net = net.half()
+    dummy = torch.randn(1, 18, 9, 9, device=device).half()
+    net_traced = torch.jit.trace(net, dummy)
 
-    # JIT trace for forward pass (~10-15% faster, no control flow in ResNet)
-    # Keep original net for predict_value (not part of forward)
-    net_traced = torch.jit.trace(net, torch.randn(1, 18, 9, 9, device=device).half())
+    # Separate ValueNet (if provided)
+    value_net_traced = None
+    value_predict = None
+    if value_model_path:
+        from alphatrain.evaluate import load_value_model
+        vnet, max_score = load_value_model(value_model_path, device)
+        vnet = vnet.half()
+        value_net_traced = torch.jit.trace(vnet, dummy)
+        value_predict = vnet.predict_value
 
     # Pre-allocate GPU-side batch buffer in fp16
     max_total = num_workers * max_batch
@@ -172,8 +181,9 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     total_batches = 0
     t_start = time.time()
 
+    mode = "dual-model" if value_model_path else "single-model"
     print(f"GPU inference server ready ({device_str}, fp16+jit, "
-          f"{num_workers} slots, max_batch={max_batch})", flush=True)
+          f"{num_workers} slots, max_batch={max_batch}, {mode})", flush=True)
 
     # Cap GPU batch — too large hurts per-eval latency on MPS
     GPU_BATCH_CAP = 128
@@ -205,10 +215,17 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                 obs_buf[slot_id, :count]).half()
             total_count += count
 
-        # One forward pass (fp16, JIT traced)
+        # Forward pass(es) — fp16, JIT traced
         with torch.inference_mode():
-            pol_logits, val_logits = net_traced(gpu_obs[:total_count])
-            values = net.predict_value(val_logits, max_val=max_score)
+            if value_net_traced is not None:
+                # Dual model: policy from main net, value from separate net
+                pol_logits, _ = net_traced(gpu_obs[:total_count])
+                val_logits = value_net_traced(gpu_obs[:total_count])
+                values = value_predict(val_logits, max_val=max_score)
+            else:
+                # Single dual-head model (legacy)
+                pol_logits, val_logits = net_traced(gpu_obs[:total_count])
+                values = net.predict_value(val_logits, max_val=max_score)
 
         # Write results to shared memory (cast back to fp32 for workers)
         pol_cpu = pol_logits.float().cpu()

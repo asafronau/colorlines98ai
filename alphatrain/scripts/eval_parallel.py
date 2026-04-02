@@ -124,6 +124,8 @@ def main():
                    help='Force device (mps/cuda/cpu). Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
                    help='MCTS workers (1=sequential, >1=GPU server mode)')
+    p.add_argument('--value-model', default=None,
+                   help='Separate ValueNet checkpoint (dual-model mode)')
     p.add_argument('--policy-only', action='store_true')
     p.add_argument('--mcts-only', action='store_true')
     args = p.parse_args()
@@ -183,14 +185,22 @@ def _run_mcts_local(args, task_seeds, total, device_str):
     from game.board import ColorLinesGame
 
     device = torch.device(device_str)
+    dual = hasattr(args, 'value_model') and args.value_model
 
     print(f"\n{'='*60}", flush=True)
     print(f"MCTS player ({total} games, local {device}, fp16+jit, "
-          f"{args.simulations} sims, bs={args.batch_size})", flush=True)
+          f"{args.simulations} sims, bs={args.batch_size}"
+          f"{', dual-model' if dual else ''})", flush=True)
     print(f"{'='*60}", flush=True)
 
-    net, max_score = load_model(args.model, device,
-                                fp16=(device_str != 'cpu'), jit_trace=True)
+    if dual:
+        from alphatrain.evaluate import load_dual_model
+        net, max_score = load_dual_model(
+            args.model, args.value_model, device,
+            fp16=(device_str != 'cpu'), jit_trace=True)
+    else:
+        net, max_score = load_model(args.model, device,
+                                    fp16=(device_str != 'cpu'), jit_trace=True)
     player = make_mcts_player(
         net, device, max_score=max_score,
         num_simulations=args.simulations,
@@ -240,8 +250,10 @@ def _run_mcts_server(args, task_seeds, total, device_str):
     max_score = float(ckpt.get('max_score', 30000.0))
     del ckpt
 
+    value_path = getattr(args, 'value_model', None)
     server = InferenceServer(args.model, n_workers, device=device_str,
-                             max_batch_per_worker=args.batch_size)
+                             max_batch_per_worker=args.batch_size,
+                             value_model_path=value_path)
     server.start()
 
     seed_queue = MPQueue()
