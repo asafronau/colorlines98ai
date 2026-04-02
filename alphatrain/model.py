@@ -113,5 +113,83 @@ class AlphaTrainNet(nn.Module):
         return (probs * bins).sum(dim=-1)
 
 
+class ValueNet(nn.Module):
+    """Standalone value network for position evaluation.
+
+    Same 18-channel input as AlphaTrainNet but outputs only value prediction.
+    Smaller architecture (fewer blocks/channels) since value is simpler than policy.
+    """
+
+    def __init__(self, in_channels=18, num_blocks=6, channels=128,
+                 num_value_bins=1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.channels = channels
+        self.num_value_bins = num_value_bins
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+        )
+        self.blocks = nn.Sequential(*[ResBlock(channels) for _ in range(num_blocks)])
+        self.backbone_bn = nn.BatchNorm2d(channels)
+
+        self.value_conv = nn.Conv2d(channels, 8, 1, bias=False)
+        self.value_bn = nn.BatchNorm2d(8)
+        self.value_fc1 = nn.Linear(8 * BOARD_SIZE * BOARD_SIZE, 256)
+        self.value_fc2 = nn.Linear(256, num_value_bins)
+
+    def forward(self, x):
+        """Returns value_logits: (batch, num_value_bins)."""
+        out = self.stem(x)
+        out = self.blocks(out)
+        out = F.relu(self.backbone_bn(out))
+
+        v = F.relu(self.value_bn(self.value_conv(out)))
+        v = v.reshape(v.size(0), -1)
+        v = F.relu(self.value_fc1(v))
+        return self.value_fc2(v)
+
+    def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
+        if self.num_value_bins == 1:
+            return torch.sigmoid(value_logits.squeeze(-1)) * max_val
+        probs = F.softmax(value_logits, dim=-1)
+        bins = torch.linspace(min_val, max_val, self.num_value_bins,
+                              device=value_logits.device)
+        return (probs * bins).sum(dim=-1)
+
+
+class DualNetWrapper:
+    """Wraps separate PolicyNet + ValueNet with unified dual-head interface.
+
+    MCTS and InferenceServer see the same (pol_logits, val_logits) API.
+    Two forward passes through two independent backbones.
+    """
+
+    def __init__(self, policy_net, value_net):
+        self.policy_net = policy_net
+        self.value_net = value_net
+        self.num_value_bins = value_net.num_value_bins
+
+    def __call__(self, x):
+        pol_logits, _ = self.policy_net(x)
+        val_logits = self.value_net(x)
+        return pol_logits, val_logits
+
+    def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
+        return self.value_net.predict_value(value_logits, min_val, max_val)
+
+    def parameters(self):
+        """Yield all parameters from both models."""
+        yield from self.policy_net.parameters()
+        yield from self.value_net.parameters()
+
+    def train(self, mode=True):
+        self.policy_net.train(mode)
+        self.value_net.train(mode)
+        return self
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
