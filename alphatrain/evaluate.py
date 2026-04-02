@@ -13,7 +13,7 @@ import torch
 from typing import Callable, Optional
 
 from game.board import ColorLinesGame
-from alphatrain.model import AlphaTrainNet
+from alphatrain.model import AlphaTrainNet, ValueNet, DualNetWrapper
 from alphatrain.observation import build_observation
 
 BOARD_SIZE = 9
@@ -86,6 +86,50 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
           + (f", val_loss={val_loss:.4f}" if val_loss else "")
           + opt_str, flush=True)
     return net, max_score
+
+
+def load_value_model(model_path, device, fp16=False, jit_trace=False):
+    """Load a standalone ValueNet checkpoint."""
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    state = ckpt['model']
+    if any(k.startswith('_orig_mod.') for k in state):
+        state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
+
+    nb = sum(1 for k in state if k.endswith('.conv1.weight')
+             and k.startswith('blocks.'))
+    ch = state['stem.0.weight'].shape[0]
+    bins = state['value_fc2.weight'].shape[0]
+    in_ch = state['stem.0.weight'].shape[1]
+
+    net = ValueNet(in_channels=in_ch, num_blocks=nb, channels=ch,
+                   num_value_bins=bins).to(device)
+    net.load_state_dict(state)
+    net.train(False)
+    max_score = float(ckpt.get('max_score', 30000.0))
+
+    opts = []
+    if fp16 and device.type in ('mps', 'cuda'):
+        net = net.half()
+        opts.append('fp16')
+    if jit_trace:
+        dtype = torch.float16 if fp16 and device.type in ('mps', 'cuda') else torch.float32
+        dummy = torch.randn(1, in_ch, 9, 9, device=device, dtype=dtype)
+        net = _JitWrapper(net, dummy)
+        opts.append('jit')
+
+    opt_str = f" [{'+'.join(opts)}]" if opts else ""
+    print(f"Loaded ValueNet {model_path}: {nb}b x {ch}ch, "
+          f"max_score={max_score:.0f}{opt_str}", flush=True)
+    return net, max_score
+
+
+def load_dual_model(policy_path, value_path, device, fp16=False, jit_trace=False):
+    """Load separate PolicyNet + ValueNet, return DualNetWrapper."""
+    policy_net, _ = load_model(policy_path, device, fp16=fp16, jit_trace=jit_trace)
+    value_net, max_score = load_value_model(value_path, device,
+                                            fp16=fp16, jit_trace=jit_trace)
+    wrapper = DualNetWrapper(policy_net, value_net)
+    return wrapper, max_score
 
 
 def make_policy_player(net, device):
