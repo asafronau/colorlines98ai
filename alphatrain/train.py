@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 from alphatrain.model import AlphaTrainNet, count_parameters
-from alphatrain.dataset import TensorDatasetGPU
+from alphatrain.dataset import TensorDatasetGPU, SelfPlayDataset
 
 
 def cross_entropy_soft(logits, targets):
@@ -23,8 +23,8 @@ def cross_entropy_soft(logits, targets):
 
 def train_epoch(model, loader, optimizer, device, max_score=500.0,
                 num_value_bins=64, scaler=None, pairwise=False,
-                scalar_value=False, val_weight=1.0, rank_weight=1.0,
-                anchor_weight=0.0, log_interval=100):
+                scalar_value=False, selfplay=False, val_weight=1.0,
+                rank_weight=1.0, anchor_weight=0.0, log_interval=100):
     model.train()
     total_loss = 0
     total_pol = 0
@@ -50,21 +50,28 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
             pol_logits, val_logits = model(obs)
             pol_loss = cross_entropy_soft(pol_logits, pol_tgt)
 
-            # Value CE loss: only for categorical head (bins > 1)
-            if scalar_value:
+            if selfplay:
+                # Self-play: direct MSE on scalar value targets
+                v_pred = model.predict_value(val_logits, max_val=max_score)
+                val_loss = F.mse_loss(v_pred, val_tgt)
+                loss = pol_loss + val_weight * val_loss
+                anchor_loss = torch.tensor(0.0, device=device)
+            elif scalar_value:
+                # Legacy scalar head with anchor loss
                 val_loss = torch.tensor(0.0, device=device)
                 loss = pol_loss
             else:
+                # Categorical value head
                 val_loss = cross_entropy_soft(val_logits, val_tgt)
                 loss = pol_loss + val_weight * val_loss
 
             # Anchor loss: MSE between sigmoid-clamped prediction and TD target
-            if anchor_weight > 0 and scalar_value:
+            if not selfplay and anchor_weight > 0 and scalar_value:
                 v_pred = model.predict_value(val_logits, max_val=max_score)
                 true_scalar = (val_tgt * anchor_bins).sum(dim=-1)
                 anchor_loss = F.mse_loss(v_pred, true_scalar)
                 loss = loss + anchor_weight * anchor_loss
-            else:
+            elif not selfplay:
                 anchor_loss = torch.tensor(0.0, device=device)
 
             if pairwise:
@@ -119,15 +126,16 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
 
 @torch.no_grad()
 def validate(model, loader, device, max_score=30000.0, num_value_bins=64,
-             use_amp=False, scalar_value=False):
+             use_amp=False, scalar_value=False, selfplay=False):
     model.eval()
     total_loss = 0
     total_pol = 0
     total_val = 0
     total_mae = 0
     n = 0
-    # Bin centers for decoding two-hot to scalar
-    bins = torch.linspace(0, max_score, num_value_bins, device=device)
+    # Bin centers for decoding two-hot to scalar (legacy)
+    if not selfplay:
+        bins = torch.linspace(0, max_score, num_value_bins, device=device)
 
     for obs, pol_tgt, val_tgt in loader:
         obs = obs.to(device)
@@ -137,14 +145,20 @@ def validate(model, loader, device, max_score=30000.0, num_value_bins=64,
         with torch.amp.autocast('cuda', enabled=use_amp):
             pol_logits, val_logits = model(obs)
             pol_loss = cross_entropy_soft(pol_logits, pol_tgt)
-            if scalar_value:
+            if selfplay:
+                pred = model.predict_value(val_logits, max_val=max_score)
+                val_loss = F.mse_loss(pred, val_tgt)
+            elif scalar_value:
                 val_loss = torch.tensor(0.0, device=device)
             else:
                 val_loss = cross_entropy_soft(val_logits, val_tgt)
 
-        # MAE: scalar head uses sigmoid output vs decoded two-hot target
+        # MAE
         pred = model.predict_value(val_logits, max_val=max_score)
-        true = (val_tgt * bins).sum(dim=-1)
+        if selfplay:
+            true = val_tgt
+        else:
+            true = (val_tgt * bins).sum(dim=-1)
         mae = (pred - true).abs().mean()
 
         total_loss += (pol_loss + val_loss).item()
@@ -196,10 +210,18 @@ def main():
     print(f"Device: {device}", flush=True)
 
     gpu_data = args.gpu_data and device.type in ('cuda', 'mps')
-    if gpu_data:
-        dataset = TensorDatasetGPU(args.tensor_file, augment=True, device=str(device))
-    else:
+    if not gpu_data:
         raise NotImplementedError("Use --gpu-data")
+
+    # Detect data format
+    probe = torch.load(args.tensor_file, weights_only=False, map_location='cpu')
+    selfplay = (probe.get('format') == 'selfplay')
+    del probe
+
+    if selfplay:
+        dataset = SelfPlayDataset(args.tensor_file, augment=True, device=str(device))
+    else:
+        dataset = TensorDatasetGPU(args.tensor_file, augment=True, device=str(device))
 
     n_val = int(len(dataset) * args.val_split)
     n_train = len(dataset) - n_val
@@ -304,6 +326,7 @@ def main():
                                   num_value_bins=dataset.num_value_bins,
                                   scaler=scaler,
                                   pairwise=pairwise, scalar_value=scalar_value,
+                                  selfplay=selfplay,
                                   val_weight=args.val_weight,
                                   rank_weight=args.rank_weight,
                                   anchor_weight=args.anchor_weight)
@@ -311,7 +334,8 @@ def main():
                                    max_score=max_score,
                                    num_value_bins=dataset.num_value_bins,
                                    use_amp=use_amp,
-                                   scalar_value=scalar_value)
+                                   scalar_value=scalar_value,
+                                   selfplay=selfplay)
         scheduler.step()
 
         print(f"  Train: loss={tl:.4f} (pol={tp:.4f} val={tv:.4f})", flush=True)
