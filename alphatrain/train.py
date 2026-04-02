@@ -196,6 +196,8 @@ def main():
     p.add_argument('--resume', type=str, default=None)
     p.add_argument('--warm-start', action='store_true',
                    help='Load weights from --resume but reset optimizer/scheduler')
+    p.add_argument('--freeze-backbone', action='store_true',
+                   help='Freeze stem + blocks + policy head, train only value head')
     p.add_argument('--save-dir', default='checkpoints/alphatrain')
     p.add_argument('--copy-to', type=str, default=None)
     p.add_argument('--num-workers', type=int, default=8)
@@ -283,12 +285,28 @@ def main():
             print(f"Warm start: loaded weights from epoch {ckpt.get('epoch', '?')}, "
                   f"fresh optimizer/scheduler", flush=True)
 
+    # Freeze backbone + policy head if requested (train value head only)
+    if args.freeze_backbone:
+        frozen, trainable = 0, 0
+        value_prefixes = ('value_conv', 'value_bn', 'value_fc1', 'value_fc2')
+        for name, param in model.named_parameters():
+            if name.startswith(value_prefixes):
+                param.requires_grad_(True)
+                trainable += param.numel()
+            else:
+                param.requires_grad_(False)
+                frozen += param.numel()
+        print(f"Frozen backbone: {frozen:,} params frozen, "
+              f"{trainable:,} trainable (value head only)", flush=True)
+
     # torch.compile AFTER loading weights
     if args.compile and hasattr(torch, 'compile'):
         model = torch.compile(model)
         print("torch.compile enabled", flush=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+    # Only pass trainable params to optimizer
+    train_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(train_params, lr=args.lr,
                                    weight_decay=args.weight_decay)
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0,
