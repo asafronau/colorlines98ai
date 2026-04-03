@@ -50,11 +50,18 @@ Generate better data → train → repeat.
 
 ### Known Issues
 
-- [ ] **GPU server mode -14% quality gap**: 16-worker MCTS scores 335 vs 1-worker 389
-  (250 games each, same seeds, p<0.01). Individual inference outputs are numerically
-  identical (verified). Root cause unknown — may be related to batching latency
-  interacting with MCTS virtual loss timing. Not blocking (value head quality is the
-  primary bottleneck), but should be investigated before production self-play.
+- [ ] **GPU server mode -14% quality gap with multi-worker**: 16-worker MCTS scores
+  ~14% lower than 1-worker local mode (confirmed over 250 games, p<0.01).
+  Investigation findings:
+  - Individual inference outputs are numerically identical (zero diff verified)
+  - 1-worker server mode matches local mode (787 vs 736, within noise)
+  - Gap appears ONLY with multiple concurrent workers
+  - MPS batch-size non-determinism found (policy logits differ by 0.75 at different
+    batch sizes) — fixed with per-request processing, but gap persists
+  - Root cause likely MPS driver behavior with concurrent GPU access from multiple
+    processes. Not fixable from Python.
+  - Workaround: use 1-worker local mode for quality-critical evaluation. Multi-worker
+    is acceptable for self-play data generation.
 
 ## Development Rules
 

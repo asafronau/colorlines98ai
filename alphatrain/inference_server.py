@@ -194,51 +194,41 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
         if item is None:
             break
         pending = [item]  # list of (slot_id, count)
-        pending_obs = item[1]
 
-        # Drain additional pending requests (cap total obs)
-        while pending_obs < GPU_BATCH_CAP:
+        # Drain additional pending requests (don't leave them waiting)
+        while True:
             try:
                 item = request_queue.get_nowait()
                 if item is None:
                     request_queue.put(None)
                     break
                 pending.append(item)
-                pending_obs += item[1]
             except Empty:
                 break
 
-        # Gather obs from shared memory → fp16 GPU tensor
-        total_count = 0
-        for slot_id, count in pending:
-            gpu_obs[total_count:total_count + count] = torch.from_numpy(
-                obs_buf[slot_id, :count]).half()
-            total_count += count
-
-        # Forward pass(es) — fp16, JIT traced
+        # Process each worker's request individually to avoid MPS
+        # batch-size non-determinism (policy logits differ by up to 0.75
+        # between bs=8 and bs=64 on MPS due to different reduction orders).
         with torch.inference_mode():
-            if value_net_traced is not None:
-                # Dual model: policy from main net, value from separate net
-                pol_logits, _ = net_traced(gpu_obs[:total_count])
-                val_logits = value_net_traced(gpu_obs[:total_count])
-                values = value_predict(val_logits, max_val=max_score)
-            else:
-                # Single dual-head model (legacy)
-                pol_logits, val_logits = net_traced(gpu_obs[:total_count])
-                values = net.predict_value(val_logits, max_val=max_score)
+            for slot_id, count in pending:
+                gpu_obs[:count] = torch.from_numpy(
+                    obs_buf[slot_id, :count]).half()
 
-        # Write results to shared memory (cast back to fp32 for workers)
-        pol_cpu = pol_logits.float().cpu()
-        val_cpu = values.float().cpu()
-        offset = 0
-        for slot_id, count in pending:
-            pol_buf[slot_id, :count] = pol_cpu[offset:offset + count].numpy()
-            val_buf[slot_id, :count] = val_cpu[offset:offset + count].numpy()
-            offset += count
-            response_queues[slot_id].put(1)
+                if value_net_traced is not None:
+                    pol_logits, _ = net_traced(gpu_obs[:count])
+                    val_logits = value_net_traced(gpu_obs[:count])
+                    values = value_predict(val_logits, max_val=max_score)
+                else:
+                    pol_logits, val_logits = net_traced(gpu_obs[:count])
+                    values = net.predict_value(val_logits, max_val=max_score)
 
-        total_evals += total_count
-        total_batches += 1
+                pol_buf[slot_id, :count] = pol_logits.float().cpu().numpy()
+                val_buf[slot_id, :count] = values.float().cpu().numpy()
+                response_queues[slot_id].put(1)
+
+                total_evals += count
+
+        total_batches += len(pending)
         if total_batches % 200 == 0:
             elapsed = time.time() - t_start
             avg_bs = total_evals / total_batches
