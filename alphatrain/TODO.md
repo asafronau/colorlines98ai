@@ -27,34 +27,26 @@ Attempted tree search with current model — value head not ready.
   - MAE=2035 is larger than per-move value differences (~100-500)
 - [ ] **BLOCKED**: Need TD-learning value targets (Pillar 2) first
 
-### Pillar 2: Value Targets (TD-Learning) ← CURRENT
-Fix value head by training on discounted future reward, not raw game_score.
+### Pillar 2: Value Training — DONE (Pillar 2f)
+Asymmetric joint training solved the backbone war.
+- [x] val_weight=0.001 prevents value gradients from corrupting policy features
+- [x] Policy preserved (315 ≈ 314), MCTS improved (911 → 992)
+- [x] Converged after 10 epochs on 1.3M expert data
 
-- [ ] Compute TD(λ) targets from existing 500 game trajectories
-  - γ=0.99, λ=0.95, reward = score_delta per turn
-  - Each state gets a different target based on its future trajectory
-- [ ] Retrain value head on TD targets (same 18ch model)
-- [ ] Verify: value head should now differentiate positions within a game
-- [ ] Re-test value-based move ranking (target: correlation > 0.5 with policy)
-- [ ] Re-test MCTS with TD-trained value head
+### Pillar 3: Self-Play Iteration Loop ← CURRENT
+Generate better data → train → repeat.
 
-### Pillar 3: Stochastic MCTS
-Handle Color Lines' randomness properly in tree search.
+**Iteration 2 (in progress):**
+- [ ] Generate 1000 self-play games with Pillar 2f model (seeds 500-1499, 400 sims)
+- [ ] Build mixed tensor: expert data + sharpened self-play (T=0.1)
+- [ ] Train Pillar 2g: asymmetric (val_weight=0.001), warm start from 2f
+- [ ] Evaluate: policy should stay ~315, MCTS should improve beyond 992
+- [ ] If improved, repeat with new model
 
-- [ ] Current determinized MCTS breaks (different spawns → conflated tree nodes)
-- [ ] Options: root-only evaluation, afterstate evaluation, or chance nodes
-- [ ] Implement chosen approach after Pillar 2 value head works
-- [ ] Test MCTS quality vs tournament bracket (target: beat 5,700 mean)
-
-### Pillar 4: Self-Play Loop
-The model teaches itself.
-
-- [ ] MCTS generates games using current network
-- [ ] Save MCTS visit counts as policy targets, TD values as value targets
-- [ ] Train new network on self-play data
-- [ ] Evaluate new vs old (100-game tournament)
-- [ ] If new wins >55%, promote and repeat
-- [ ] Track Elo progression across iterations
+**Future iterations:**
+- [ ] Track MCTS mean across iterations (992 → ? → ? → target 5,700)
+- [ ] Increase sims (400 → 800) when model is stronger
+- [ ] Consider hybrid MCTS (NN policy + heuristic leaf eval) for 8,000+ data
 
 ### Known Issues
 

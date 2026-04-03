@@ -476,6 +476,30 @@ The shared ResNet backbone is the root cause of all failures:
 - No shared backbone → no gradient conflict
 - Self-improvement loop: MCTS (policy priors + value eval) → self-play → train value → repeat
 
+### Pillar 2f: Asymmetric Joint Training (SUCCESS)
+First successful training iteration. Shared backbone with val_weight=0.001.
+- Data: 1.3M expert pairwise states (same as original training)
+- Config: lr=1e-4, 10 epochs, warm start from epoch 6, val_weight=0.001
+- Rank loss + anchor MSE for value, policy CE drives backbone
+- Training: anchor MAE 296→236, policy val loss 1.7869→1.7762
+- **Result: Policy 315 (preserved), MCTS-400 = 992 (+9% over 911 baseline)**
+- Max score jumped 2023→3135
+- Converged by epoch 9-10 (val loss flat at 1.7762)
+
+### Standalone ValueNet Experiment (FAILED)
+Tested decoupled architecture: separate PolicyNet (10b×256ch) + ValueNet (6b×128ch).
+- ValueNet trained from scratch on 277K self-play states
+- Training: MAE=6.0 (overfitting: train MSE=16, val MSE=66)
+- **Result: MCTS 400 (vs baseline 911) — -56% regression**
+- The value head needs the policy backbone's "tactical eyes"
+- Decoupled architecture can't learn vision from 277K states alone
+- Key lesson: jointly-learned features are essential for value prediction
+
+### Next: Iteration 2 Self-Play
+Generate 1000 games with improved Pillar 2f model (MCTS 992 mean):
+- Seeds 500-1499, 400 sims, 16 workers MPS
+- Then build mixed training data and run Pillar 2g training
+
 ### Lessons Learned (Phase 4)
 8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
    value gradients steamroll policy features in shared backbone. Always check loss magnitudes.
@@ -489,5 +513,11 @@ The shared ResNet backbone is the root cause of all failures:
 11. **Shared backbones create gradient conflicts.** Policy and value heads need different features.
     When one dominates training, it corrupts features needed by the other.
 
-12. **Separate networks solve the backbone war.** Independent PolicyNet and ValueNet eliminate
-    gradient conflicts entirely. This is the correct architecture for AlphaZero.
+12. **Separate networks lose "tactical eyes."** Decoupled ValueNet (6b×128ch) scored MCTS 400
+    vs baseline 911 despite MAE=6. Value head needs jointly-learned backbone features.
+
+13. **Asymmetric joint training works.** val_weight=0.001 lets the value head learn as a
+    "passive observer" without corrupting the policy backbone. First successful iteration.
+
+14. **Don't over-train on converged data.** Pillar 2f plateaued by epoch 9. More epochs on
+    the same data won't help — need better data (new self-play from improved model).
