@@ -39,20 +39,35 @@ def _legal_priors_jit(board, pol_logits, top_k):
     """Compute top-K legal move priors entirely in JIT.
 
     Returns (count, flat_indices[top_k], priors[top_k]).
+
+    Optimized: BFS labels + precomputed per-component cell lists so each
+    source ball iterates only its reachable cells (not all 81). Top-K is
+    maintained inline via a sorted insertion buffer, and softmax is computed
+    over only the final K values instead of all legal moves.
     """
-    # Label connected components of empty cells
+    # Label connected components of empty cells and collect per-component
+    # cell lists in a single BFS pass
     labels = np.zeros((9, 9), dtype=np.int8)
     queue = np.empty(162, dtype=np.int32)
     current = np.int8(0)
+    comp_start = np.empty(82, dtype=np.int32)
+    comp_count = np.empty(82, dtype=np.int32)
+    comp_flat = np.empty(81, dtype=np.int32)
+    comp_count[:] = 0
+    n_empty = 0
+
     for sr in range(9):
         for sc in range(9):
             if board[sr, sc] != 0 or labels[sr, sc] != 0:
                 continue
             current += 1
             labels[sr, sc] = current
+            comp_start[current] = n_empty
             queue[0] = sr * 9 + sc
             head = 0
             tail = 1
+            comp_flat[n_empty] = sr * 9 + sc
+            n_empty += 1
             while head < tail:
                 pos = queue[head]
                 head += 1
@@ -72,18 +87,27 @@ def _legal_priors_jit(board, pol_logits, top_k):
                             labels[nr, nc] = current
                             queue[tail] = nr * 9 + nc
                             tail += 1
+                            comp_flat[n_empty] = nr * 9 + nc
+                            n_empty += 1
+            comp_count[current] = n_empty - comp_start[current]
 
-    # Collect legal moves and logits
-    move_idx = np.empty(6561, dtype=np.int32)
-    move_log = np.empty(6561, dtype=np.float32)
+    # Collect legal moves with inline top-K maintenance
+    # Instead of collecting ALL moves then sorting, we maintain a sorted buffer
+    # of the K best logits. Softmax is deferred to only these K values.
+    k = top_k
+    topk_idx = np.empty(k, dtype=np.int32)
+    topk_log = np.empty(k, dtype=np.float32)
+    n_top = 0
+    min_top = np.float32(-1e30)
     n_moves = 0
 
     for sr in range(9):
         for sc in range(9):
             if board[sr, sc] == 0:
                 continue
-            # Find reachable component labels
-            adj = np.zeros(82, dtype=np.int8)
+            # Find reachable component IDs (deduplicated)
+            adj_comp = np.empty(4, dtype=np.int8)
+            n_adj = 0
             for d in range(4):
                 if d == 0:
                     nr, nc = sr, sc + 1
@@ -96,57 +120,73 @@ def _legal_priors_jit(board, pol_logits, top_k):
                 if 0 <= nr < 9 and 0 <= nc < 9:
                     lbl = labels[nr, nc]
                     if lbl > 0:
-                        adj[lbl] = 1
+                        found = False
+                        for j in range(n_adj):
+                            if adj_comp[j] == lbl:
+                                found = True
+                                break
+                        if not found:
+                            adj_comp[n_adj] = lbl
+                            n_adj += 1
+
+            if n_adj == 0:
+                continue
 
             base = (sr * 9 + sc) * 81
-            for tr in range(9):
-                for tc in range(9):
-                    if labels[tr, tc] > 0 and adj[labels[tr, tc]] == 1:
-                        idx = base + tr * 9 + tc
-                        move_idx[n_moves] = idx
-                        move_log[n_moves] = pol_logits[idx]
-                        n_moves += 1
+
+            # Iterate only cells in reachable components
+            for ci in range(n_adj):
+                comp_id = adj_comp[ci]
+                start = comp_start[comp_id]
+                count = comp_count[comp_id]
+                for j in range(count):
+                    tgt = comp_flat[start + j]
+                    idx = base + tgt
+                    logit = pol_logits[idx]
+                    n_moves += 1
+
+                    # Maintain top-K sorted buffer (ascending, smallest first)
+                    if n_top < k:
+                        pos = n_top
+                        while pos > 0 and topk_log[pos - 1] > logit:
+                            topk_idx[pos] = topk_idx[pos - 1]
+                            topk_log[pos] = topk_log[pos - 1]
+                            pos -= 1
+                        topk_idx[pos] = idx
+                        topk_log[pos] = logit
+                        n_top += 1
+                        if n_top == k:
+                            min_top = topk_log[0]
+                    elif logit > min_top:
+                        # Evict smallest, shift and insert
+                        pos = 0
+                        while pos < k - 1 and topk_log[pos + 1] < logit:
+                            topk_idx[pos] = topk_idx[pos + 1]
+                            topk_log[pos] = topk_log[pos + 1]
+                            pos += 1
+                        topk_idx[pos] = idx
+                        topk_log[pos] = logit
+                        min_top = topk_log[0]
 
     if n_moves == 0:
-        return 0, move_idx[:0], move_log[:0]
+        return 0, topk_idx[:0], topk_log[:0]
 
-    # Softmax
-    max_l = move_log[0]
-    for i in range(1, n_moves):
-        if move_log[i] > max_l:
-            max_l = move_log[i]
+    # Softmax over just the K selected values
+    actual_k = n_top
+    max_l = topk_log[0]
+    for i in range(1, actual_k):
+        if topk_log[i] > max_l:
+            max_l = topk_log[i]
     total = np.float32(0.0)
-    probs = np.empty(n_moves, dtype=np.float32)
-    for i in range(n_moves):
-        p = np.exp(move_log[i] - max_l)
-        probs[i] = p
+    priors = np.empty(actual_k, dtype=np.float32)
+    for i in range(actual_k):
+        p = np.exp(topk_log[i] - max_l)
+        priors[i] = p
         total += p
-    for i in range(n_moves):
-        probs[i] /= total
+    for i in range(actual_k):
+        priors[i] /= total
 
-    # Top-K selection
-    k = min(top_k, n_moves)
-    out_idx = np.empty(k, dtype=np.int32)
-    out_pri = np.empty(k, dtype=np.float32)
-    used = np.zeros(n_moves, dtype=np.int8)
-    total_p = np.float32(0.0)
-    for j in range(k):
-        best_i = -1
-        best_v = np.float32(-1.0)
-        for i in range(n_moves):
-            if used[i] == 0 and probs[i] > best_v:
-                best_v = probs[i]
-                best_i = i
-        used[best_i] = 1
-        out_idx[j] = move_idx[best_i]
-        out_pri[j] = probs[best_i]
-        total_p += probs[best_i]
-    # Renormalize
-    if total_p > 0:
-        for i in range(k):
-            out_pri[i] /= total_p
-
-    return k, out_idx, out_pri
+    return actual_k, topk_idx[:actual_k], priors
 
 
 def _flat_to_action(flat_idx):
