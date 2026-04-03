@@ -56,6 +56,14 @@ The model teaches itself.
 - [ ] If new wins >55%, promote and repeat
 - [ ] Track Elo progression across iterations
 
+### Known Issues
+
+- [ ] **GPU server mode -14% quality gap**: 16-worker MCTS scores 335 vs 1-worker 389
+  (250 games each, same seeds, p<0.01). Individual inference outputs are numerically
+  identical (verified). Root cause unknown — may be related to batching latency
+  interacting with MCTS virtual loss timing. Not blocking (value head quality is the
+  primary bottleneck), but should be investigated before production self-play.
+
 ## Development Rules
 
 Every change follows this process:
