@@ -8,6 +8,12 @@ AlphaZero-style Monte Carlo Tree Search using the trained ResNet:
 - Determinized: each simulation samples independent ball spawns via game.clone()
 - MuZero-style Q normalization for score-based (not win/loss) values
 
+Performance optimizations:
+- Flat integer action keys (avoids tuple-of-tuples overhead)
+- Shared RNG across simulations (avoids 5us np.random.default_rng per clone)
+- Inlined PUCT selection (avoids method call + property overhead)
+- Direct _legal_priors_jit → dict with int keys (no numpy decomposition)
+
 Nodes represent post-spawn game states — matching the NN's training
 distribution. 400 simulations average over spawn outcomes.
 
@@ -143,12 +149,19 @@ def _legal_priors_jit(board, pol_logits, top_k):
     return k, out_idx, out_pri
 
 
+def _flat_to_action(flat_idx):
+    """Decode flat index to ((sr, sc), (tr, tc)) action tuple."""
+    src_flat = flat_idx // 81
+    tgt_flat = flat_idx % 81
+    return ((src_flat // 9, src_flat % 9), (tgt_flat // 9, tgt_flat % 9))
+
+
 class Node:
     """MCTS tree node."""
     __slots__ = ('children', 'visit_count', 'value_sum', 'prior')
 
     def __init__(self, prior=0.0):
-        self.children = {}  # (source, target) -> Node
+        self.children = {}  # flat_action_int -> Node
         self.visit_count = 0
         self.value_sum = 0.0
         self.prior = prior
@@ -163,16 +176,34 @@ class Node:
         return len(self.children) > 0
 
 
+# Pre-allocated buffers for _build_obs_for_game (avoid per-call allocation)
+_obs_nr = np.zeros(3, dtype=np.intp)
+_obs_nc = np.zeros(3, dtype=np.intp)
+_obs_ncol = np.zeros(3, dtype=np.intp)
+
+
 def _build_obs_for_game(game):
     """Build observation tensor from game state."""
-    nr = np.zeros(3, dtype=np.intp)
-    nc = np.zeros(3, dtype=np.intp)
-    ncol = np.zeros(3, dtype=np.intp)
-    nn = min(len(game.next_balls), 3)
-    for i, ((r, c), col) in enumerate(game.next_balls):
-        if i >= 3:
-            break
-        nr[i], nc[i], ncol[i] = r, c, col
+    nr, nc, ncol = _obs_nr, _obs_nc, _obs_ncol
+    nb = game.next_balls
+    nn = len(nb)
+    if nn > 3:
+        nn = 3
+    if nn >= 1:
+        pos_col = nb[0]
+        nr[0] = pos_col[0][0]; nc[0] = pos_col[0][1]; ncol[0] = pos_col[1]
+    else:
+        nr[0] = 0; nc[0] = 0; ncol[0] = 0
+    if nn >= 2:
+        pos_col = nb[1]
+        nr[1] = pos_col[0][0]; nc[1] = pos_col[0][1]; ncol[1] = pos_col[1]
+    else:
+        nr[1] = 0; nc[1] = 0; ncol[1] = 0
+    if nn >= 3:
+        pos_col = nb[2]
+        nr[2] = pos_col[0][0]; nc[2] = pos_col[0][1]; ncol[2] = pos_col[1]
+    else:
+        nr[2] = 0; nc[2] = 0; ncol[2] = 0
     return build_observation(game.board, nr, nc, ncol, nn)
 
 
@@ -181,12 +212,14 @@ def _get_legal_priors(game, pol_logits_np, top_k):
 
     Uses JIT-compiled function for speed (computes connected components,
     legal moves, softmax, and top-K entirely in numba).
+
+    Returns dict mapping ((sr,sc),(tr,tc)) -> prior (legacy tuple format).
     """
     k, flat_idx, priors = _legal_priors_jit(
         game.board, pol_logits_np, top_k)
     if k == 0:
         return {}
-    # Vectorized index → action conversion (avoids Python loop)
+    # Vectorized index -> action conversion (avoids Python loop)
     idx = flat_idx[:k].astype(np.int32)
     src_flat = idx // 81
     tgt_flat = idx % 81
@@ -197,6 +230,19 @@ def _get_legal_priors(game, pol_logits_np, top_k):
     pri = priors[:k]
     return {((int(sr[i]), int(sc[i])), (int(tr[i]), int(tc[i]))): float(pri[i])
             for i in range(k)}
+
+
+def _get_legal_priors_flat(board, pol_logits_np, top_k):
+    """Extract legal move priors as flat-index dict {int: float}.
+
+    Same as _get_legal_priors but avoids tuple-of-tuples key overhead.
+    Returns dict mapping flat_action_int -> prior.
+    """
+    k, flat_idx, priors = _legal_priors_jit(board, pol_logits_np, top_k)
+    if k == 0:
+        return {}
+    # Direct int keys — no numpy decomposition needed
+    return {int(flat_idx[i]): float(priors[i]) for i in range(k)}
 
 
 class MCTS:
@@ -224,6 +270,7 @@ class MCTS:
         self.batch_size = batch_size
         self.inference_client = inference_client
         self._fp16 = False
+        self._sim_rng = np.random.default_rng()
         if net is not None and device is not None:
             # Detect fp16 model (JIT traced or .half())
             try:
@@ -239,11 +286,12 @@ class MCTS:
         """Single NN forward pass -> (priors dict, value scalar).
 
         Uses inference_client if available, otherwise direct net call.
+        Returns priors as {flat_int: prior}.
         """
         obs_np = _build_obs_for_game(game)
         if self.inference_client is not None:
             pol_np, value = self.inference_client.evaluate(obs_np)
-            priors = _get_legal_priors(game, pol_np, self.top_k)
+            priors = _get_legal_priors_flat(game.board, pol_np, self.top_k)
             return priors, value
         obs = torch.from_numpy(obs_np).unsqueeze(0).to(self.device)
         if self._fp16:
@@ -252,7 +300,7 @@ class MCTS:
             pol_logits, val_logits = self.net(obs)
             value = self.net.predict_value(val_logits, max_val=self.max_score).item()
         pol_np = pol_logits[0].float().cpu().numpy()
-        priors = _get_legal_priors(game, pol_np, self.top_k)
+        priors = _get_legal_priors_flat(game.board, pol_np, self.top_k)
         return priors, value
 
     def _select_child(self, node, min_q, max_q):
@@ -265,7 +313,7 @@ class MCTS:
 
         for action, child in node.children.items():
             if child.visit_count > 0:
-                q = child.q_value
+                q = child.value_sum / child.visit_count
                 q_norm = (q - min_q) / q_range if q_range > 0 else 0.5
             else:
                 q_norm = 0.5
@@ -320,9 +368,17 @@ class MCTS:
             obs_np_buf = np.empty(
                 (self.batch_size, 18, 9, 9), dtype=np.float32)
 
+        # Localize frequently accessed attributes for speed
+        c_puct = self.c_puct
+        top_k = self.top_k
+        batch_size = self.batch_size
+        num_sims = self.num_simulations
+        sim_rng = self._sim_rng
+        use_server = self.inference_client is not None
+
         sims_done = 0
-        while sims_done < self.num_simulations:
-            bs = min(self.batch_size, self.num_simulations - sims_done)
+        while sims_done < num_sims:
+            bs = min(batch_size, num_sims - sims_done)
             batch_paths = []
             batch_games = []
             batch_leaf_nodes = []
@@ -332,14 +388,39 @@ class MCTS:
             # === SELECT B leaves with virtual loss ===
             for _ in range(bs):
                 node = root
-                sim_game = game.clone()
+                sim_game = game.clone(rng=sim_rng)
                 path = [node]
 
-                while node.expanded() and not sim_game.game_over:
-                    action, child = self._select_child(node, min_q, max_q)
-                    sim_game.move(action[0], action[1])
-                    path.append(child)
-                    node = child
+                while node.children and not sim_game.game_over:
+                    # Inline PUCT selection for speed
+                    best_score = -1e30
+                    best_action = 0
+                    best_child = None
+                    sqrt_parent = math.sqrt(node.visit_count)
+                    q_range = max_q - min_q
+                    for act_i, child in node.children.items():
+                        vc = child.visit_count
+                        if vc > 0:
+                            q = child.value_sum / vc
+                            q_norm = (q - min_q) / q_range if q_range > 0 else 0.5
+                        else:
+                            q_norm = 0.5
+                        u = c_puct * child.prior * sqrt_parent / (1 + vc)
+                        score = q_norm + u
+                        if score > best_score:
+                            best_score = score
+                            best_action = act_i
+                            best_child = child
+
+                    # Decode flat action and execute trusted move
+                    # (move is guaranteed legal — from _legal_priors_jit)
+                    src_flat = best_action // 81
+                    tgt_flat = best_action % 81
+                    sim_game.trusted_move(
+                        src_flat // 9, src_flat % 9,
+                        tgt_flat // 9, tgt_flat % 9)
+                    path.append(best_child)
+                    node = best_child
 
                 for n in path:
                     n.visit_count += 1
@@ -354,7 +435,7 @@ class MCTS:
                 else:
                     batch_game_over.append(False)
                     obs = _build_obs_for_game(sim_game)
-                    if self.inference_client is not None:
+                    if use_server:
                         obs_np_buf[obs_count] = obs
                     else:
                         t = torch.from_numpy(obs)
@@ -365,7 +446,7 @@ class MCTS:
 
             # === BATCH EVALUATE ===
             if obs_count > 0:
-                if self.inference_client is not None:
+                if use_server:
                     pol_np, val_np = self.inference_client.evaluate_batch(
                         obs_np_buf, obs_count)
                     # No copy needed — shared memory is safe until next
@@ -389,10 +470,12 @@ class MCTS:
                 else:
                     value = float(val_np[nn_idx])
                     node = batch_leaf_nodes[b]
-                    priors = _get_legal_priors(
-                        batch_games[b], pol_np[nn_idx], self.top_k)
-                    for act, prior in priors.items():
-                        node.children[act] = Node(prior=prior)
+                    # Inline expand: JIT -> Nodes directly (no intermediate dict)
+                    k, flat_idx, pri = _legal_priors_jit(
+                        batch_games[b].board, pol_np[nn_idx], top_k)
+                    ch = node.children
+                    for i in range(k):
+                        ch[int(flat_idx[i])] = Node(prior=float(pri[i]))
                     nn_idx += 1
 
                 min_q = min(min_q, value)
@@ -411,13 +494,12 @@ class MCTS:
 
         if return_policy:
             # Build full 6561-dim policy target
+            # Actions are already flat indices — write directly
             policy_target = np.zeros(NUM_MOVES, dtype=np.float32)
             visit_sum = visits.sum()
             if visit_sum > 0:
                 for i, a in enumerate(actions):
-                    (sr, sc), (tr, tc) = a
-                    idx = (sr * 9 + sc) * 81 + tr * 9 + tc
-                    policy_target[idx] = visits[i] / visit_sum
+                    policy_target[a] = visits[i] / visit_sum
 
         # Select move
         if temperature > 0 and len(root.children) > 0:
@@ -425,11 +507,14 @@ class MCTS:
             adjusted = visits ** (1.0 / temperature)
             probs = adjusted / adjusted.sum()
             chosen_idx = np.random.choice(len(actions), p=probs)
-            action = actions[chosen_idx]
+            flat_action = actions[chosen_idx]
         else:
             # Greedy argmax
-            action = max(root.children.items(),
-                         key=lambda x: x[1].visit_count)[0]
+            flat_action = max(root.children.items(),
+                              key=lambda x: x[1].visit_count)[0]
+
+        # Decode flat action to tuple format for callers
+        action = _flat_to_action(flat_action)
 
         if return_policy:
             return action, policy_target

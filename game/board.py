@@ -334,9 +334,9 @@ class ColorLinesGame:
             self._generate_next_balls()
         self._cc_labels = None
 
-    def clone(self) -> 'ColorLinesGame':
+    def clone(self, rng=None) -> 'ColorLinesGame':
         g = ColorLinesGame.__new__(ColorLinesGame)
-        g.rng = np.random.default_rng()
+        g.rng = rng if rng is not None else np.random.default_rng()
         g.num_colors = self.num_colors
         g.board = self.board.copy()
         g.next_balls = list(self.next_balls)
@@ -505,6 +505,33 @@ class ColorLinesGame:
                 self.game_over = True
 
         return (True, total_pts, self.game_over)
+
+    def trusted_move(self, sr, sc, tr, tc):
+        """Execute a move known to be legal. Skips validation for speed.
+
+        For use in MCTS/search where legal moves are pre-computed.
+        Caller guarantees: source has a ball, target is empty, path exists.
+        """
+        # Execute
+        color = self.board[sr, sc]
+        self.board[sr, sc] = 0
+        self.board[tr, tc] = color
+        self._cc_labels = None
+        self.turns += 1
+
+        cleared = _clear_lines_at(self.board, tr, tc)
+        if cleared > 0:
+            self.score += calculate_score(cleared)
+        else:
+            self._spawn_balls()
+            for (br, bc), _ in self.next_balls:
+                if self.board[br, bc] != 0:
+                    spawn_cleared = _clear_lines_at(self.board, br, bc)
+                    if spawn_cleared > 0:
+                        self.score += calculate_score(spawn_cleared)
+            self._generate_next_balls()
+            if _count_empty(self.board) == 0:
+                self.game_over = True
 
     # ── Observation ───────────────────────────────────────────────────
 
