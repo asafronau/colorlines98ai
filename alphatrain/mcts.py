@@ -383,6 +383,16 @@ class MCTS:
         """
         root = Node()
 
+        # Seed sim_rng from game state for reproducibility across modes.
+        # Same board position → same MCTS simulation spawns → identical trees
+        # regardless of local vs server execution.
+        # NOTE: Python hash() is randomized per-process (PYTHONHASHSEED),
+        # so we use a deterministic hash from raw board bytes instead.
+        board_bytes = game.board.tobytes()
+        state_seed = int.from_bytes(board_bytes[:8], 'little')
+        state_seed = (state_seed ^ (game.score * 31) ^ (game.turns * 7)) & 0xFFFFFFFF
+        self._sim_rng = np.random.default_rng(state_seed)
+
         # Expand root
         priors, root_value = self._nn_evaluate_single(game)
         if not priors:
@@ -394,7 +404,7 @@ class MCTS:
 
         # Dirichlet noise at root for exploration
         if dirichlet_alpha > 0 and dirichlet_weight > 0:
-            noise = np.random.dirichlet(
+            noise = self._sim_rng.dirichlet(
                 [dirichlet_alpha] * len(root.children))
             for i, child in enumerate(root.children.values()):
                 child.prior = ((1 - dirichlet_weight) * child.prior
