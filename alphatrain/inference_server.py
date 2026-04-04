@@ -70,9 +70,11 @@ class InferenceServer:
     """Manages shared memory and GPU inference process."""
 
     def __init__(self, model_path, num_workers, device=None,
-                 max_batch_per_worker=MAX_BATCH, value_model_path=None):
+                 max_batch_per_worker=MAX_BATCH, value_model_path=None,
+                 deterministic=False):
         self.model_path = model_path
         self.value_model_path = value_model_path
+        self.deterministic = deterministic
         self.num_workers = num_workers
         self.max_batch = max_batch_per_worker
 
@@ -116,7 +118,7 @@ class InferenceServer:
                   self.num_workers, self.max_batch,
                   self._obs_shm.name, self._pol_shm.name, self._val_shm.name,
                   self.request_queue, self.response_queues,
-                  self.value_model_path),
+                  self.value_model_path, self.deterministic),
             daemon=True)
         self._process.start()
 
@@ -143,7 +145,8 @@ class InferenceServer:
 
 def _gpu_loop(model_path, device_str, num_workers, max_batch,
               obs_shm_name, pol_shm_name, val_shm_name,
-              request_queue, response_queues, value_model_path=None):
+              request_queue, response_queues, value_model_path=None,
+              deterministic=False):
     """GPU inference process main loop."""
     # Attach to shared memory
     obs_shm = SharedMemory(name=obs_shm_name)
@@ -195,7 +198,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
             break
         pending = [item]  # list of (slot_id, count)
 
-        # Drain additional pending requests (don't leave them waiting)
+        # Drain additional pending requests
         while True:
             try:
                 item = request_queue.get_nowait()
@@ -203,30 +206,60 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                     request_queue.put(None)
                     break
                 pending.append(item)
+                if sum(c for _, c in pending) >= GPU_BATCH_CAP:
+                    break
             except Empty:
                 break
 
-        # Process each worker's request individually to avoid MPS
-        # batch-size non-determinism (policy logits differ by up to 0.75
-        # between bs=8 and bs=64 on MPS due to different reduction orders).
-        with torch.inference_mode():
-            for slot_id, count in pending:
-                gpu_obs[:count] = torch.from_numpy(
-                    obs_buf[slot_id, :count]).half()
+        if deterministic:
+            # Per-request processing: each worker's batch processed individually.
+            # Ensures bit-for-bit identical results to local mode (MPS gives
+            # different policy logits for different batch sizes).
+            with torch.inference_mode():
+                for slot_id, count in pending:
+                    gpu_obs[:count] = torch.from_numpy(
+                        obs_buf[slot_id, :count]).half()
 
+                    if value_net_traced is not None:
+                        pol_logits, _ = net_traced(gpu_obs[:count])
+                        val_logits = value_net_traced(gpu_obs[:count])
+                        values = value_predict(val_logits, max_val=max_score)
+                    else:
+                        pol_logits, val_logits = net_traced(gpu_obs[:count])
+                        values = net.predict_value(val_logits, max_val=max_score)
+
+                    pol_buf[slot_id, :count] = pol_logits.float().cpu().numpy()
+                    val_buf[slot_id, :count] = values.float().cpu().numpy()
+                    response_queues[slot_id].put(1)
+                    total_evals += count
+        else:
+            # Cross-worker batching: higher throughput (~2.6x vs 1.2x).
+            # Results are statistically equivalent but not bit-for-bit identical
+            # to local mode due to MPS batch-size non-determinism.
+            total_count = 0
+            for slot_id, count in pending:
+                gpu_obs[total_count:total_count + count] = torch.from_numpy(
+                    obs_buf[slot_id, :count]).half()
+                total_count += count
+
+            with torch.inference_mode():
                 if value_net_traced is not None:
-                    pol_logits, _ = net_traced(gpu_obs[:count])
-                    val_logits = value_net_traced(gpu_obs[:count])
+                    pol_logits, _ = net_traced(gpu_obs[:total_count])
+                    val_logits = value_net_traced(gpu_obs[:total_count])
                     values = value_predict(val_logits, max_val=max_score)
                 else:
-                    pol_logits, val_logits = net_traced(gpu_obs[:count])
+                    pol_logits, val_logits = net_traced(gpu_obs[:total_count])
                     values = net.predict_value(val_logits, max_val=max_score)
 
-                pol_buf[slot_id, :count] = pol_logits.float().cpu().numpy()
-                val_buf[slot_id, :count] = values.float().cpu().numpy()
+            pol_cpu = pol_logits.float().cpu()
+            val_cpu = values.float().cpu()
+            offset = 0
+            for slot_id, count in pending:
+                pol_buf[slot_id, :count] = pol_cpu[offset:offset + count].numpy()
+                val_buf[slot_id, :count] = val_cpu[offset:offset + count].numpy()
+                offset += count
                 response_queues[slot_id].put(1)
-
-                total_evals += count
+            total_evals += total_count
 
         total_batches += len(pending)
         if total_batches % 200 == 0:

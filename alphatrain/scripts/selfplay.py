@@ -230,6 +230,8 @@ def main():
                    help='Parallel workers (1=local MPS, >1=CPU multiprocessing)')
     p.add_argument('--value-model', default=None,
                    help='Separate ValueNet checkpoint (if None, use value head from --model)')
+    p.add_argument('--deterministic', action='store_true',
+                   help='Per-request GPU processing (exact scores, slower)')
     p.add_argument('--save-dir', default='data/selfplay')
     p.add_argument('--temperature-moves', type=int, default=30)
     p.add_argument('--dirichlet-alpha', type=float, default=0.3)
@@ -376,7 +378,8 @@ def main():
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
                                  max_batch_per_worker=args.batch_size,
-                                 value_model_path=args.value_model)
+                                 value_model_path=args.value_model,
+                                 deterministic=args.deterministic)
         server.start()
 
         seed_queue = MPQueue()
