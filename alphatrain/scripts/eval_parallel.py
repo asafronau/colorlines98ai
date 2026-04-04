@@ -126,6 +126,8 @@ def main():
                    help='MCTS workers (1=sequential, >1=GPU server mode)')
     p.add_argument('--value-model', default=None,
                    help='Separate ValueNet checkpoint (dual-model mode)')
+    p.add_argument('--deterministic', action='store_true',
+                   help='Per-request GPU processing (exact scores, slower)')
     p.add_argument('--policy-only', action='store_true')
     p.add_argument('--mcts-only', action='store_true')
     args = p.parse_args()
@@ -251,9 +253,11 @@ def _run_mcts_server(args, task_seeds, total, device_str):
     del ckpt
 
     value_path = getattr(args, 'value_model', None)
+    det = getattr(args, 'deterministic', False)
     server = InferenceServer(args.model, n_workers, device=device_str,
                              max_batch_per_worker=args.batch_size,
-                             value_model_path=value_path)
+                             value_model_path=value_path,
+                             deterministic=det)
     server.start()
 
     seed_queue = MPQueue()
