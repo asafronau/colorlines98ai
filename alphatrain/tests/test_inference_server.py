@@ -189,3 +189,45 @@ class TestServerWithMCTS:
         assert result['observations'].shape[0] == result['turns']
         assert result['policy_targets'].shape == (result['turns'], 6561)
         assert result['value_targets'].shape == (result['turns'],)
+
+    def test_server_matches_local_game_scores(self, server):
+        """Server mode produces identical game scores to local mode.
+
+        MCTS is deterministic (state-seeded RNG), so the same game seed
+        must produce the exact same score regardless of execution mode.
+        """
+        from alphatrain.mcts import MCTS
+        from alphatrain.evaluate import load_model
+        from game.board import ColorLinesGame
+
+        device = torch.device(_get_device())
+        net, max_score = load_model(MODEL_PATH, device,
+                                    fp16=True, jit_trace=True)
+
+        # Local mode
+        mcts_local = MCTS(net, device, max_score=max_score,
+                          num_simulations=50, batch_size=8,
+                          top_k=30, c_puct=2.5)
+
+        # Server mode
+        client = server.make_client(0)
+        mcts_server = MCTS(inference_client=client, max_score=max_score,
+                           num_simulations=50, batch_size=8,
+                           top_k=30, c_puct=2.5)
+
+        for seed in [42, 100]:
+            for mcts_name, mcts in [('local', mcts_local), ('server', mcts_server)]:
+                game = ColorLinesGame(seed=seed)
+                game.reset()
+                while not game.game_over:
+                    action = mcts.search(game)
+                    if action is None:
+                        break
+                    r = game.move(action[0], action[1])
+                    if not r['valid']:
+                        break
+                if mcts_name == 'local':
+                    local_score = game.score
+                else:
+                    assert game.score == local_score, \
+                        f"seed={seed}: local={local_score}, server={game.score}"
