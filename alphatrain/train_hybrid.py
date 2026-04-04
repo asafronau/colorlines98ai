@@ -158,6 +158,14 @@ def train_epoch_hybrid(model, expert_loader, selfplay_loader, optimizer, device,
         total_val_s += val_loss_s.item()
         n += 1
 
+        # Memory diagnostics: first 3 steps + every log_interval
+        if bi < 3 or (bi + 1) % log_interval == 0:
+            alloc = torch.cuda.memory_allocated() / 1e9
+            resv = torch.cuda.memory_reserved() / 1e9
+            if bi < 3:
+                print(f"  [step {bi}] GPU: {alloc:.1f} GB alloc, "
+                      f"{resv:.1f} GB reserved", flush=True)
+
         if (bi + 1) % log_interval == 0:
             elapsed = time.time() - t0
             sps = (bi + 1) * expert_loader.batch_size * 2 / elapsed
@@ -275,9 +283,13 @@ def main():
         num_workers=0, collate_fn=expert_ds.collate)
 
     # ── Load self-play dataset ──
-    print("\n--- Self-play dataset ---", flush=True)
+    # CPU-resident: the dense policy tensor (346K × 6561 × f32 = 9 GB) doesn't
+    # fit on GPU alongside the expert dataset. Collate runs on CPU (array indexing
+    # + dihedral permutation), then .to(device) transfers ~13 MB per batch.
+    print("\n--- Self-play dataset (CPU-resident, 9 GB policy too large for GPU) ---",
+          flush=True)
     selfplay_ds = SelfPlayDataset(args.selfplay_file, augment=True,
-                                   device=str(device))
+                                   device='cpu')
 
     n_val_sp = int(len(selfplay_ds) * args.val_split)
     n_train_sp = len(selfplay_ds) - n_val_sp
@@ -293,6 +305,12 @@ def main():
         num_workers=0, collate_fn=selfplay_ds.collate)
 
     max_score = expert_ds.max_score
+
+    if device.type == 'cuda':
+        alloc = torch.cuda.memory_allocated() / 1e9
+        resv = torch.cuda.memory_reserved() / 1e9
+        print(f"\nGPU after data load: {alloc:.1f} GB alloc, {resv:.1f} GB reserved",
+              flush=True)
     print(f"\nExpert: {n_train_expert:,} train, {n_eval_expert:,} val "
           f"(pairwise={expert_ds.has_pairs})", flush=True)
     print(f"Self-play: {n_train_sp:,} train, {n_val_sp:,} val", flush=True)
