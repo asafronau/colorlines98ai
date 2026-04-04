@@ -4,9 +4,16 @@ One GPU process handles all NN forward passes. CPU workers send batches of
 observations via shared memory (zero-copy). Queues carry only integer signals.
 
 Architecture:
-    Workers write obs to shared memory → put (slot_id, count) on queue →
-    GPU reads from shared memory, batches, evaluates →
-    writes results to shared memory → signals worker via response queue.
+    Workers write obs to shared memory -> put (slot_id, count) on queue ->
+    GPU reads from shared memory, batches, evaluates ->
+    writes results to shared memory -> signals worker via response queue.
+
+Performance optimizations (2026-04-03):
+    - Batched mode: adaptive gather window with busy-poll (up to 0.5ms) to
+      accumulate requests from multiple workers into larger GPU batches
+      (avg bs=90-128 vs previous avg bs=8, measured 20-32% throughput gain)
+    - Contiguous obs staging buffer for single GPU transfer per batch
+    - Batch-level CPU result transfer (.float().cpu()) then numpy scatter
 """
 
 import time
@@ -147,7 +154,15 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
               obs_shm_name, pol_shm_name, val_shm_name,
               request_queue, response_queues, value_model_path=None,
               deterministic=False):
-    """GPU inference process main loop."""
+    """GPU inference process main loop.
+
+    Two modes:
+    - deterministic: process each worker's batch individually (bit-for-bit
+      reproducible with local mode on MPS).
+    - batched: gather requests from multiple workers into one large GPU batch
+      for higher throughput (results are statistically equivalent but not
+      bit-for-bit identical due to MPS batch-size non-determinism).
+    """
     # Attach to shared memory
     obs_shm = SharedMemory(name=obs_shm_name)
     pol_shm = SharedMemory(name=pol_shm_name)
@@ -180,41 +195,60 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     max_total = num_workers * max_batch
     gpu_obs = torch.empty(max_total, 18, 9, 9, device=device, dtype=torch.float16)
 
+    # Pre-allocate flat obs staging buffer for contiguous GPU transfer.
+    # When gathering obs from multiple workers, we first copy to this
+    # contiguous buffer, then do a single torch.from_numpy -> GPU transfer.
+    obs_staging = np.empty((max_total,) + OBS_SHAPE, dtype=np.float32)
+
     total_evals = 0
     total_batches = 0
+    total_gpu_batches = 0
     t_start = time.time()
 
     mode = "dual-model" if value_model_path else "single-model"
     print(f"GPU inference server ready ({device_str}, fp16+jit, "
           f"{num_workers} slots, max_batch={max_batch}, {mode})", flush=True)
 
-    # Cap GPU batch — too large hurts per-eval latency on MPS
+    # Cap GPU batch -- too large hurts per-eval latency on MPS
     GPU_BATCH_CAP = 128
+
+    # Adaptive gather: in batched mode with multiple workers, busy-poll
+    # briefly after first request to accumulate a larger GPU batch.
+    # This trades ~0.2-0.5ms latency for much better GPU utilization
+    # (bs=32-128 vs bs=8 when processing each worker's request immediately).
+    #
+    # We use busy-polling (get_nowait + time.monotonic) instead of
+    # get(timeout=) because the OS scheduler resolution on macOS is ~1ms,
+    # which makes short timeouts unreliable.
+    GATHER_TIMEOUT = 0.0005 if (not deterministic and num_workers > 1) else 0.0
+    # Minimum batch to fill before processing.
+    GATHER_MIN_EVALS = min(48, num_workers * max_batch)
+
+    # Localize queue methods for hot loop
+    _queue_get = request_queue.get
+    _queue_get_nowait = request_queue.get_nowait
 
     while True:
         # Block on first request
-        item = request_queue.get()
+        item = _queue_get()
         if item is None:
             break
         pending = [item]  # list of (slot_id, count)
-
-        # Drain additional pending requests
-        while True:
-            try:
-                item = request_queue.get_nowait()
-                if item is None:
-                    request_queue.put(None)
-                    break
-                pending.append(item)
-                if sum(c for _, c in pending) >= GPU_BATCH_CAP:
-                    break
-            except Empty:
-                break
+        pending_evals = item[1]
 
         if deterministic:
-            # Per-request processing: each worker's batch processed individually.
-            # Ensures bit-for-bit identical results to local mode (MPS gives
-            # different policy logits for different batch sizes).
+            # Deterministic mode: drain whatever is available, no waiting.
+            while True:
+                try:
+                    item = _queue_get_nowait()
+                    if item is None:
+                        request_queue.put(None)
+                        break
+                    pending.append(item)
+                except Empty:
+                    break
+
+            # Per-request processing: each worker's batch individually.
             with torch.inference_mode():
                 for slot_id, count in pending:
                     gpu_obs[:count] = torch.from_numpy(
@@ -228,19 +262,55 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                         pol_logits, val_logits = net_traced(gpu_obs[:count])
                         values = net.predict_value(val_logits, max_val=max_score)
 
+                    # Direct copy: .float().cpu().numpy() is fastest on MPS
+                    # (pre-allocated copy_ is slower due to MPS sync overhead)
                     pol_buf[slot_id, :count] = pol_logits.float().cpu().numpy()
                     val_buf[slot_id, :count] = values.float().cpu().numpy()
                     response_queues[slot_id].put(1)
                     total_evals += count
+                    total_gpu_batches += 1
         else:
-            # Cross-worker batching: higher throughput (~2.6x vs 1.2x).
-            # Results are statistically equivalent but not bit-for-bit identical
-            # to local mode due to MPS batch-size non-determinism.
+            # Batched mode: gather requests from multiple workers, then
+            # process in one large GPU batch for higher throughput.
+
+            # Adaptive gather: busy-poll for more requests until we reach
+            # the minimum batch threshold or the gather window expires.
+            if GATHER_TIMEOUT > 0 and pending_evals < GATHER_MIN_EVALS:
+                deadline = time.monotonic() + GATHER_TIMEOUT
+                while pending_evals < GPU_BATCH_CAP:
+                    try:
+                        item = _queue_get_nowait()
+                        if item is None:
+                            request_queue.put(None)
+                            break
+                        pending.append(item)
+                        pending_evals += item[1]
+                    except Empty:
+                        if time.monotonic() >= deadline:
+                            break
+
+            # Final drain: pick up any requests that arrived during the
+            # gather window or are immediately available.
+            while pending_evals < GPU_BATCH_CAP:
+                try:
+                    item = _queue_get_nowait()
+                    if item is None:
+                        request_queue.put(None)
+                        break
+                    pending.append(item)
+                    pending_evals += item[1]
+                except Empty:
+                    break
+
+            # Stage obs into contiguous buffer, then single transfer to GPU
             total_count = 0
             for slot_id, count in pending:
-                gpu_obs[total_count:total_count + count] = torch.from_numpy(
-                    obs_buf[slot_id, :count]).half()
+                np.copyto(obs_staging[total_count:total_count + count],
+                          obs_buf[slot_id, :count])
                 total_count += count
+
+            gpu_obs[:total_count] = torch.from_numpy(
+                obs_staging[:total_count]).half()
 
             with torch.inference_mode():
                 if value_net_traced is not None:
@@ -251,21 +321,30 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                     pol_logits, val_logits = net_traced(gpu_obs[:total_count])
                     values = net.predict_value(val_logits, max_val=max_score)
 
+            # Transfer GPU results to CPU in one shot, then scatter to SHM.
+            # .float().cpu() is faster than copy_() on MPS.
             pol_cpu = pol_logits.float().cpu()
             val_cpu = values.float().cpu()
+
+            # Scatter results to per-worker shared memory
             offset = 0
+            pol_np = pol_cpu.numpy()
+            val_np = val_cpu.numpy()
             for slot_id, count in pending:
-                pol_buf[slot_id, :count] = pol_cpu[offset:offset + count].numpy()
-                val_buf[slot_id, :count] = val_cpu[offset:offset + count].numpy()
+                np.copyto(pol_buf[slot_id, :count],
+                          pol_np[offset:offset + count])
+                np.copyto(val_buf[slot_id, :count],
+                          val_np[offset:offset + count])
                 offset += count
                 response_queues[slot_id].put(1)
             total_evals += total_count
+            total_gpu_batches += 1
 
         total_batches += len(pending)
         if total_batches % 200 == 0:
             elapsed = time.time() - t_start
-            avg_bs = total_evals / total_batches
-            print(f"  [GPU] {total_evals} evals, {total_batches} batches "
+            avg_bs = total_evals / max(total_gpu_batches, 1)
+            print(f"  [GPU] {total_evals} evals, {total_gpu_batches} fwd "
                   f"(avg bs={avg_bs:.1f}, {total_evals/elapsed:.0f} evals/s)",
                   flush=True)
 

@@ -311,6 +311,10 @@ class MCTS:
         self.inference_client = inference_client
         self._fp16 = False
         self._sim_rng = np.random.default_rng()
+        # Pre-allocate obs buffer for server mode (reused across searches)
+        if inference_client is not None:
+            self._obs_np_buf = np.empty(
+                (batch_size, 18, 9, 9), dtype=np.float32)
         if net is not None and device is not None:
             # Detect fp16 model (JIT traced or .half())
             try:
@@ -413,11 +417,6 @@ class MCTS:
         min_q = root_value
         max_q = root_value
 
-        # Pre-allocate obs buffer for server mode
-        if self.inference_client is not None:
-            obs_np_buf = np.empty(
-                (self.batch_size, 18, 9, 9), dtype=np.float32)
-
         # Localize frequently accessed attributes for speed
         c_puct = self.c_puct
         top_k = self.top_k
@@ -425,6 +424,8 @@ class MCTS:
         num_sims = self.num_simulations
         sim_rng = self._sim_rng
         use_server = self.inference_client is not None
+        if use_server:
+            obs_np_buf = self._obs_np_buf
 
         sims_done = 0
         while sims_done < num_sims:
