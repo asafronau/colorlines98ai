@@ -468,6 +468,7 @@ class TensorDatasetGPU(Dataset):
     def __getitem__(self, idx):
         return idx
 
+    @torch.no_grad()
     def collate(self, indices):
         """Build batch on GPU: observations + policy + value targets."""
         indices = torch.tensor(indices, dtype=torch.long, device=self.device)
@@ -631,6 +632,7 @@ class TensorDatasetGPU(Dataset):
         """Build observations from boards only (no next_balls). For afterstates."""
         return self._build_obs_core(boards)
 
+    @torch.no_grad()
     def collate_pairwise(self, indices):
         """Build batch with afterstate pairs for pairwise value training.
 
@@ -705,6 +707,7 @@ class SelfPlayDataset(Dataset):
     def __getitem__(self, idx):
         return idx
 
+    @torch.no_grad()
     def collate(self, indices):
         """Build batch: (obs, policy, value_scalar)."""
         indices = torch.tensor(indices, dtype=torch.long, device=self.device)
