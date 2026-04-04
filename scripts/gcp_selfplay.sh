@@ -28,8 +28,8 @@
 
 set -euo pipefail
 
-GAMES=300
-SEED_START=0
+GAMES=200
+SEED_START=300
 SIMS=800
 BS=8
 WORKERS=$(nproc)
