@@ -314,6 +314,60 @@ pub fn get_source_mask_bits(board: &Board) -> u128 {
     mask
 }
 
+/// Pre-computed bitmasks per connected component.
+/// component_masks[label] = u128 with all cells of that component set.
+/// Max 40 components on a 9x9 board (theoretical max with checkerboard).
+pub struct ComponentMasks {
+    masks: [u128; 42],  // index by label (1-based, 0 unused)
+    pub count: usize,
+}
+
+impl ComponentMasks {
+    pub fn from_labels(labels: &Board) -> Self {
+        let mut masks = [0u128; 42];
+        let mut max_label = 0usize;
+        for r in 0..BOARD_SIZE {
+            for c in 0..BOARD_SIZE {
+                let lbl = labels[r][c];
+                if lbl > 0 {
+                    let idx = lbl as usize;
+                    masks[idx] |= 1u128 << rc_to_idx(r, c);
+                    if idx > max_label { max_label = idx; }
+                }
+            }
+        }
+        ComponentMasks { masks, count: max_label }
+    }
+
+    /// Target mask for source at (sr, sc): OR together component masks
+    /// of all components adjacent to the source. O(1) instead of O(81).
+    #[inline]
+    pub fn target_mask(&self, labels: &Board, sr: usize, sc: usize) -> u128 {
+        let mut mask = 0u128;
+        let mut seen = [0i8; 4];
+        let mut n_seen = 0;
+        for &(dr, dc) in &[(0i32, 1i32), (0, -1), (1, 0), (-1, 0)] {
+            let nr = sr as i32 + dr;
+            let nc = sc as i32 + dc;
+            if nr >= 0 && nr < BOARD_SIZE as i32 && nc >= 0 && nc < BOARD_SIZE as i32 {
+                let lbl = labels[nr as usize][nc as usize];
+                if lbl > 0 {
+                    let mut found = false;
+                    for i in 0..n_seen {
+                        if seen[i] == lbl { found = true; break; }
+                    }
+                    if !found {
+                        seen[n_seen] = lbl;
+                        n_seen += 1;
+                        mask |= self.masks[lbl as usize];
+                    }
+                }
+            }
+        }
+        mask
+    }
+}
+
 /// Target mask as u128 bitmask: bit set for empty cells reachable from source.
 pub fn get_target_mask_bits(labels: &Board, sr: usize, sc: usize) -> u128 {
     let mut reachable_labels = [0i8; 4];
