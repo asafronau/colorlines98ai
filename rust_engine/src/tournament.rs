@@ -199,7 +199,7 @@ pub fn tournament_player(
     let qualifiers: Vec<Candidate> = candidates.drain(..qual_n).collect();
 
     // Rollout phases use cloned game RNG (not advancing the real game RNG)
-    let mut rollout_rng = game.rng.clone();
+    let rollout_rng = game.rng.clone();
 
     // Quarter-finals: 10 short rollouts → top 10
     let qf = run_rollouts(game, &qualifiers, 10, rollout_depth / 2, temperature, &mut rollout_rng.clone());

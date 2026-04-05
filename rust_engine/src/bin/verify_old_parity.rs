@@ -7,7 +7,7 @@ use colorlines98::board::*;
 use colorlines98::heuristic::evaluate_move;
 use colorlines98::rng::Xorshift64;
 
-const DIRS: [(i32, i32); 4] = [(0, 1), (1, 0), (1, 1), (1, -1)];
+
 
 /// Minimal game struct matching old engine exactly.
 struct OldGame {
