@@ -24,6 +24,9 @@ pub struct ColorLinesGame {
     pub turns: i32,
     pub game_over: bool,
     pub rng: SimpleRng,
+    // Cached CC labels — invalidated on any board mutation.
+    pub(crate) cc_labels: Board,
+    pub(crate) cc_valid: bool,
 }
 
 impl ColorLinesGame {
@@ -36,6 +39,8 @@ impl ColorLinesGame {
             turns: 0,
             game_over: false,
             rng: SimpleRng::new(seed),
+            cc_labels: [[0i8; BOARD_SIZE]; BOARD_SIZE],
+            cc_valid: false,
         }
     }
 
@@ -54,7 +59,24 @@ impl ColorLinesGame {
     pub fn clone_with_rng(&self, rng: SimpleRng) -> Self {
         let mut c = self.clone();
         c.rng = rng;
+        c.cc_valid = false;
         c
+    }
+
+    /// Ensure CC labels are computed and cached.
+    #[inline]
+    pub fn ensure_cc(&mut self) {
+        if !self.cc_valid {
+            self.cc_labels = label_empty_components(&self.board);
+            self.cc_valid = true;
+        }
+    }
+
+    /// Get cached CC labels (computes if needed).
+    #[inline]
+    pub fn get_cc_labels(&mut self) -> &Board {
+        self.ensure_cc();
+        &self.cc_labels
     }
 
     /// Get next_balls as the tuple format used by Python for compatibility.
@@ -90,6 +112,7 @@ impl ColorLinesGame {
     }
 
     fn spawn_balls(&mut self) {
+        self.cc_valid = false;
         for i in 0..self.num_next as usize {
             let nb = self.next_balls[i];
             let (row, col) = (nb.row as usize, nb.col as usize);
@@ -122,8 +145,8 @@ impl ColorLinesGame {
             return (false, 0, 0, self.game_over);
         }
 
-        let labels = label_empty_components(&self.board);
-        if !is_reachable(&labels, sr, sc, tr, tc) {
+        self.ensure_cc();
+        if !is_reachable(&self.cc_labels, sr, sc, tr, tc) {
             return (false, 0, 0, self.game_over);
         }
 
@@ -148,6 +171,7 @@ impl ColorLinesGame {
         let color = self.board[sr][sc];
         self.board[sr][sc] = 0;
         self.board[tr][tc] = color;
+        self.cc_valid = false;
         self.turns += 1;
 
         let mut total_score = 0i32;
