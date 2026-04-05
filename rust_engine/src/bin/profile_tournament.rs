@@ -146,14 +146,14 @@ fn main() {
     println!("\n--- Full tournament move (50 rollouts) ---");
     let mut rng = SimpleRng::new(99);
     let t0 = Instant::now();
-    let _ = tournament_player(&game, 50, 20, 3.23, &mut rng);
+    let _ = tournament_player(&mut game, 50, 20, 3.23);
     let t_tour = t0.elapsed();
     println!("  {:.1}ms/move ({:.1} mv/s)", t_tour.as_secs_f64() * 1e3, 1.0 / t_tour.as_secs_f64());
 
     println!("\n--- Full tournament move (200 rollouts) ---");
     let mut rng = SimpleRng::new(99);
     let t0 = Instant::now();
-    let _ = tournament_player(&game, 200, 20, 3.23, &mut rng);
+    let _ = tournament_player(&mut game, 200, 20, 3.23);
     let t_tour200 = t0.elapsed();
     println!("  {:.1}ms/move ({:.1} mv/s)", t_tour200.as_secs_f64() * 1e3, 1.0 / t_tour200.as_secs_f64());
 
