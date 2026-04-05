@@ -1,32 +1,27 @@
-"""Hybrid training: interleaved expert (pairwise ranking) + self-play (MSE value).
+"""Hybrid training: interleaved expert (pairwise ranking) + self-play (value only).
 
-Expert batches: pol_CE + 0.001 * (rank_loss + anchor_MSE)
-Self-play batches: pol_CE + 0.001 * MSE(value, TD_return)
+Expert batches: pol_CE + val_weight * (rank_loss + anchor_MSE)
+Self-play batches: val_weight * MSE(value, TD_return) — NO policy loss
 
-Uses two dataloaders — one for each data source — interleaved within each epoch.
-This preserves the pairwise ranking signal that made Pillar 2f successful while
-absorbing self-play value targets for positions the model actually encounters.
+The policy head learns ONLY from expert data (strong player, mean ~5,700).
+The value head learns from BOTH: expert ranking teaches discrimination,
+self-play MSE teaches absolute value prediction for MCTS positions.
 
-GPU Memory considerations (H100 80GB):
-    Both datasets are GPU-resident: expert ~5 GB (sparse boards + pairs),
-    selfplay ~11 GB (pre-computed obs 346K×18×9×9 + dense policy 346K×6561).
-    Total dataset footprint ~65 GB, leaving ~15 GB for model + activations.
+Self-play data should be elite-filtered (--min-game-score) to avoid teaching
+the value head what "failure" looks like.
 
-    Each training step has 3 forward passes (expert main bs=N, expert pairs
-    bs=2N, selfplay bs=N). To avoid OOM, we use split backward passes with
-    gradient accumulation: expert backward runs and frees activations BEFORE
-    selfplay forward starts. torch.cuda.empty_cache() between passes prevents
-    fragmentation from torch.compile's cached allocations.
+No cycling: selfplay drives the epoch length. Expert is subsampled to match
+via random_split, so each state is seen ~once per epoch.
 
-    Tested batch sizes on H100-80GB: bs=2048 OOM, bs=1024 fits.
-    On A100-40GB: use bs=512. On A100-80GB: use bs=1024.
+GPU Memory: expert dataset on GPU (~0.8 GB compact). Self-play on CPU
+(dense policy 9 GB too large for GPU). Per-batch transfer ~13 MB.
 
 Usage:
     python -m alphatrain.train_hybrid \
         --expert-file alphatrain/data/alphatrain_pairwise.pt \
-        --selfplay-file alphatrain/data/selfplay_iter2.pt \
+        --selfplay-file alphatrain/data/selfplay_iter2_elite.pt \
         --resume alphatrain/data/pillar2f_best.pt --warm-start \
-        --epochs 15 --batch-size 1024 --lr 5e-5 --warmup-epochs 2 \
+        --epochs 15 --batch-size 8192 --lr 5e-5 --warmup-epochs 2 \
         --val-weight 0.001 --rank-weight 1.0 --anchor-weight 0.001
 """
 
@@ -37,7 +32,7 @@ import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 
 from alphatrain.model import AlphaTrainNet, count_parameters
 from alphatrain.dataset import TensorDatasetGPU, SelfPlayDataset
@@ -54,30 +49,35 @@ def train_epoch_hybrid(model, expert_loader, selfplay_loader, optimizer, device,
                        log_interval=50):
     """One epoch of interleaved expert + self-play training.
 
-    Expert is the longer loader (1.31M states). Self-play cycles to match.
-    Each step processes one expert batch and one self-play batch, averages losses.
+    Selfplay drives the epoch length (smaller dataset, no cycling).
+    Expert is cycled to match. Each step:
+      - Expert: pol_CE + val_weight * (ranking + anchor)
+      - Self-play: val_weight * MSE only (no policy loss)
     """
     model.train()
     total_loss = 0
     total_pol_e = 0
     total_rank = 0
     total_anchor = 0
-    total_pol_s = 0
     total_val_s = 0
     n = 0
     t0 = time.time()
     use_amp = scaler is not None
 
-    # Precompute bin centers for decoding two-hot to scalar (expert anchor loss)
     anchor_bins = torch.linspace(0, max_score, num_value_bins, device=device)
 
-    # Expert is larger — cycle selfplay to match
-    selfplay_iter = itertools.cycle(selfplay_loader)
+    # Expert is larger — restart iterator when exhausted (NOT itertools.cycle,
+    # which caches all yielded GPU tensors in memory).
+    expert_iter = iter(expert_loader)
 
-    for bi, expert_batch in enumerate(expert_loader):
-        selfplay_batch = next(selfplay_iter)
+    for bi, selfplay_batch in enumerate(selfplay_loader):
+        try:
+            expert_batch = next(expert_iter)
+        except StopIteration:
+            expert_iter = iter(expert_loader)
+            expert_batch = next(expert_iter)
 
-        # ── Expert: pol_CE + ranking + anchor ──
+        # ── Expert batch ──
         obs_e, pol_e, val_e, good_obs, bad_obs, margin = expert_batch
         obs_e = obs_e.to(device)
         pol_e = pol_e.to(device)
@@ -86,15 +86,11 @@ def train_epoch_hybrid(model, expert_loader, selfplay_loader, optimizer, device,
         bad_obs = bad_obs.to(device)
         margin = margin.to(device)
 
-        # ── Self-play: pol_CE + MSE value ──
-        obs_s, pol_s, val_s = selfplay_batch
+        # ── Self-play batch (value only, no policy) ──
+        obs_s, _pol_s, val_s = selfplay_batch
         obs_s = obs_s.to(device)
-        pol_s = pol_s.to(device)
         val_s = val_s.to(device)
 
-        # Two separate backward passes to halve peak activation memory.
-        # Gradient accumulation makes this mathematically identical to
-        # a single backward on (loss_expert + loss_selfplay) / 2.
         optimizer.zero_grad(set_to_none=True)
 
         # ── Pass 1: Expert (pol_CE + ranking + anchor) ──
@@ -116,26 +112,23 @@ def train_epoch_hybrid(model, expert_loader, selfplay_loader, optimizer, device,
 
             loss_expert = (pol_loss_e
                            + val_weight * anchor_loss
-                           + rank_weight * rank_loss) / 2.0  # /2 for averaging
+                           + rank_weight * rank_loss) / 2.0
 
         if use_amp:
             scaler.scale(loss_expert).backward()
         else:
             loss_expert.backward()
 
-        # Free expert activations and defragment before selfplay forward
         del obs_e, pol_e, val_e, good_obs, bad_obs, margin
         del pol_logits_e, val_logits_e, pair_obs, pair_val
-        torch.cuda.empty_cache()
 
-        # ── Pass 2: Self-play (pol_CE + MSE value) ──
+        # ── Pass 2: Self-play (value MSE ONLY — no policy loss) ──
         with torch.amp.autocast('cuda', enabled=use_amp):
-            pol_logits_s, val_logits_s = model(obs_s)
-            pol_loss_s = cross_entropy_soft(pol_logits_s, pol_s)
+            _pol_logits_s, val_logits_s = model(obs_s)
             v_pred_s = model.predict_value(val_logits_s, max_val=max_score)
             val_loss_s = F.mse_loss(v_pred_s, val_s)
 
-            loss_selfplay = (pol_loss_s + val_weight * val_loss_s) / 2.0
+            loss_selfplay = (val_weight * val_loss_s) / 2.0
 
         if use_amp:
             scaler.scale(loss_selfplay).backward()
@@ -154,12 +147,11 @@ def train_epoch_hybrid(model, expert_loader, selfplay_loader, optimizer, device,
         total_pol_e += pol_loss_e.item()
         total_rank += rank_loss.item()
         total_anchor += anchor_loss.item()
-        total_pol_s += pol_loss_s.item()
         total_val_s += val_loss_s.item()
         n += 1
 
         # Memory diagnostics: first 3 steps + every log_interval
-        if bi < 3 or (bi + 1) % log_interval == 0:
+        if device.type == 'cuda' and (bi < 3 or (bi + 1) % log_interval == 0):
             alloc = torch.cuda.memory_allocated() / 1e9
             resv = torch.cuda.memory_reserved() / 1e9
             if bi < 3:
@@ -168,17 +160,17 @@ def train_epoch_hybrid(model, expert_loader, selfplay_loader, optimizer, device,
 
         if (bi + 1) % log_interval == 0:
             elapsed = time.time() - t0
-            sps = (bi + 1) * expert_loader.batch_size * 2 / elapsed
-            eta = (len(expert_loader) - bi - 1) / max(bi + 1, 1) * elapsed
-            print(f"  [{bi+1}/{len(expert_loader)}] "
+            sps = (bi + 1) * selfplay_loader.batch_size * 2 / elapsed
+            eta = (len(selfplay_loader) - bi - 1) / max(bi + 1, 1) * elapsed
+            print(f"  [{bi+1}/{len(selfplay_loader)}] "
                   f"loss={total_loss/n:.4f} "
                   f"(e_pol={total_pol_e/n:.4f} rank={total_rank/n:.4f} "
                   f"anchor={total_anchor/n:.1f} | "
-                  f"s_pol={total_pol_s/n:.4f} s_val={total_val_s/n:.1f}) "
+                  f"s_val={total_val_s/n:.1f}) "
                   f"{sps:.0f} s/s ETA {eta/60:.0f}m", flush=True)
 
     return (total_loss / n, total_pol_e / n, total_rank / n,
-            total_anchor / n, total_pol_s / n, total_val_s / n)
+            total_anchor / n, total_val_s / n)
 
 
 @torch.no_grad()
@@ -202,17 +194,15 @@ def validate_hybrid(model, expert_val_loader, selfplay_val_loader, device,
         em += mae.item()
         en += 1
 
-    # Self-play validation: policy CE + value MSE + MAE
-    sp, sv, sm, sn = 0, 0, 0, 0
-    for obs, pol, val in selfplay_val_loader:
-        obs, pol, val = obs.to(device), pol.to(device), val.to(device)
+    # Self-play validation: value MSE + MAE only
+    sv, sm, sn = 0, 0, 0
+    for obs, _pol, val in selfplay_val_loader:
+        obs, val = obs.to(device), val.to(device)
         with torch.amp.autocast('cuda', enabled=use_amp):
-            pol_logits, val_logits = model(obs)
-            pol_loss = cross_entropy_soft(pol_logits, pol)
+            _, val_logits = model(obs)
             pred = model.predict_value(val_logits, max_val=max_score)
             val_loss = F.mse_loss(pred, val)
         mae = (pred - val).abs().mean()
-        sp += pol_loss.item()
         sv += val_loss.item()
         sm += mae.item()
         sn += 1
@@ -220,7 +210,6 @@ def validate_hybrid(model, expert_val_loader, selfplay_val_loader, device,
     return {
         'expert_pol': ep / max(en, 1),
         'expert_mae': em / max(en, 1),
-        'selfplay_pol': sp / max(sn, 1),
         'selfplay_val': sv / max(sn, 1),
         'selfplay_mae': sm / max(sn, 1),
     }
@@ -231,9 +220,9 @@ def main():
     p.add_argument('--expert-file', required=True,
                    help='Expert pairwise tensor (alphatrain_pairwise.pt)')
     p.add_argument('--selfplay-file', required=True,
-                   help='Self-play tensor (selfplay_iter2.pt)')
+                   help='Self-play tensor (elite-filtered)')
     p.add_argument('--epochs', type=int, default=15)
-    p.add_argument('--batch-size', type=int, default=4096)
+    p.add_argument('--batch-size', type=int, default=8192)
     p.add_argument('--lr', type=float, default=5e-5)
     p.add_argument('--warmup-epochs', type=int, default=2)
     p.add_argument('--weight-decay', type=float, default=1e-4)
@@ -242,15 +231,14 @@ def main():
     p.add_argument('--anchor-weight', type=float, default=0.001)
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
-    p.add_argument('--value-bins', type=int, default=1,
-                   help='Value head size (1=scalar)')
+    p.add_argument('--value-bins', type=int, default=1)
     p.add_argument('--val-split', type=float, default=0.05)
     p.add_argument('--gpu-data', action='store_true')
     p.add_argument('--amp', action='store_true')
     p.add_argument('--compile', action='store_true')
     p.add_argument('--resume', type=str, default=None)
     p.add_argument('--warm-start', action='store_true')
-    p.add_argument('--save-dir', default='checkpoints/pillar2g')
+    p.add_argument('--save-dir', default='checkpoints/pillar2h')
     p.add_argument('--copy-to', type=str, default=None)
     args = p.parse_args()
 
@@ -263,7 +251,7 @@ def main():
     if not (args.gpu_data and device.type in ('cuda', 'mps')):
         raise NotImplementedError("Use --gpu-data with CUDA or MPS")
 
-    # ── Load expert dataset (pairwise) ──
+    # ── Load expert dataset (pairwise, GPU-resident) ──
     print("\n--- Expert dataset ---", flush=True)
     expert_ds = TensorDatasetGPU(args.expert_file, augment=True,
                                   device=str(device))
@@ -282,12 +270,8 @@ def main():
         expert_val, batch_size=args.batch_size * 2, shuffle=False,
         num_workers=0, collate_fn=expert_ds.collate)
 
-    # ── Load self-play dataset ──
-    # CPU-resident: the dense policy tensor (346K × 6561 × f32 = 9 GB) doesn't
-    # fit on GPU alongside the expert dataset. Collate runs on CPU (array indexing
-    # + dihedral permutation), then .to(device) transfers ~13 MB per batch.
-    print("\n--- Self-play dataset (CPU-resident, 9 GB policy too large for GPU) ---",
-          flush=True)
+    # ── Load self-play dataset (CPU-resident, elite-filtered) ──
+    print("\n--- Self-play dataset (CPU-resident) ---", flush=True)
     selfplay_ds = SelfPlayDataset(args.selfplay_file, augment=True,
                                    device='cpu')
 
@@ -311,12 +295,14 @@ def main():
         resv = torch.cuda.memory_reserved() / 1e9
         print(f"\nGPU after data load: {alloc:.1f} GB alloc, {resv:.1f} GB reserved",
               flush=True)
+
     print(f"\nExpert: {n_train_expert:,} train, {n_eval_expert:,} val "
           f"(pairwise={expert_ds.has_pairs})", flush=True)
     print(f"Self-play: {n_train_sp:,} train, {n_val_sp:,} val", flush=True)
-    print(f"Expert loader: {len(expert_train_loader)} batches/epoch", flush=True)
     print(f"Self-play loader: {len(selfplay_train_loader)} batches/epoch "
-          f"(cycled to {len(expert_train_loader)})", flush=True)
+          f"(drives epoch length)", flush=True)
+    print(f"Expert loader: {len(expert_train_loader)} batches/epoch "
+          f"(cycled)", flush=True)
 
     # ── Model ──
     model = AlphaTrainNet(num_blocks=args.num_blocks, channels=args.channels,
@@ -382,7 +368,8 @@ def main():
     print(f"  Expert: pol_CE + {args.val_weight} * "
           f"({args.rank_weight} * rank + {args.anchor_weight} * anchor)",
           flush=True)
-    print(f"  Self-play: pol_CE + {args.val_weight} * MSE", flush=True)
+    print(f"  Self-play: {args.val_weight} * MSE (value only, NO policy)",
+          flush=True)
     print(f"  LR: {args.lr}, warmup: {args.warmup_epochs} epochs", flush=True)
     print(f"{'='*60}\n", flush=True)
 
@@ -393,7 +380,7 @@ def main():
         lr = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {epoch+1}/{args.epochs} (lr={lr:.2e})", flush=True)
 
-        tl, ep_l, rk, an, sp_l, sv_l = train_epoch_hybrid(
+        tl, ep_l, rk, an, sv_l = train_epoch_hybrid(
             model, expert_train_loader, selfplay_train_loader,
             optimizer, device, max_score=max_score,
             num_value_bins=expert_ds.num_value_bins,
@@ -409,17 +396,15 @@ def main():
 
         print(f"  Train: loss={tl:.4f} "
               f"(e_pol={ep_l:.4f} rank={rk:.4f} anchor={an:.1f} | "
-              f"s_pol={sp_l:.4f} s_val={sv_l:.1f})", flush=True)
+              f"s_val={sv_l:.1f})", flush=True)
         print(f"  Val:   e_pol={val['expert_pol']:.4f} "
               f"e_mae={val['expert_mae']:.0f} | "
-              f"s_pol={val['selfplay_pol']:.4f} "
               f"s_val={val['selfplay_val']:.1f} "
               f"s_mae={val['selfplay_mae']:.0f} "
               f"[{time.time()-et:.0f}s]", flush=True)
 
-        # Use combined metric for best model selection:
-        # expert policy + selfplay policy (both should be good)
-        val_combined = val['expert_pol'] + val['selfplay_pol']
+        # Best model by expert policy loss (the only policy signal)
+        val_metric = val['expert_pol']
 
         ckpt_data = {
             'epoch': epoch,
@@ -427,8 +412,8 @@ def main():
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'val_metrics': val,
-            'val_loss': val_combined,
-            'best_val_loss': min(best_val, val_combined),
+            'val_loss': val_metric,
+            'best_val_loss': min(best_val, val_metric),
             'max_score': max_score,
             'args': vars(args),
         }
@@ -447,19 +432,18 @@ def main():
                          os.path.join(copy_dir,
                                       f'alphatrain_td_epoch_{epoch+1}.pt'))
 
-        if val_combined < best_val:
-            best_val = val_combined
+        if val_metric < best_val:
+            best_val = val_metric
             best_path = os.path.join(args.save_dir, 'best.pt')
             torch.save(ckpt_data, best_path)
-            print(f"  ** New best (combined_pol={val_combined:.4f}) **",
-                  flush=True)
+            print(f"  ** New best (e_pol={val_metric:.4f}) **", flush=True)
             if args.copy_to:
                 shutil.copy2(best_path, args.copy_to)
                 print(f"  Copied to {args.copy_to}", flush=True)
 
     print(f"\n=== Done: {args.epochs} epochs in "
           f"{(time.time()-t0)/3600:.1f}h ===", flush=True)
-    print(f"Best combined pol loss: {best_val:.4f}", flush=True)
+    print(f"Best expert pol loss: {best_val:.4f}", flush=True)
 
 
 if __name__ == '__main__':
