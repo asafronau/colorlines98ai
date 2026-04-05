@@ -41,12 +41,7 @@ fn rollout(
         if clone.game_over {
             break;
         }
-        buf.fill(&clone);
-        let m = if temperature > 0.0 {
-            buf.softmax_move(temperature, &mut rng)
-        } else {
-            buf.best_move()
-        };
+        let m = crate::heuristic::get_rollout_move(&clone, temperature, &mut rng, buf);
         match m {
             Some((sr, sc, tr, tc)) => {
                 clone.move_ball(sr, sc, tr, tc);
@@ -125,8 +120,8 @@ pub fn tournament_player_with_buf(
                     }
                     let immediate = evaluate_move(&mut board_copy, sr, sc, tr, tc, color);
 
-                    // Fast 1-ply: execute move, check for clears, count empty.
-                    // Avoids the O(N²) full 2-ply response evaluation.
+                    // 2-ply: execute move, then evaluate best response.
+                    // Uses MoveBuffer for response evaluation (reuses allocation).
                     let mut ply_game = game.clone_with_rng(SimpleRng::new(rng.next_u64()));
                     let (valid, pts, _, game_over) = ply_game.move_ball(sr, sc, tr, tc);
                     if !valid {
@@ -135,7 +130,14 @@ pub fn tournament_player_with_buf(
 
                     let clear_bonus = pts as f64 * 20.0;
                     let future = if !game_over {
-                        count_empty(&ply_game.board) as f64 * 0.25
+                        let mut f = 0.0f64;
+                        buf.fill(&ply_game);
+                        if let Some((bsr, bsc, btr, btc)) = buf.best_move() {
+                            let c = ply_game.board[bsr][bsc];
+                            let mut b2 = ply_game.board;
+                            f = evaluate_move(&mut b2, bsr, bsc, btr, btc, c);
+                        }
+                        f + count_empty(&ply_game.board) as f64 * 0.25
                     } else {
                         -500.0
                     };
