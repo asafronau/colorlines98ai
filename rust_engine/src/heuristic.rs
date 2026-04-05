@@ -196,6 +196,8 @@ fn max_line_at_fast(board: &Board, r: usize, c: usize, color: i8) -> i32 {
 pub struct MoveBuffer {
     pub moves: Vec<(usize, usize, usize, usize)>,
     pub scores: Vec<f64>,
+    h_scores: Vec<f64>,
+    ml_scores: Vec<f64>,
 }
 
 impl MoveBuffer {
@@ -203,6 +205,8 @@ impl MoveBuffer {
         MoveBuffer {
             moves: Vec::with_capacity(1200),
             scores: Vec::with_capacity(1200),
+            h_scores: Vec::with_capacity(1200),
+            ml_scores: Vec::with_capacity(1200),
         }
     }
 
@@ -248,6 +252,54 @@ impl MoveBuffer {
                 }
             }
         }
+    }
+
+    /// Collect all legal moves with ML-blended scores (heuristic + oracle).
+    /// Used for root-level move selection in the tournament player.
+    pub fn fill_ml(&mut self, game: &crate::game::ColorLinesGame) {
+        self.moves.clear();
+        self.scores.clear();
+        self.h_scores.clear();
+        self.ml_scores.clear();
+
+        let source_mask = get_source_mask(&game.board);
+        let labels = label_empty_components(&game.board);
+        let mut board = game.board;
+
+        // Extract next_ball info for features
+        let mut next_r = [0usize; 3];
+        let mut next_c = [0usize; 3];
+        let mut next_color = [0i8; 3];
+        let n_next = game.num_next as usize;
+        for i in 0..n_next {
+            next_r[i] = game.next_balls[i].row as usize;
+            next_c[i] = game.next_balls[i].col as usize;
+            next_color[i] = game.next_balls[i].color;
+        }
+
+        for sr in 0..BOARD_SIZE {
+            for sc in 0..BOARD_SIZE {
+                if source_mask[sr][sc] == 0 { continue; }
+                let color = board[sr][sc];
+                let target_mask = get_target_mask(&labels, sr, sc);
+                for tr in 0..BOARD_SIZE {
+                    for tc in 0..BOARD_SIZE {
+                        if target_mask[tr][tc] == 0 { continue; }
+                        let h = evaluate_move(&mut board, sr, sc, tr, tc, color);
+                        let m = crate::features::ml_score(
+                            &mut board, sr, sc, tr, tc, color,
+                            &next_r, &next_c, &next_color, n_next,
+                        );
+                        self.moves.push((sr, sc, tr, tc));
+                        self.h_scores.push(h);
+                        self.ml_scores.push(m);
+                    }
+                }
+            }
+        }
+
+        // Blend: normalize both, combine with ML_BLEND weight
+        self.scores = crate::features::normalize_and_blend(&self.h_scores, &self.ml_scores);
     }
 
     /// Pick the best move (greedy).

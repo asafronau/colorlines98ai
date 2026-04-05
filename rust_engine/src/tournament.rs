@@ -99,34 +99,28 @@ pub fn tournament_player_with_buf(
     rng: &mut SimpleRng,
     buf: &mut MoveBuffer,
 ) -> Option<TournamentResult> {
+    // Phase 1: 2-ply for ALL legal moves.
+    // Uses plain heuristic for evaluation (ML oracle used only at root selection
+    // in the heuristic player, not inside the tournament bracket).
     let source_mask = get_source_mask(&game.board);
     let labels = label_empty_components(&game.board);
-
-    // Phase 1: 2-ply for ALL legal moves
     let mut candidates: Vec<Candidate> = Vec::with_capacity(256);
     let mut board_copy = game.board;
 
     for sr in 0..BOARD_SIZE {
         for sc in 0..BOARD_SIZE {
-            if source_mask[sr][sc] == 0 {
-                continue;
-            }
+            if source_mask[sr][sc] == 0 { continue; }
             let color = game.board[sr][sc];
             let target_mask = get_target_mask(&labels, sr, sc);
             for tr in 0..BOARD_SIZE {
                 for tc in 0..BOARD_SIZE {
-                    if target_mask[tr][tc] == 0 {
-                        continue;
-                    }
+                    if target_mask[tr][tc] == 0 { continue; }
                     let immediate = evaluate_move(&mut board_copy, sr, sc, tr, tc, color);
 
-                    // 2-ply: execute move, then evaluate best response.
-                    // Uses MoveBuffer for response evaluation (reuses allocation).
+                    // 2-ply: execute move, evaluate best response
                     let mut ply_game = game.clone_with_rng(SimpleRng::new(rng.next_u64()));
                     let (valid, pts, _, game_over) = ply_game.move_ball(sr, sc, tr, tc);
-                    if !valid {
-                        continue;
-                    }
+                    if !valid { continue; }
 
                     let clear_bonus = pts as f64 * 20.0;
                     let future = if !game_over {
@@ -144,7 +138,7 @@ pub fn tournament_player_with_buf(
 
                     candidates.push(Candidate {
                         mv: (sr, sc, tr, tc),
-                        score_2ply: immediate + clear_bonus + future,
+                        score_2ply: immediate + clear_bonus + future * 0.5,
                     });
                 }
             }
