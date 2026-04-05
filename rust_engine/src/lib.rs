@@ -1,6 +1,8 @@
 pub mod rng;
 pub mod board;
 pub mod game;
+pub mod heuristic;
+pub mod tournament;
 
 #[cfg(feature = "python")]
 mod python;
