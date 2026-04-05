@@ -130,34 +130,66 @@ pub fn evaluate_move(board: &mut Board, sr: usize, sc: usize, tr: usize, tc: usi
 
 /// Find the best move using the heuristic.
 pub fn get_best_move(game: &crate::game::ColorLinesGame) -> Option<(usize, usize, usize, usize)> {
+    let mut buf = MoveBuffer::new();
+    buf.fill(game);
+    buf.best_move()
+}
+
+/// Fast rollout move: first check for immediate clears (very cheap),
+/// then fall back to softmax over all moves if none found.
+/// Returns the move and whether early-exit was used.
+pub fn get_rollout_move(
+    game: &crate::game::ColorLinesGame,
+    temperature: f64,
+    rng: &mut crate::rng::SimpleRng,
+    buf: &mut MoveBuffer,
+) -> Option<(usize, usize, usize, usize)> {
     let source_mask = get_source_mask(&game.board);
     let labels = label_empty_components(&game.board);
-    let mut best_score = f64::NEG_INFINITY;
-    let mut best_move = None;
     let mut board = game.board;
 
+    // Fast path: check for immediate line clears first (no full evaluation needed)
     for sr in 0..BOARD_SIZE {
         for sc in 0..BOARD_SIZE {
-            if source_mask[sr][sc] == 0 {
-                continue;
-            }
+            if source_mask[sr][sc] == 0 { continue; }
             let color = board[sr][sc];
-            let target_mask = get_target_mask(&labels, sr, sc);
-            for tr in 0..BOARD_SIZE {
-                for tc in 0..BOARD_SIZE {
-                    if target_mask[tr][tc] == 0 {
-                        continue;
-                    }
-                    let s = evaluate_move(&mut board, sr, sc, tr, tc, color);
-                    if s > best_score {
-                        best_score = s;
-                        best_move = Some((sr, sc, tr, tc));
+            // Check if this ball is part of a line of 4 (moving it could complete/break)
+            let ml = max_line_at_fast(&board, sr, sc, color);
+            if ml >= 4 {
+                // This ball is promising — check its targets for clears
+                let target_mask = get_target_mask(&labels, sr, sc);
+                for tr in 0..BOARD_SIZE {
+                    for tc in 0..BOARD_SIZE {
+                        if target_mask[tr][tc] == 0 { continue; }
+                        board[sr][sc] = 0;
+                        board[tr][tc] = color;
+                        let new_ml = max_line_at_fast(&board, tr, tc, color);
+                        board[sr][sc] = color;
+                        board[tr][tc] = 0;
+                        if new_ml >= MIN_LINE_LENGTH as i32 {
+                            return Some((sr, sc, tr, tc));
+                        }
                     }
                 }
             }
         }
     }
-    best_move
+
+    // Slow path: full evaluation + softmax
+    buf.fill(game);
+    if temperature > 0.0 {
+        buf.softmax_move(temperature, rng)
+    } else {
+        buf.best_move()
+    }
+}
+
+#[inline]
+fn max_line_at_fast(board: &Board, r: usize, c: usize, color: i8) -> i32 {
+    DIRS.iter()
+        .map(|&(dr, dc)| line_length(board, r, c, color, dr, dc))
+        .max()
+        .unwrap_or(1)
 }
 
 /// Reusable buffers for move evaluation (avoids allocation in hot loops).
