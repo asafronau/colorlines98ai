@@ -2,7 +2,6 @@ use colorlines98::board::*;
 use colorlines98::game::ColorLinesGame;
 use colorlines98::heuristic::get_best_move;
 use colorlines98::tournament::tournament_player;
-use colorlines98::rng::SimpleRng;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Instant;

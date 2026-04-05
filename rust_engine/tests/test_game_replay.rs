@@ -1,7 +1,7 @@
 /// Game replay fixture tests.
 /// Verifies Rust game produces identical board states and scores as Python.
 use colorlines98::board::*;
-use colorlines98::game::ColorLinesGame;
+use colorlines98::game::{ColorLinesGame, NextBall};
 use serde_json::Value;
 use std::fs;
 
@@ -56,18 +56,18 @@ fn test_game_replay_next_balls_after_reset() {
         game.reset();
 
         assert_eq!(
-            game.next_balls.len(),
+            game.num_next as usize,
             expected_nb.len(),
             "seed={seed}: next_balls count mismatch"
         );
 
         for (i, nb) in expected_nb.iter().enumerate() {
-            let row = nb["row"].as_u64().unwrap() as usize;
-            let col = nb["col"].as_u64().unwrap() as usize;
+            let row = nb["row"].as_u64().unwrap() as u8;
+            let col = nb["col"].as_u64().unwrap() as u8;
             let color = nb["color"].as_i64().unwrap() as i8;
             assert_eq!(
                 game.next_balls[i],
-                ((row, col), color),
+                NextBall { row, col, color },
                 "seed={seed}: next_ball[{i}] mismatch"
             );
         }
