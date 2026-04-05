@@ -77,7 +77,7 @@ impl PyColorLinesGame {
 
     #[getter]
     fn next_balls(&self) -> Vec<((usize, usize), i8)> {
-        self.inner.next_balls.clone()
+        self.inner.next_balls_tuples()
     }
 
     /// Execute a move with full validation.

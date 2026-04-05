@@ -7,7 +7,7 @@
 
 use crate::board::*;
 use crate::game::ColorLinesGame;
-use crate::heuristic::{evaluate_move, get_best_move, get_softmax_move};
+use crate::heuristic::{evaluate_move, MoveBuffer};
 use crate::rng::SimpleRng;
 
 /// Result of tournament play: chosen move + top candidates with scores.
@@ -27,6 +27,7 @@ fn rollout(
     depth: usize,
     temperature: f64,
     seed: u64,
+    buf: &mut MoveBuffer,
 ) -> f64 {
     let mut clone = game.clone_with_rng(SimpleRng::new(seed));
     let (valid, _, _, _) = clone.move_ball(mv.0, mv.1, mv.2, mv.3);
@@ -40,10 +41,11 @@ fn rollout(
         if clone.game_over {
             break;
         }
+        buf.fill(&clone);
         let m = if temperature > 0.0 {
-            get_softmax_move(&clone, temperature, &mut rng)
+            buf.softmax_move(temperature, &mut rng)
         } else {
-            get_best_move(&clone)
+            buf.best_move()
         };
         match m {
             Some((sr, sc, tr, tc)) => {
@@ -62,12 +64,13 @@ fn run_rollouts(
     depth: usize,
     temperature: f64,
     rng: &mut SimpleRng,
+    buf: &mut MoveBuffer,
 ) -> Vec<Vec<f64>> {
     candidates
         .iter()
         .map(|c| {
             (0..n_rollouts)
-                .map(|_| rollout(game, c.mv, depth, temperature, rng.next_u64()))
+                .map(|_| rollout(game, c.mv, depth, temperature, rng.next_u64(), buf))
                 .collect()
         })
         .collect()
@@ -87,6 +90,19 @@ pub fn tournament_player(
     rollout_depth: usize,
     temperature: f64,
     rng: &mut SimpleRng,
+) -> Option<TournamentResult> {
+    let mut buf = MoveBuffer::new();
+    tournament_player_with_buf(game, num_rollouts, rollout_depth, temperature, rng, &mut buf)
+}
+
+/// Tournament player with pre-allocated buffer (avoids per-call allocation).
+pub fn tournament_player_with_buf(
+    game: &ColorLinesGame,
+    num_rollouts: usize,
+    rollout_depth: usize,
+    temperature: f64,
+    rng: &mut SimpleRng,
+    buf: &mut MoveBuffer,
 ) -> Option<TournamentResult> {
     let source_mask = get_source_mask(&game.board);
     let labels = label_empty_components(&game.board);
@@ -109,31 +125,24 @@ pub fn tournament_player(
                     }
                     let immediate = evaluate_move(&mut board_copy, sr, sc, tr, tc, color);
 
-                    // 2-ply: simulate move, evaluate best response
+                    // Fast 1-ply: execute move, check for clears, count empty.
+                    // Avoids the O(N²) full 2-ply response evaluation.
                     let mut ply_game = game.clone_with_rng(SimpleRng::new(rng.next_u64()));
-                    let (valid, _, _, _) = ply_game.move_ball(sr, sc, tr, tc);
+                    let (valid, pts, _, game_over) = ply_game.move_ball(sr, sc, tr, tc);
                     if !valid {
                         continue;
                     }
 
-                    let pts = ply_game.score - game.score;
                     let clear_bonus = pts as f64 * 20.0;
-                    let future = if !ply_game.game_over {
-                        let mut f = 0.0f64;
-                        if let Some((bsr, bsc, btr, btc)) = get_best_move(&ply_game) {
-                            let c = ply_game.board[bsr][bsc];
-                            let mut b2 = ply_game.board;
-                            f = evaluate_move(&mut b2, bsr, bsc, btr, btc, c);
-                        }
-                        f += count_empty(&ply_game.board) as f64 * 0.25;
-                        f
+                    let future = if !game_over {
+                        count_empty(&ply_game.board) as f64 * 0.25
                     } else {
                         -500.0
                     };
 
                     candidates.push(Candidate {
                         mv: (sr, sc, tr, tc),
-                        score_2ply: immediate + clear_bonus + future * 0.5,
+                        score_2ply: immediate + clear_bonus + future,
                     });
                 }
             }
@@ -161,7 +170,7 @@ pub fn tournament_player(
     let qualifiers: Vec<Candidate> = candidates.drain(..qual_n).collect();
 
     // Phase 2: Quarter-finals — 10 short rollouts → top 10
-    let qf_scores = run_rollouts(game, &qualifiers, 10, rollout_depth / 2, temperature, rng);
+    let qf_scores = run_rollouts(game, &qualifiers, 10, rollout_depth / 2, temperature, rng, buf);
     let mut qf_ranked: Vec<(usize, f64)> = (0..qualifiers.len())
         .map(|i| (i, mean(&qf_scores[i]) + qualifiers[i].score_2ply * 0.1))
         .collect();
@@ -179,7 +188,7 @@ pub fn tournament_player(
         })
         .collect();
     let semi_raw: Vec<Vec<f64>> = semi_indices.iter().map(|&i| qf_scores[i].clone()).collect();
-    let sf_scores = run_rollouts(game, &semis, 40, rollout_depth, temperature, rng);
+    let sf_scores = run_rollouts(game, &semis, 40, rollout_depth, temperature, rng, buf);
 
     let combined: Vec<Vec<f64>> = (0..semis.len())
         .map(|i| {
@@ -212,7 +221,7 @@ pub fn tournament_player(
     } else {
         10
     };
-    let final_scores = run_rollouts(game, &finals, remaining, rollout_depth, temperature, rng);
+    let final_scores = run_rollouts(game, &finals, remaining, rollout_depth, temperature, rng, buf);
 
     let all_finals: Vec<Vec<f64>> = (0..finals.len())
         .map(|i| {

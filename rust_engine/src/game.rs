@@ -1,29 +1,41 @@
 // Color Lines 98 game state and logic.
+//
+// Zero-allocation design: all state is inline (no Vec, no heap).
+// Clone is a simple memcpy (~100 bytes). Critical for rollout performance.
 
 use crate::board::*;
 use crate::rng::SimpleRng;
 
+/// A pending ball spawn: position + color.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct NextBall {
+    pub row: u8,
+    pub col: u8,
+    pub color: i8,
+}
+
+/// Full game state — 100% stack-allocated. Clone = memcpy.
 #[derive(Clone)]
 pub struct ColorLinesGame {
     pub board: Board,
-    pub next_balls: Vec<((usize, usize), i8)>, // ((row, col), color)
+    pub next_balls: [NextBall; BALLS_PER_TURN],
+    pub num_next: u8,
     pub score: i32,
     pub turns: i32,
     pub game_over: bool,
     pub rng: SimpleRng,
-    num_colors: i8,
 }
 
 impl ColorLinesGame {
     pub fn new(seed: u64) -> Self {
         ColorLinesGame {
             board: [[0i8; BOARD_SIZE]; BOARD_SIZE],
-            next_balls: Vec::new(),
+            next_balls: [NextBall::default(); BALLS_PER_TURN],
+            num_next: 0,
             score: 0,
             turns: 0,
             game_over: false,
             rng: SimpleRng::new(seed),
-            num_colors: NUM_COLORS,
         }
     }
 
@@ -37,17 +49,22 @@ impl ColorLinesGame {
         self.generate_next_balls();
     }
 
-    /// Deep clone with a replacement RNG.
+    /// Clone with a replacement RNG. Entire struct is Copy-like (no heap).
+    #[inline]
     pub fn clone_with_rng(&self, rng: SimpleRng) -> Self {
-        ColorLinesGame {
-            board: self.board,
-            next_balls: self.next_balls.clone(),
-            score: self.score,
-            turns: self.turns,
-            game_over: self.game_over,
-            rng,
-            num_colors: self.num_colors,
-        }
+        let mut c = self.clone();
+        c.rng = rng;
+        c
+    }
+
+    /// Get next_balls as the tuple format used by Python for compatibility.
+    pub fn next_balls_tuples(&self) -> Vec<((usize, usize), i8)> {
+        (0..self.num_next as usize)
+            .map(|i| {
+                let nb = &self.next_balls[i];
+                ((nb.row as usize, nb.col as usize), nb.color)
+            })
+            .collect()
     }
 
     // ── Ball spawning ─────────────────────────────────────────────
@@ -56,27 +73,33 @@ impl ColorLinesGame {
         let empty = get_empty_cells(&self.board);
         let n_empty = empty.len();
         if n_empty == 0 {
-            self.next_balls = Vec::new();
+            self.num_next = 0;
             return;
         }
         let n = BALLS_PER_TURN.min(n_empty);
         let indices = self.rng.choice_no_replace(n_empty, n);
-        let colors = self.rng.integers(1, self.num_colors as i64 + 1, n);
-        self.next_balls = (0..n)
-            .map(|i| (empty[indices[i]], colors[i] as i8))
-            .collect();
+        let colors = self.rng.integers(1, NUM_COLORS as i64 + 1, n);
+        for i in 0..n {
+            self.next_balls[i] = NextBall {
+                row: empty[indices[i]].0 as u8,
+                col: empty[indices[i]].1 as u8,
+                color: colors[i] as i8,
+            };
+        }
+        self.num_next = n as u8;
     }
 
     fn spawn_balls(&mut self) {
-        for i in 0..self.next_balls.len() {
-            let ((row, col), color) = self.next_balls[i];
+        for i in 0..self.num_next as usize {
+            let nb = self.next_balls[i];
+            let (row, col) = (nb.row as usize, nb.col as usize);
             if self.board[row][col] == 0 {
-                self.board[row][col] = color;
+                self.board[row][col] = nb.color;
             } else {
                 let empty = get_empty_cells(&self.board);
                 if !empty.is_empty() {
                     let idx = self.rng.randint(0, empty.len() as i64) as usize;
-                    self.board[empty[idx].0][empty[idx].1] = color;
+                    self.board[empty[idx].0][empty[idx].1] = nb.color;
                 }
             }
         }
@@ -85,7 +108,6 @@ impl ColorLinesGame {
     // ── Move execution ────────────────────────────────────────────
 
     /// Execute a move with full validation.
-    /// Returns (valid, score_gained, cleared, game_over).
     pub fn move_ball(
         &mut self,
         sr: usize,
@@ -105,7 +127,24 @@ impl ColorLinesGame {
             return (false, 0, 0, self.game_over);
         }
 
-        // Execute move
+        self.execute_move(sr, sc, tr, tc)
+    }
+
+    /// Execute a move known to be legal (skip validation).
+    #[inline]
+    pub fn trusted_move(&mut self, sr: usize, sc: usize, tr: usize, tc: usize) {
+        self.execute_move(sr, sc, tr, tc);
+    }
+
+    /// Shared move execution logic.
+    #[inline]
+    fn execute_move(
+        &mut self,
+        sr: usize,
+        sc: usize,
+        tr: usize,
+        tc: usize,
+    ) -> (bool, i32, usize, bool) {
         let color = self.board[sr][sc];
         self.board[sr][sc] = 0;
         self.board[tr][tc] = color;
@@ -123,8 +162,11 @@ impl ColorLinesGame {
         } else {
             // No line → spawn + check spawned balls for lines
             self.spawn_balls();
-            let next_balls_snapshot: Vec<_> = self.next_balls.clone();
-            for &((br, bc), _) in &next_balls_snapshot {
+            // Check spawned positions (snapshot next_balls before generate)
+            let n = self.num_next as usize;
+            let snapshot = self.next_balls;
+            for i in 0..n {
+                let (br, bc) = (snapshot[i].row as usize, snapshot[i].col as usize);
                 if self.board[br][bc] != 0 {
                     let spawn_cleared = clear_lines_at(&mut self.board, br, bc);
                     if spawn_cleared > 0 {
@@ -143,34 +185,6 @@ impl ColorLinesGame {
 
         (true, total_score, total_cleared, self.game_over)
     }
-
-    /// Execute a move known to be legal (skip validation). For MCTS hot path.
-    pub fn trusted_move(&mut self, sr: usize, sc: usize, tr: usize, tc: usize) {
-        let color = self.board[sr][sc];
-        self.board[sr][sc] = 0;
-        self.board[tr][tc] = color;
-        self.turns += 1;
-
-        let cleared = clear_lines_at(&mut self.board, tr, tc);
-        if cleared > 0 {
-            self.score += calculate_score(cleared);
-        } else {
-            self.spawn_balls();
-            let next_balls_snapshot: Vec<_> = self.next_balls.clone();
-            for &((br, bc), _) in &next_balls_snapshot {
-                if self.board[br][bc] != 0 {
-                    let spawn_cleared = clear_lines_at(&mut self.board, br, bc);
-                    if spawn_cleared > 0 {
-                        self.score += calculate_score(spawn_cleared);
-                    }
-                }
-            }
-            self.generate_next_balls();
-            if count_empty(&self.board) == 0 {
-                self.game_over = true;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -183,6 +197,7 @@ mod tests {
         assert_eq!(g.score, 0);
         assert_eq!(g.turns, 0);
         assert!(!g.game_over);
+        assert_eq!(g.num_next, 0);
     }
 
     #[test]
@@ -190,8 +205,8 @@ mod tests {
         let mut g = ColorLinesGame::new(42);
         g.reset();
         let n_balls = 81 - count_empty(&g.board);
-        assert_eq!(n_balls, 3); // 3 balls spawned from first generate+spawn
-        assert_eq!(g.next_balls.len(), 3); // 3 next balls generated
+        assert_eq!(n_balls, 3);
+        assert_eq!(g.num_next, 3);
     }
 
     #[test]
@@ -201,7 +216,7 @@ mod tests {
         let mut g2 = ColorLinesGame::new(42);
         g2.reset();
         assert_eq!(g1.board, g2.board);
-        assert_eq!(g1.next_balls, g2.next_balls);
+        assert_eq!(g1.next_balls[..g1.num_next as usize], g2.next_balls[..g2.num_next as usize]);
     }
 
     #[test]
@@ -209,8 +224,31 @@ mod tests {
         let mut g = ColorLinesGame::new(42);
         g.reset();
         let mut g2 = g.clone();
-        // Mutate clone
         g2.board[0][0] = 5;
         assert_ne!(g.board[0][0], g2.board[0][0]);
+    }
+
+    #[test]
+    fn test_clone_is_cheap() {
+        // Verify clone is truly stack-based (no heap)
+        let mut g = ColorLinesGame::new(42);
+        g.reset();
+        let size = std::mem::size_of::<ColorLinesGame>();
+        // Board(81) + next_balls(3×3=9) + num_next(1) + score(4) + turns(4)
+        // + game_over(1) + rng(8) + padding ≈ ~120 bytes
+        assert!(size < 200, "ColorLinesGame is {} bytes, expected <200", size);
+    }
+
+    #[test]
+    fn test_next_balls_tuples_compat() {
+        let mut g = ColorLinesGame::new(42);
+        g.reset();
+        let tuples = g.next_balls_tuples();
+        assert_eq!(tuples.len(), g.num_next as usize);
+        for (i, &((r, c), color)) in tuples.iter().enumerate() {
+            assert_eq!(r, g.next_balls[i].row as usize);
+            assert_eq!(c, g.next_balls[i].col as usize);
+            assert_eq!(color, g.next_balls[i].color);
+        }
     }
 }

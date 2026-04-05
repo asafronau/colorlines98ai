@@ -160,61 +160,108 @@ pub fn get_best_move(game: &crate::game::ColorLinesGame) -> Option<(usize, usize
     best_move
 }
 
+/// Reusable buffers for move evaluation (avoids allocation in hot loops).
+pub struct MoveBuffer {
+    pub moves: Vec<(usize, usize, usize, usize)>,
+    pub scores: Vec<f64>,
+}
+
+impl MoveBuffer {
+    pub fn new() -> Self {
+        MoveBuffer {
+            moves: Vec::with_capacity(1200),
+            scores: Vec::with_capacity(1200),
+        }
+    }
+
+    /// Collect all legal moves and their heuristic scores.
+    pub fn fill(&mut self, game: &crate::game::ColorLinesGame) {
+        self.fill_inner(&game.board, BOARD_SIZE); // no source limit
+    }
+
+    /// Fast fill: only evaluate moves from up to `max_sources` source balls.
+    /// For rollouts where speed > accuracy.
+    pub fn fill_fast(&mut self, game: &crate::game::ColorLinesGame, max_sources: usize) {
+        self.fill_inner(&game.board, max_sources);
+    }
+
+    fn fill_inner(&mut self, board: &Board, max_sources: usize) {
+        self.moves.clear();
+        self.scores.clear();
+        let source_mask = get_source_mask(board);
+        let labels = label_empty_components(board);
+        let mut board_mut = *board;
+        let mut n_sources = 0;
+
+        for sr in 0..BOARD_SIZE {
+            for sc in 0..BOARD_SIZE {
+                if source_mask[sr][sc] == 0 {
+                    continue;
+                }
+                n_sources += 1;
+                if n_sources > max_sources {
+                    return;
+                }
+                let color = board_mut[sr][sc];
+                let target_mask = get_target_mask(&labels, sr, sc);
+                for tr in 0..BOARD_SIZE {
+                    for tc in 0..BOARD_SIZE {
+                        if target_mask[tr][tc] == 0 {
+                            continue;
+                        }
+                        let s = evaluate_move(&mut board_mut, sr, sc, tr, tc, color);
+                        self.moves.push((sr, sc, tr, tc));
+                        self.scores.push(s);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pick the best move (greedy).
+    pub fn best_move(&self) -> Option<(usize, usize, usize, usize)> {
+        if self.moves.is_empty() {
+            return None;
+        }
+        let best_idx = self.scores.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap().0;
+        Some(self.moves[best_idx])
+    }
+
+    /// Sample a move using softmax.
+    pub fn softmax_move(&self, temperature: f64, rng: &mut crate::rng::SimpleRng) -> Option<(usize, usize, usize, usize)> {
+        if self.moves.is_empty() {
+            return None;
+        }
+        let max_s = self.scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mut cumul = 0.0f64;
+        let mut sum = 0.0f64;
+        // Two-pass: compute sum, then sample
+        for s in &self.scores {
+            sum += ((s - max_s) / temperature).exp();
+        }
+        let r = rng.next_f64() * sum;
+        for (i, s) in self.scores.iter().enumerate() {
+            cumul += ((s - max_s) / temperature).exp();
+            if r <= cumul {
+                return Some(self.moves[i]);
+            }
+        }
+        Some(*self.moves.last().unwrap())
+    }
+}
+
 /// Sample a move using softmax over heuristic scores.
 pub fn get_softmax_move(
     game: &crate::game::ColorLinesGame,
     temperature: f64,
     rng: &mut crate::rng::SimpleRng,
 ) -> Option<(usize, usize, usize, usize)> {
-    let source_mask = get_source_mask(&game.board);
-    let labels = label_empty_components(&game.board);
-    let mut moves = Vec::with_capacity(256);
-    let mut scores = Vec::with_capacity(256);
-    let mut board = game.board;
-
-    for sr in 0..BOARD_SIZE {
-        for sc in 0..BOARD_SIZE {
-            if source_mask[sr][sc] == 0 {
-                continue;
-            }
-            let color = board[sr][sc];
-            let target_mask = get_target_mask(&labels, sr, sc);
-            for tr in 0..BOARD_SIZE {
-                for tc in 0..BOARD_SIZE {
-                    if target_mask[tr][tc] == 0 {
-                        continue;
-                    }
-                    let s = evaluate_move(&mut board, sr, sc, tr, tc, color);
-                    moves.push((sr, sc, tr, tc));
-                    scores.push(s);
-                }
-            }
-        }
-    }
-
-    if moves.is_empty() {
-        return None;
-    }
-
-    let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mut probs: Vec<f64> = scores
-        .iter()
-        .map(|s| ((s - max_s) / temperature).exp())
-        .collect();
-    let sum: f64 = probs.iter().sum();
-    for p in probs.iter_mut() {
-        *p /= sum;
-    }
-
-    let r = rng.next_f64();
-    let mut cumul = 0.0;
-    for (i, &p) in probs.iter().enumerate() {
-        cumul += p;
-        if r <= cumul {
-            return Some(moves[i]);
-        }
-    }
-    Some(*moves.last().unwrap())
+    let mut buf = MoveBuffer::new();
+    buf.fill(game);
+    buf.softmax_move(temperature, rng)
 }
 
 #[cfg(test)]
