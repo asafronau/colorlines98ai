@@ -142,18 +142,98 @@ fn main() {
         t_roll.as_secs_f64() * 1e6 / n_rollouts as f64,
         t_roll.as_secs_f64() * 1e6 / n_rollouts as f64 / 20.0);
 
+    // ── 2-ply simulation (the bottleneck) ──
+    println!("\n--- 2-ply simulation (matching tournament logic) ---");
+    {
+        game.ensure_cc();
+        let src_bits = get_source_mask_bits(&game.board);
+        let labels = game.cc_labels;
+        let comp = ComponentMasks::from_labels(&labels);
+
+        let mut ply = game.clone();
+        let mut n_candidates = 0;
+        let mut t_move = 0u64;
+        let mut t_gbm = 0u64;
+        let mut t_comp = 0u64;
+
+        let t0 = Instant::now();
+        let mut src = src_bits;
+        while src != 0 {
+            let si = src.trailing_zeros();
+            src &= src - 1;
+            let (sr, sc) = idx_to_rc(si);
+            let color = game.board[sr][sc];
+            let tgt = comp.target_mask(&labels, sr, sc);
+            let mut t = tgt;
+            while t != 0 {
+                let ti = t.trailing_zeros();
+                t &= t - 1;
+                let (tr, tc) = idx_to_rc(ti);
+
+                // Simulate 2-ply (without RNG to avoid side effects)
+                ply.board = game.board;
+                ply.next_balls = game.next_balls;
+                ply.num_next = game.num_next;
+                ply.score = game.score;
+                ply.turns = game.turns;
+                ply.game_over = game.game_over;
+                ply.cc_labels = game.cc_labels;
+                ply.cc_valid = true;
+
+                let tm = Instant::now();
+                ply.trusted_move(sr, sc, tr, tc);
+                t_move += tm.elapsed().as_nanos() as u64;
+
+                if !ply.game_over {
+                    let tc2 = Instant::now();
+                    ply.ensure_cc();
+                    let ply_labels = ply.cc_labels;
+                    let ply_comp = ComponentMasks::from_labels(&ply_labels);
+                    t_comp += tc2.elapsed().as_nanos() as u64;
+
+                    let tg = Instant::now();
+                    let ply_src = get_source_mask_bits(&ply.board);
+                    let mut best_score = f64::NEG_INFINITY;
+                    let mut ps = ply_src;
+                    while ps != 0 {
+                        let psi = ps.trailing_zeros();
+                        ps &= ps - 1;
+                        let (psr, psc) = idx_to_rc(psi);
+                        let pc = ply.board[psr][psc];
+                        let pt = ply_comp.target_mask(&ply_labels, psr, psc);
+                        let mut ptt = pt;
+                        while ptt != 0 {
+                            let pti = ptt.trailing_zeros();
+                            ptt &= ptt - 1;
+                            let (ptr, ptc) = idx_to_rc(pti);
+                            let s = evaluate_move(&mut ply.board, psr, psc, ptr, ptc, pc);
+                            if s > best_score { best_score = s; }
+                        }
+                    }
+                    t_gbm += tg.elapsed().as_nanos() as u64;
+                }
+                n_candidates += 1;
+            }
+        }
+        let total = t0.elapsed();
+        println!("  {n_candidates} candidates in {:.1}ms", total.as_secs_f64() * 1e3);
+        println!("  trusted_move: {:.1}ms ({:.1}µs/call)", t_move as f64 / 1e6, t_move as f64 / 1e3 / n_candidates as f64);
+        println!("  CC+ComponentMasks: {:.1}ms ({:.1}µs/call)", t_comp as f64 / 1e6, t_comp as f64 / 1e3 / n_candidates as f64);
+        println!("  get_best_move eval: {:.1}ms ({:.1}µs/call)", t_gbm as f64 / 1e6, t_gbm as f64 / 1e3 / n_candidates as f64);
+    }
+
     // ── Full tournament move ──
     println!("\n--- Full tournament move (50 rollouts) ---");
-    let mut rng = SimpleRng::new(99);
+    let mut g50 = game.clone();
     let t0 = Instant::now();
-    let _ = tournament_player(&mut game, 50, 20, 3.23);
+    let _ = tournament_player(&mut g50, 50, 20, 3.23);
     let t_tour = t0.elapsed();
     println!("  {:.1}ms/move ({:.1} mv/s)", t_tour.as_secs_f64() * 1e3, 1.0 / t_tour.as_secs_f64());
 
     println!("\n--- Full tournament move (200 rollouts) ---");
-    let mut rng = SimpleRng::new(99);
+    let mut g200 = game.clone();
     let t0 = Instant::now();
-    let _ = tournament_player(&mut game, 200, 20, 3.23);
+    let _ = tournament_player(&mut g200, 200, 20, 3.23);
     let t_tour200 = t0.elapsed();
     println!("  {:.1}ms/move ({:.1} mv/s)", t_tour200.as_secs_f64() * 1e3, 1.0 / t_tour200.as_secs_f64());
 

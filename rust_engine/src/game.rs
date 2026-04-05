@@ -25,8 +25,8 @@ pub struct ColorLinesGame {
     pub game_over: bool,
     pub rng: SimpleRng,
     // Cached CC labels — invalidated on any board mutation.
-    pub(crate) cc_labels: Board,
-    pub(crate) cc_valid: bool,
+    pub cc_labels: Board,
+    pub cc_valid: bool,
 }
 
 impl ColorLinesGame {
