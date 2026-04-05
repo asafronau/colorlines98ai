@@ -242,28 +242,47 @@ fn main() {
             let completed = AtomicUsize::new(0);
             let total_score = AtomicI64::new(0);
             let total_states = AtomicUsize::new(0);
+            let next_idx = AtomicUsize::new(0);
             let t0 = Instant::now();
 
-            seeds.into_par_iter().for_each(|seed| {
-                let game_start = Instant::now();
-                let record = play_datagen_game(seed, rollouts, 20, 3.23);
-                let game_time = game_start.elapsed().as_secs_f64();
-                let mps = record.turns as f64 / game_time;
+            // Worker pool: each thread picks seeds one at a time from a shared queue.
+            // Only `workers` games are in-flight at once. Safe to abort anytime.
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let seeds = &seeds;
+                    let next_idx = &next_idx;
+                    let completed = &completed;
+                    let total_score = &total_score;
+                    let total_states = &total_states;
+                    let t0 = &t0;
+                    scope.spawn(move || {
+                        loop {
+                            let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                            if idx >= total_games { break; }
+                            let seed = seeds[idx];
 
-                let fname = format!("{}/game_seed{}_score{}.json", out_dir, seed, record.score);
-                std::fs::write(&fname, serde_json::to_string(&record).unwrap()).unwrap();
+                            let game_start = Instant::now();
+                            let record = play_datagen_game(seed, rollouts, 20, 3.23);
+                            let game_time = game_start.elapsed().as_secs_f64();
+                            let mps = record.turns as f64 / game_time;
 
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                total_score.fetch_add(record.score as i64, Ordering::Relaxed);
-                total_states.fetch_add(record.num_moves, Ordering::Relaxed);
+                            let fname = format!("{}/game_seed{}_score{}.json", out_dir, seed, record.score);
+                            std::fs::write(&fname, serde_json::to_string(&record).unwrap()).unwrap();
 
-                let elapsed = t0.elapsed().as_secs_f64();
-                let mean = total_score.load(Ordering::Relaxed) as f64 / done as f64;
-                let gph = done as f64 / elapsed * 3600.0;
-                let eta_h = (total_games - done) as f64 / gph * 3600.0;
-                let states = total_states.load(Ordering::Relaxed);
-                eprintln!("  [{}/{}] seed={} score={} turns={} {:.0} mv/s | mean={:.0} states={} {:.1} games/h ETA {:.1}h",
-                    done + n_skip, n, seed, record.score, record.turns, mps, mean, states, gph, eta_h / 3600.0);
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            total_score.fetch_add(record.score as i64, Ordering::Relaxed);
+                            total_states.fetch_add(record.num_moves, Ordering::Relaxed);
+
+                            let elapsed = t0.elapsed().as_secs_f64();
+                            let mean = total_score.load(Ordering::Relaxed) as f64 / done as f64;
+                            let gph = done as f64 / elapsed * 3600.0;
+                            let eta_h = (total_games - done) as f64 / gph * 3600.0;
+                            let states = total_states.load(Ordering::Relaxed);
+                            eprintln!("  [{}/{}] seed={} score={} turns={} {:.0} mv/s | mean={:.0} states={} {:.1} games/h ETA {:.1}h",
+                                done + n_skip, n, seed, record.score, record.turns, mps, mean, states, gph, eta_h / 3600.0);
+                        }
+                    });
+                }
             });
 
             let elapsed = t0.elapsed();
