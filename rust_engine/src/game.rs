@@ -92,20 +92,30 @@ impl ColorLinesGame {
     // ── Ball spawning ─────────────────────────────────────────────
 
     fn generate_next_balls(&mut self) {
-        let empty = get_empty_cells(&self.board);
+        let mut empty = EmptyCells::from_board(&self.board);
         let n_empty = empty.len();
         if n_empty == 0 {
             self.num_next = 0;
             return;
         }
         let n = BALLS_PER_TURN.min(n_empty);
-        let indices = self.rng.choice_no_replace(n_empty, n);
-        let colors = self.rng.integers(1, NUM_COLORS as i64 + 1, n);
+        // Fisher-Yates partial shuffle — same RNG consumption order as choice_no_replace
+        let mut selected = [0usize; BALLS_PER_TURN];
+        for i in 0..n {
+            let j = i + (self.rng.next_u64() as usize % (n_empty - i));
+            empty.cells.swap(i, j);
+            selected[i] = i;
+        }
+        // Colors — same RNG consumption order as integers(1, 8, n)
+        let mut colors = [0i8; BALLS_PER_TURN];
+        for i in 0..n {
+            colors[i] = self.rng.randint(1, NUM_COLORS as i64 + 1) as i8;
+        }
         for i in 0..n {
             self.next_balls[i] = NextBall {
-                row: empty[indices[i]].0 as u8,
-                col: empty[indices[i]].1 as u8,
-                color: colors[i] as i8,
+                row: empty.cells[selected[i]].0,
+                col: empty.cells[selected[i]].1,
+                color: colors[i],
             };
         }
         self.num_next = n as u8;
@@ -119,10 +129,11 @@ impl ColorLinesGame {
             if self.board[row][col] == 0 {
                 self.board[row][col] = nb.color;
             } else {
-                let empty = get_empty_cells(&self.board);
+                let empty = EmptyCells::from_board(&self.board);
                 if !empty.is_empty() {
                     let idx = self.rng.randint(0, empty.len() as i64) as usize;
-                    self.board[empty[idx].0][empty[idx].1] = nb.color;
+                    let (er, ec) = empty.get(idx);
+                    self.board[er][ec] = nb.color;
                 }
             }
         }

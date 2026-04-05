@@ -9,7 +9,7 @@ use crate::board::*;
 const W: [f64; 5] = [14.6, 109.4, 5.7, 1.38, 2.4];
 const DIRS: [(i32, i32); 4] = [(0, 1), (1, 0), (1, 1), (1, -1)];
 
-#[inline]
+#[inline(always)]
 fn line_length(board: &Board, r: usize, c: usize, color: i8, dr: i32, dc: i32) -> i32 {
     let mut length = 1i32;
     let (mut cr, mut cc) = (r as i32 + dr, c as i32 + dc);
@@ -39,7 +39,7 @@ fn max_line_at(board: &Board, r: usize, c: usize, color: i8) -> i32 {
         .unwrap_or(1)
 }
 
-#[inline]
+#[inline(always)]
 fn empty_extends(board: &Board, r: usize, c: usize, color: i8, dr: i32, dc: i32) -> i32 {
     let mut extends = 0;
     // Forward: skip same-color, count empty
@@ -77,6 +77,7 @@ fn empty_extends(board: &Board, r: usize, c: usize, color: i8, dr: i32, dc: i32)
 
 /// Evaluate a move using CMA-ES heuristic weights.
 /// Temporarily modifies board and restores it (no allocation).
+#[inline(always)]
 pub fn evaluate_move(board: &mut Board, sr: usize, sc: usize, tr: usize, tc: usize, color: i8) -> f64 {
     board[sr][sc] = 0;
     board[tr][tc] = color;
