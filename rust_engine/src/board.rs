@@ -30,17 +30,43 @@ pub fn count_empty(board: &Board) -> usize {
     n
 }
 
-/// Return vec of (row, col) for all empty cells, in row-major order.
-pub fn get_empty_cells(board: &Board) -> Vec<(usize, usize)> {
-    let mut cells = Vec::new();
-    for r in 0..BOARD_SIZE {
-        for c in 0..BOARD_SIZE {
-            if board[r][c] == 0 {
-                cells.push((r, c));
+/// Stack-allocated empty cell list (no heap allocation).
+pub struct EmptyCells {
+    pub cells: [(u8, u8); 81],
+    pub count: usize,
+}
+
+impl EmptyCells {
+    #[inline]
+    pub fn from_board(board: &Board) -> Self {
+        let mut cells = [(0u8, 0u8); 81];
+        let mut count = 0;
+        for r in 0..BOARD_SIZE {
+            for c in 0..BOARD_SIZE {
+                if board[r][c] == 0 {
+                    cells[count] = (r as u8, c as u8);
+                    count += 1;
+                }
             }
         }
+        EmptyCells { cells, count }
     }
-    cells
+
+    #[inline]
+    pub fn len(&self) -> usize { self.count }
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.count == 0 }
+    #[inline]
+    pub fn get(&self, i: usize) -> (usize, usize) {
+        (self.cells[i].0 as usize, self.cells[i].1 as usize)
+    }
+}
+
+/// Return vec of (row, col) for all empty cells, in row-major order.
+/// Used by Python FFI and tests. Hot paths should use EmptyCells instead.
+pub fn get_empty_cells(board: &Board) -> Vec<(usize, usize)> {
+    let ec = EmptyCells::from_board(board);
+    (0..ec.count).map(|i| ec.get(i)).collect()
 }
 
 /// BFS-label connected components of empty cells.
@@ -252,6 +278,90 @@ pub fn get_target_mask(labels: &Board, sr: usize, sc: usize) -> Board {
     }
     mask
 }
+
+// ── u128 bitmask variants (81 bits, row-major) ─────────────────────
+
+/// Cell index (0..81) to (row, col).
+#[inline(always)]
+pub fn idx_to_rc(idx: u32) -> (usize, usize) {
+    (idx as usize / BOARD_SIZE, idx as usize % BOARD_SIZE)
+}
+
+/// (row, col) to cell index.
+#[inline(always)]
+pub fn rc_to_idx(r: usize, c: usize) -> u32 {
+    (r * BOARD_SIZE + c) as u32
+}
+
+/// Source mask as u128 bitmask: bit set where a ball has ≥1 adjacent empty cell.
+pub fn get_source_mask_bits(board: &Board) -> u128 {
+    let mut mask = 0u128;
+    for r in 0..BOARD_SIZE {
+        for c in 0..BOARD_SIZE {
+            if board[r][c] == 0 { continue; }
+            for &(dr, dc) in &[(0i32, 1i32), (0, -1), (1, 0), (-1, 0)] {
+                let nr = r as i32 + dr;
+                let nc = c as i32 + dc;
+                if nr >= 0 && nr < BOARD_SIZE as i32 && nc >= 0 && nc < BOARD_SIZE as i32
+                    && board[nr as usize][nc as usize] == 0
+                {
+                    mask |= 1u128 << rc_to_idx(r, c);
+                    break;
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// Target mask as u128 bitmask: bit set for empty cells reachable from source.
+pub fn get_target_mask_bits(labels: &Board, sr: usize, sc: usize) -> u128 {
+    let mut reachable_labels = [0i8; 4];
+    let mut n_labels = 0;
+    for &(dr, dc) in &[(0i32, 1i32), (0, -1), (1, 0), (-1, 0)] {
+        let nr = sr as i32 + dr;
+        let nc = sc as i32 + dc;
+        if nr >= 0 && nr < BOARD_SIZE as i32 && nc >= 0 && nc < BOARD_SIZE as i32 {
+            let lbl = labels[nr as usize][nc as usize];
+            if lbl > 0 {
+                let mut found = false;
+                for i in 0..n_labels {
+                    if reachable_labels[i] == lbl { found = true; break; }
+                }
+                if !found {
+                    reachable_labels[n_labels] = lbl;
+                    n_labels += 1;
+                }
+            }
+        }
+    }
+    if n_labels == 0 { return 0; }
+    let mut mask = 0u128;
+    for r in 0..BOARD_SIZE {
+        for c in 0..BOARD_SIZE {
+            if labels[r][c] > 0 {
+                for i in 0..n_labels {
+                    if labels[r][c] == reachable_labels[i] {
+                        mask |= 1u128 << rc_to_idx(r, c);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// Iterate set bits in a u128 bitmask. Usage:
+/// ```
+/// let mut bits = mask;
+/// while bits != 0 {
+///     let idx = bits.trailing_zeros();
+///     bits &= bits - 1;
+///     let (r, c) = idx_to_rc(idx);
+///     // ...
+/// }
+/// ```
 
 /// Return (9,9) mask: 1 where a ball has ≥1 adjacent empty cell.
 pub fn get_source_mask(board: &Board) -> Board {

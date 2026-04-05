@@ -23,23 +23,26 @@ struct Candidate {
 /// Get best move using plain heuristic (game.rng NOT consumed).
 fn get_best_move_pure(game: &mut ColorLinesGame) -> Option<(usize, usize, usize, usize)> {
     game.ensure_cc();
-    let source_mask = get_source_mask(&game.board);
+    let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
     let mut best_score = f64::NEG_INFINITY;
     let mut best = None;
     let mut board = game.board;
-    for sr in 0..BOARD_SIZE {
-        for sc in 0..BOARD_SIZE {
-            if source_mask[sr][sc] == 0 { continue; }
-            let color = board[sr][sc];
-            let tm = get_target_mask(&labels, sr, sc);
-            for tr in 0..BOARD_SIZE {
-                for tc in 0..BOARD_SIZE {
-                    if tm[tr][tc] == 0 { continue; }
-                    let s = evaluate_move(&mut board, sr, sc, tr, tc, color);
-                    if s > best_score { best_score = s; best = Some((sr, sc, tr, tc)); }
-                }
-            }
+
+    let mut src = src_bits;
+    while src != 0 {
+        let si = src.trailing_zeros();
+        src &= src - 1;
+        let (sr, sc) = idx_to_rc(si);
+        let color = board[sr][sc];
+        let tgt = get_target_mask_bits(&labels, sr, sc);
+        let mut t = tgt;
+        while t != 0 {
+            let ti = t.trailing_zeros();
+            t &= t - 1;
+            let (tr, tc) = idx_to_rc(ti);
+            let s = evaluate_move(&mut board, sr, sc, tr, tc, color);
+            if s > best_score { best_score = s; best = Some((sr, sc, tr, tc)); }
         }
     }
     best
@@ -49,25 +52,28 @@ fn get_best_move_pure(game: &mut ColorLinesGame) -> Option<(usize, usize, usize,
 fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64)
     -> Option<(usize, usize, usize, usize)>
 {
-    let source_mask = get_source_mask(&game.board);
     game.ensure_cc();
+    let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
     let mut moves = Vec::with_capacity(256);
     let mut scores = Vec::with_capacity(256);
     let mut board = game.board;
-    for sr in 0..BOARD_SIZE {
-        for sc in 0..BOARD_SIZE {
-            if source_mask[sr][sc] == 0 { continue; }
-            let color = board[sr][sc];
-            let tm = get_target_mask(&labels, sr, sc);
-            for tr in 0..BOARD_SIZE {
-                for tc in 0..BOARD_SIZE {
-                    if tm[tr][tc] == 0 { continue; }
-                    let s = evaluate_move(&mut board, sr, sc, tr, tc, color);
-                    moves.push((sr, sc, tr, tc));
-                    scores.push(s);
-                }
-            }
+
+    let mut src = src_bits;
+    while src != 0 {
+        let si = src.trailing_zeros();
+        src &= src - 1;
+        let (sr, sc) = idx_to_rc(si);
+        let color = board[sr][sc];
+        let tgt = get_target_mask_bits(&labels, sr, sc);
+        let mut t = tgt;
+        while t != 0 {
+            let ti = t.trailing_zeros();
+            t &= t - 1;
+            let (tr, tc) = idx_to_rc(ti);
+            let s = evaluate_move(&mut board, sr, sc, tr, tc, color);
+            moves.push((sr, sc, tr, tc));
+            scores.push(s);
         }
     }
     if moves.is_empty() { return None; }
@@ -139,58 +145,59 @@ pub fn tournament_player(
     temperature: f64,
 ) -> Option<TournamentResult> {
     game.ensure_cc();
-    let source_mask = get_source_mask(&game.board);
+    let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
 
-    // Phase 1: 2-ply for ALL legal moves
+    // Phase 1: 2-ply for ALL legal moves (bitmask iteration skips empty cells)
     let mut candidates: Vec<Candidate> = Vec::with_capacity(256);
     let mut ply = game.clone();
 
-    for sr in 0..BOARD_SIZE {
-        for sc in 0..BOARD_SIZE {
-            if source_mask[sr][sc] == 0 { continue; }
-            let color = game.board[sr][sc];
-            let tm = get_target_mask(&labels, sr, sc);
-            for tr in 0..BOARD_SIZE {
-                for tc in 0..BOARD_SIZE {
-                    if tm[tr][tc] == 0 { continue; }
-                    let immediate = evaluate_move(&mut game.board, sr, sc, tr, tc, color);
+    let mut src = src_bits;
+    while src != 0 {
+        let si = src.trailing_zeros();
+        src &= src - 1;
+        let (sr, sc) = idx_to_rc(si);
+        let color = game.board[sr][sc];
+        let tgt_bits = get_target_mask_bits(&labels, sr, sc);
+        let mut tgt = tgt_bits;
+        while tgt != 0 {
+            let ti = tgt.trailing_zeros();
+            tgt &= tgt - 1;
+            let (tr, tc) = idx_to_rc(ti);
+            let immediate = evaluate_move(&mut game.board, sr, sc, tr, tc, color);
 
-                    // 2-ply clone uses game's RNG (advances it — matches old engine)
-                    ply.board = game.board;
-                    ply.next_balls = game.next_balls;
-                    ply.num_next = game.num_next;
-                    ply.score = game.score;
-                    ply.turns = game.turns;
-                    ply.game_over = game.game_over;
-                    ply.rng = SimpleRng::new(game.rng.next_u64());
-                    // CC labels from game are valid for ply (same board)
-                    ply.cc_labels = game.cc_labels;
-                    ply.cc_valid = true;
+            // 2-ply clone uses game's RNG (advances it — matches old engine)
+            ply.board = game.board;
+            ply.next_balls = game.next_balls;
+            ply.num_next = game.num_next;
+            ply.score = game.score;
+            ply.turns = game.turns;
+            ply.game_over = game.game_over;
+            ply.rng = SimpleRng::new(game.rng.next_u64());
+            ply.cc_labels = game.cc_labels;
+            ply.cc_valid = true;
 
-                    let (valid, pts, _, game_over) = ply.move_ball(sr, sc, tr, tc);
-                    if !valid { continue; }
+            let (valid, pts, _, game_over) = ply.move_ball(sr, sc, tr, tc);
+            if !valid { continue; }
 
-                    let clear_bonus = pts as f64 * 20.0;
-                    let future = if !game_over {
-                        let mut f = 0.0f64;
-                        if let Some((bsr, bsc, btr, btc)) = get_best_move_pure(&mut ply) {
-                            let c = ply.board[bsr][bsc];
-                            let mut b2 = ply.board;
-                            f = evaluate_move(&mut b2, bsr, bsc, btr, btc, c);
-                        }
-                        f += count_empty(&ply.board) as f64 * 0.25;
-                        f
-                    } else {
-                        -500.0
-                    };
-
-                    candidates.push(Candidate {
-                        mv: (sr, sc, tr, tc),
-                        score_2ply: immediate + clear_bonus + future * 0.5,
-                    });
+            let clear_bonus = pts as f64 * 20.0;
+            let future = if !game_over {
+                let mut f = 0.0f64;
+                if let Some((bsr, bsc, btr, btc)) = get_best_move_pure(&mut ply) {
+                    let c = ply.board[bsr][bsc];
+                    let mut b2 = ply.board;
+                    f = evaluate_move(&mut b2, bsr, bsc, btr, btc, c);
                 }
-            }
+                f += count_empty(&ply.board) as f64 * 0.25;
+                f
+            } else {
+                -500.0
+            };
+
+            candidates.push(Candidate {
+                mv: (sr, sc, tr, tc),
+                score_2ply: immediate + clear_bonus + future * 0.5,
+            });
         }
     }
 
