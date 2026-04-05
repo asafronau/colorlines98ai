@@ -49,16 +49,32 @@ fn get_best_move_pure(game: &mut ColorLinesGame) -> Option<(usize, usize, usize,
     best
 }
 
+/// Pre-allocated buffers for rollout move evaluation (avoids 43K+ Vec allocations per tournament move).
+struct RolloutBuf {
+    moves: Vec<(usize, usize, usize, usize)>,
+    scores: Vec<f64>,
+}
+
+impl RolloutBuf {
+    fn new() -> Self {
+        RolloutBuf {
+            moves: Vec::with_capacity(1200),
+            scores: Vec::with_capacity(1200),
+        }
+    }
+}
+
 /// Softmax move using game's RNG (matches old engine coupling behavior).
-fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64)
+/// Uses pre-allocated buffers to avoid allocation.
+fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64, buf: &mut RolloutBuf)
     -> Option<(usize, usize, usize, usize)>
 {
+    buf.moves.clear();
+    buf.scores.clear();
     game.ensure_cc();
     let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
     let comp = ComponentMasks::from_labels(&labels);
-    let mut moves = Vec::with_capacity(256);
-    let mut scores = Vec::with_capacity(256);
     let mut board = game.board;
 
     let mut src = src_bits;
@@ -74,23 +90,22 @@ fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64)
             t &= t - 1;
             let (tr, tc) = idx_to_rc(ti);
             let s = evaluate_move(&mut board, sr, sc, tr, tc, color);
-            moves.push((sr, sc, tr, tc));
-            scores.push(s);
+            buf.moves.push((sr, sc, tr, tc));
+            buf.scores.push(s);
         }
     }
-    if moves.is_empty() { return None; }
-    let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mut probs: Vec<f64> = scores.iter().map(|s| ((s - max_s) / temperature).exp()).collect();
-    let sum: f64 = probs.iter().sum();
-    for p in probs.iter_mut() { *p /= sum; }
-    // Uses game's RNG — coupling rollout randomness with spawn randomness
-    let r = game.rng.next_f64();
+    if buf.moves.is_empty() { return None; }
+    let max_s = buf.scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // Softmax sampling with single-pass (no probs Vec allocation)
+    let mut sum = 0.0f64;
+    for s in &buf.scores { sum += ((s - max_s) / temperature).exp(); }
+    let r = game.rng.next_f64() * sum;
     let mut cumul = 0.0;
-    for (i, &p) in probs.iter().enumerate() {
-        cumul += p;
-        if r <= cumul { return Some(moves[i]); }
+    for (i, s) in buf.scores.iter().enumerate() {
+        cumul += ((s - max_s) / temperature).exp();
+        if r <= cumul { return Some(buf.moves[i]); }
     }
-    Some(*moves.last().unwrap())
+    Some(*buf.moves.last().unwrap())
 }
 
 fn rollout(
@@ -99,6 +114,7 @@ fn rollout(
     depth: usize,
     temperature: f64,
     seed: u64,
+    rbuf: &mut RolloutBuf,
 ) -> f64 {
     let mut clone = game.clone_with_rng(SimpleRng::new(seed));
     let initial_score = clone.score;
@@ -110,7 +126,7 @@ fn rollout(
     for _ in 0..depth {
         if clone.game_over { break; }
         let m = if temperature > 0.0 {
-            get_softmax_move_coupled(&mut clone, temperature)
+            get_softmax_move_coupled(&mut clone, temperature, rbuf)
         } else {
             get_best_move_pure(&mut clone)
         };
@@ -129,9 +145,10 @@ fn run_rollouts(
     depth: usize,
     temperature: f64,
     rng: &mut SimpleRng,
+    rbuf: &mut RolloutBuf,
 ) -> Vec<Vec<f64>> {
     candidates.iter().map(|c| {
-        (0..n_rollouts).map(|_| rollout(game, c.mv, depth, temperature, rng.next_u64())).collect()
+        (0..n_rollouts).map(|_| rollout(game, c.mv, depth, temperature, rng.next_u64(), rbuf)).collect()
     }).collect()
 }
 
@@ -154,6 +171,7 @@ pub fn tournament_player(
     // Phase 1: 2-ply for ALL legal moves (bitmask iteration skips empty cells)
     let mut candidates: Vec<Candidate> = Vec::with_capacity(256);
     let mut ply = game.clone();
+    let mut rbuf = RolloutBuf::new();
 
     let mut src = src_bits;
     while src != 0 {
@@ -220,7 +238,7 @@ pub fn tournament_player(
     let rollout_rng = game.rng.clone();
 
     // Quarter-finals: 10 short rollouts → top 10
-    let qf = run_rollouts(game, &qualifiers, 10, rollout_depth / 2, temperature, &mut rollout_rng.clone());
+    let qf = run_rollouts(game, &qualifiers, 10, rollout_depth / 2, temperature, &mut rollout_rng.clone(), &mut rbuf);
     let mut qfr: Vec<(usize, f64)> = (0..qualifiers.len())
         .map(|i| (i, mean(&qf[i]) + qualifiers[i].score_2ply * 0.1))
         .collect();
@@ -231,7 +249,7 @@ pub fn tournament_player(
     // Semi-finals: 40 full rollouts → top 3
     let semis: Vec<Candidate> = si.iter().map(|&i| Candidate { mv: qualifiers[i].mv, score_2ply: qualifiers[i].score_2ply }).collect();
     let sr_scores: Vec<Vec<f64>> = si.iter().map(|&i| qf[i].clone()).collect();
-    let sf = run_rollouts(game, &semis, 40, rollout_depth, temperature, &mut rollout_rng.clone());
+    let sf = run_rollouts(game, &semis, 40, rollout_depth, temperature, &mut rollout_rng.clone(), &mut rbuf);
     let combined: Vec<Vec<f64>> = (0..semis.len()).map(|i| {
         let mut v = sr_scores[i].clone();
         v.extend_from_slice(&sf[i]);
@@ -250,7 +268,7 @@ pub fn tournament_player(
     // Finals
     let used = 10 + 40;
     let remaining = if num_rollouts > used { num_rollouts - used } else { 10 };
-    let fsc = run_rollouts(game, &finals, remaining, rollout_depth, temperature, &mut rollout_rng.clone());
+    let fsc = run_rollouts(game, &finals, remaining, rollout_depth, temperature, &mut rollout_rng.clone(), &mut rbuf);
     let af: Vec<Vec<f64>> = (0..finals.len()).map(|i| {
         let mut v = fr[i].clone();
         v.extend_from_slice(&fsc[i]);
