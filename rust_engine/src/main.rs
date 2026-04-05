@@ -24,10 +24,9 @@ fn play_heuristic_game(seed: u64) -> (i32, i32) {
 fn play_tournament_game(seed: u64, num_rollouts: usize, depth: usize, temp: f64) -> (i32, i32) {
     let mut game = ColorLinesGame::new(seed);
     game.reset();
-    let mut rng = SimpleRng::new(seed.wrapping_add(1000));
     let game_start = Instant::now();
     while !game.game_over {
-        match tournament_player(&game, num_rollouts, depth, temp, &mut rng) {
+        match tournament_player(&mut game, num_rollouts, depth, temp) {
             Some(result) => {
                 game.move_ball(
                     result.chosen.0, result.chosen.1,
