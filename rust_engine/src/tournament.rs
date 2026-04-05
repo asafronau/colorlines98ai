@@ -30,18 +30,24 @@ fn rollout(
     buf: &mut MoveBuffer,
 ) -> f64 {
     let mut clone = game.clone_with_rng(SimpleRng::new(seed));
+    let initial_score = clone.score;
     let (valid, _, _, _) = clone.move_ball(mv.0, mv.1, mv.2, mv.3);
     if !valid {
         return -1000.0;
     }
-    let base_score = clone.score;
+    let move_pts = clone.score - initial_score;
 
     let mut rng = SimpleRng::new(seed.wrapping_add(1));
     for _ in 0..depth {
         if clone.game_over {
             break;
         }
-        let m = crate::heuristic::get_rollout_move(&clone, temperature, &mut rng, buf);
+        buf.fill(&clone);
+        let m = if temperature > 0.0 {
+            buf.softmax_move(temperature, &mut rng)
+        } else {
+            buf.best_move()
+        };
         match m {
             Some((sr, sc, tr, tc)) => {
                 clone.move_ball(sr, sc, tr, tc);
@@ -49,7 +55,9 @@ fn rollout(
             None => break,
         }
     }
-    (clone.score - base_score) as f64
+    // Rollout return = rollout_gain + initial_move_score (matches old engine)
+    let rollout_gain = (clone.score - initial_score - move_pts) as f64;
+    rollout_gain + move_pts as f64
 }
 
 fn run_rollouts(
