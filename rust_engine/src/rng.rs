@@ -103,6 +103,54 @@ impl SimpleRng {
     }
 }
 
+/// Xorshift64 RNG — matches old Rust engine exactly.
+/// For verification only. Production uses SplitMix64.
+#[derive(Clone)]
+pub struct Xorshift64(pub u64);
+
+impl Xorshift64 {
+    pub fn new(seed: u64) -> Self {
+        Xorshift64(if seed == 0 { 1 } else { seed })
+    }
+
+    #[inline(always)]
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    #[inline(always)]
+    pub fn next_usize(&mut self, n: usize) -> usize {
+        (self.next_u64() >> 1) as usize % n
+    }
+
+    #[inline(always)]
+    pub fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    pub fn choice_no_replace(&mut self, n: usize, k: usize) -> Vec<usize> {
+        let mut arr: Vec<usize> = (0..n).collect();
+        let mut result = Vec::with_capacity(k);
+        for i in 0..k {
+            let j = i + self.next_usize(n - i);
+            arr.swap(i, j);
+            result.push(arr[i]);
+        }
+        result
+    }
+
+    pub fn randint(&mut self, low: i64, high: i64) -> i64 {
+        low + self.next_usize((high - low) as usize) as i64
+    }
+
+    pub fn integers(&mut self, low: i64, high: i64, size: usize) -> Vec<i64> {
+        (0..size).map(|_| self.randint(low, high)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
