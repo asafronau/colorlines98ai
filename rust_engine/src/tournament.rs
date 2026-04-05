@@ -21,9 +21,10 @@ struct Candidate {
 }
 
 /// Get best move using plain heuristic (game.rng NOT consumed).
-fn get_best_move_pure(game: &ColorLinesGame) -> Option<(usize, usize, usize, usize)> {
+fn get_best_move_pure(game: &mut ColorLinesGame) -> Option<(usize, usize, usize, usize)> {
+    game.ensure_cc();
     let source_mask = get_source_mask(&game.board);
-    let labels = label_empty_components(&game.board);
+    let labels = game.cc_labels;
     let mut best_score = f64::NEG_INFINITY;
     let mut best = None;
     let mut board = game.board;
@@ -49,7 +50,8 @@ fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64)
     -> Option<(usize, usize, usize, usize)>
 {
     let source_mask = get_source_mask(&game.board);
-    let labels = label_empty_components(&game.board);
+    game.ensure_cc();
+    let labels = game.cc_labels;
     let mut moves = Vec::with_capacity(256);
     let mut scores = Vec::with_capacity(256);
     let mut board = game.board;
@@ -102,7 +104,7 @@ fn rollout(
         let m = if temperature > 0.0 {
             get_softmax_move_coupled(&mut clone, temperature)
         } else {
-            get_best_move_pure(&clone)
+            get_best_move_pure(&mut clone)
         };
         match m {
             Some((sr, sc, tr, tc)) => { clone.move_ball(sr, sc, tr, tc); }
@@ -136,8 +138,9 @@ pub fn tournament_player(
     rollout_depth: usize,
     temperature: f64,
 ) -> Option<TournamentResult> {
+    game.ensure_cc();
     let source_mask = get_source_mask(&game.board);
-    let labels = label_empty_components(&game.board);
+    let labels = game.cc_labels;
 
     // Phase 1: 2-ply for ALL legal moves
     let mut candidates: Vec<Candidate> = Vec::with_capacity(256);
@@ -161,6 +164,9 @@ pub fn tournament_player(
                     ply.turns = game.turns;
                     ply.game_over = game.game_over;
                     ply.rng = SimpleRng::new(game.rng.next_u64());
+                    // CC labels from game are valid for ply (same board)
+                    ply.cc_labels = game.cc_labels;
+                    ply.cc_valid = true;
 
                     let (valid, pts, _, game_over) = ply.move_ball(sr, sc, tr, tc);
                     if !valid { continue; }
@@ -168,7 +174,7 @@ pub fn tournament_player(
                     let clear_bonus = pts as f64 * 20.0;
                     let future = if !game_over {
                         let mut f = 0.0f64;
-                        if let Some((bsr, bsc, btr, btc)) = get_best_move_pure(&ply) {
+                        if let Some((bsr, bsc, btr, btc)) = get_best_move_pure(&mut ply) {
                             let c = ply.board[bsr][bsc];
                             let mut b2 = ply.board;
                             f = evaluate_move(&mut b2, bsr, bsc, btr, btc, c);
