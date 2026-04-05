@@ -24,9 +24,10 @@ pub struct ColorLinesGame {
     pub turns: i32,
     pub game_over: bool,
     pub rng: SimpleRng,
-    // Cached CC labels — invalidated on any board mutation.
+    // Cached CC labels + component masks — invalidated on any board mutation.
     pub cc_labels: Board,
     pub cc_valid: bool,
+    pub comp_masks: crate::board::ComponentMasks,
 }
 
 impl ColorLinesGame {
@@ -41,6 +42,7 @@ impl ColorLinesGame {
             rng: SimpleRng::new(seed),
             cc_labels: [[0i8; BOARD_SIZE]; BOARD_SIZE],
             cc_valid: false,
+            comp_masks: crate::board::ComponentMasks::empty(),
         }
     }
 
@@ -68,6 +70,7 @@ impl ColorLinesGame {
     pub fn ensure_cc(&mut self) {
         if !self.cc_valid {
             self.cc_labels = label_empty_components(&self.board);
+            self.comp_masks = crate::board::ComponentMasks::from_labels(&self.cc_labels);
             self.cc_valid = true;
         }
     }

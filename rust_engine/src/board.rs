@@ -317,12 +317,17 @@ pub fn get_source_mask_bits(board: &Board) -> u128 {
 /// Pre-computed bitmasks per connected component.
 /// component_masks[label] = u128 with all cells of that component set.
 /// Max 40 components on a 9x9 board (theoretical max with checkerboard).
+#[derive(Clone, Copy)]
 pub struct ComponentMasks {
     masks: [u128; 42],  // index by label (1-based, 0 unused)
     pub count: usize,
 }
 
 impl ComponentMasks {
+    pub fn empty() -> Self {
+        ComponentMasks { masks: [0u128; 42], count: 0 }
+    }
+
     pub fn from_labels(labels: &Board) -> Self {
         let mut masks = [0u128; 42];
         let mut max_label = 0usize;
