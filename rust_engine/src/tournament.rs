@@ -25,6 +25,7 @@ fn get_best_move_pure(game: &mut ColorLinesGame) -> Option<(usize, usize, usize,
     game.ensure_cc();
     let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
+    let comp = ComponentMasks::from_labels(&labels);
     let mut best_score = f64::NEG_INFINITY;
     let mut best = None;
     let mut board = game.board;
@@ -35,7 +36,7 @@ fn get_best_move_pure(game: &mut ColorLinesGame) -> Option<(usize, usize, usize,
         src &= src - 1;
         let (sr, sc) = idx_to_rc(si);
         let color = board[sr][sc];
-        let tgt = get_target_mask_bits(&labels, sr, sc);
+        let tgt = comp.target_mask(&labels, sr, sc);
         let mut t = tgt;
         while t != 0 {
             let ti = t.trailing_zeros();
@@ -55,6 +56,7 @@ fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64)
     game.ensure_cc();
     let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
+    let comp = ComponentMasks::from_labels(&labels);
     let mut moves = Vec::with_capacity(256);
     let mut scores = Vec::with_capacity(256);
     let mut board = game.board;
@@ -65,7 +67,7 @@ fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64)
         src &= src - 1;
         let (sr, sc) = idx_to_rc(si);
         let color = board[sr][sc];
-        let tgt = get_target_mask_bits(&labels, sr, sc);
+        let tgt = comp.target_mask(&labels, sr, sc);
         let mut t = tgt;
         while t != 0 {
             let ti = t.trailing_zeros();
@@ -147,6 +149,7 @@ pub fn tournament_player(
     game.ensure_cc();
     let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
+    let comp_masks = ComponentMasks::from_labels(&labels);
 
     // Phase 1: 2-ply for ALL legal moves (bitmask iteration skips empty cells)
     let mut candidates: Vec<Candidate> = Vec::with_capacity(256);
@@ -158,7 +161,7 @@ pub fn tournament_player(
         src &= src - 1;
         let (sr, sc) = idx_to_rc(si);
         let color = game.board[sr][sc];
-        let tgt_bits = get_target_mask_bits(&labels, sr, sc);
+        let tgt_bits = comp_masks.target_mask(&labels, sr, sc);
         let mut tgt = tgt_bits;
         while tgt != 0 {
             let ti = tgt.trailing_zeros();
@@ -177,8 +180,10 @@ pub fn tournament_player(
             ply.cc_labels = game.cc_labels;
             ply.cc_valid = true;
 
-            let (valid, pts, _, game_over) = ply.move_ball(sr, sc, tr, tc);
-            if !valid { continue; }
+            // Use trusted_move — we know it's legal (from source/target masks)
+            ply.trusted_move(sr, sc, tr, tc);
+            let pts = ply.score - game.score;
+            let game_over = ply.game_over;
 
             let clear_bonus = pts as f64 * 20.0;
             let future = if !game_over {
