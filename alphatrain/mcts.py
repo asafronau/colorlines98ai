@@ -310,7 +310,7 @@ class MCTS:
         self.batch_size = batch_size
         self.inference_client = inference_client
         self._fp16 = False
-        self._sim_rng = np.random.default_rng()
+        self._sim_rng = None  # SimpleRng, set per search
         # Pre-allocate obs buffer for server mode (reused across searches)
         if inference_client is not None:
             self._obs_np_buf = np.empty(
@@ -395,7 +395,8 @@ class MCTS:
         board_bytes = game.board.tobytes()
         state_seed = int.from_bytes(board_bytes[:8], 'little')
         state_seed = (state_seed ^ (game.score * 31) ^ (game.turns * 7)) & 0xFFFFFFFF
-        self._sim_rng = np.random.default_rng(state_seed)
+        from game.rng import SimpleRng
+        self._sim_rng = SimpleRng(state_seed)
 
         # Expand root
         priors, root_value = self._nn_evaluate_single(game)
@@ -557,7 +558,15 @@ class MCTS:
             # Temperature-weighted sampling
             adjusted = visits ** (1.0 / temperature)
             probs = adjusted / adjusted.sum()
-            chosen_idx = np.random.choice(len(actions), p=probs)
+            # Weighted sampling using our deterministic RNG
+            u = self._sim_rng.next_f64()
+            cumsum = 0.0
+            chosen_idx = len(actions) - 1  # fallback to last
+            for ci in range(len(actions)):
+                cumsum += probs[ci]
+                if u < cumsum:
+                    chosen_idx = ci
+                    break
             flat_action = actions[chosen_idx]
         else:
             # Greedy argmax
