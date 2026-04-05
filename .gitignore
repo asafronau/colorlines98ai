@@ -31,3 +31,7 @@ Thumbs.db
 # Numba cache
 __numba_cache__/
 rust_engine/target/
+checkpoints/
+.claude/agent-memory/
+.claude/agents/
+*.pt.gz
