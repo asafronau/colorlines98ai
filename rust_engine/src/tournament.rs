@@ -25,7 +25,6 @@ fn get_best_move_pure(game: &mut ColorLinesGame) -> Option<(usize, usize, usize,
     game.ensure_cc();
     let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
-    let comp = ComponentMasks::from_labels(&labels);
     let mut best_score = f64::NEG_INFINITY;
     let mut best = None;
     let mut board = game.board;
@@ -36,7 +35,7 @@ fn get_best_move_pure(game: &mut ColorLinesGame) -> Option<(usize, usize, usize,
         src &= src - 1;
         let (sr, sc) = idx_to_rc(si);
         let color = board[sr][sc];
-        let tgt = comp.target_mask(&labels, sr, sc);
+        let tgt = game.comp_masks.target_mask(&labels, sr, sc);
         let mut t = tgt;
         while t != 0 {
             let ti = t.trailing_zeros();
@@ -74,7 +73,6 @@ fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64, buf: &m
     game.ensure_cc();
     let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
-    let comp = ComponentMasks::from_labels(&labels);
     let mut board = game.board;
 
     let mut src = src_bits;
@@ -83,7 +81,7 @@ fn get_softmax_move_coupled(game: &mut ColorLinesGame, temperature: f64, buf: &m
         src &= src - 1;
         let (sr, sc) = idx_to_rc(si);
         let color = board[sr][sc];
-        let tgt = comp.target_mask(&labels, sr, sc);
+        let tgt = game.comp_masks.target_mask(&labels, sr, sc);
         let mut t = tgt;
         while t != 0 {
             let ti = t.trailing_zeros();
@@ -166,7 +164,7 @@ pub fn tournament_player(
     game.ensure_cc();
     let src_bits = get_source_mask_bits(&game.board);
     let labels = game.cc_labels;
-    let comp_masks = ComponentMasks::from_labels(&labels);
+    let comp_masks = &game.comp_masks;
 
     // Phase 1: 2-ply for ALL legal moves (bitmask iteration skips empty cells)
     let mut candidates: Vec<Candidate> = Vec::with_capacity(256);
