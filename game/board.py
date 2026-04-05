@@ -11,6 +11,7 @@ import numpy as np
 from numba import njit
 from typing import Optional
 from .config import BOARD_SIZE, NUM_COLORS, BALLS_PER_TURN, MIN_LINE_LENGTH
+from .rng import SimpleRng
 
 # Directions for line checking: horizontal, vertical, two diagonals
 LINE_DIRECTIONS = [(0, 1), (1, 0), (1, 1), (1, -1)]
@@ -307,7 +308,7 @@ class ColorLinesGame:
     """Color Lines 98 game state and logic."""
 
     def __init__(self, seed: Optional[int] = None, num_colors: int = NUM_COLORS):
-        self.rng = np.random.default_rng(seed)
+        self.rng = SimpleRng(seed if seed is not None else 0)
         self.num_colors = num_colors
         self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
         self.next_balls: list[tuple[tuple[int, int], int]] = []
@@ -336,7 +337,7 @@ class ColorLinesGame:
 
     def clone(self, rng=None) -> 'ColorLinesGame':
         g = ColorLinesGame.__new__(ColorLinesGame)
-        g.rng = rng if rng is not None else np.random.default_rng()
+        g.rng = rng if rng is not None else SimpleRng(0)
         g.num_colors = self.num_colors
         g.board = self.board.copy()
         g.next_balls = list(self.next_balls)
@@ -366,8 +367,8 @@ class ColorLinesGame:
             self.next_balls = []
             return
         n = min(BALLS_PER_TURN, n_empty)
-        indices = self.rng.choice(n_empty, size=n, replace=False)
-        colors = self.rng.integers(1, self.num_colors + 1, size=n)
+        indices = self.rng.choice_no_replace(n_empty, n)
+        colors = self.rng.integers(1, self.num_colors + 1, n)
         self.next_balls = [
             ((int(empty[indices[i], 0]), int(empty[indices[i], 1])), int(colors[i]))
             for i in range(n)
@@ -382,7 +383,7 @@ class ColorLinesGame:
             else:
                 empty = _get_empty_array(self.board)
                 if len(empty) > 0:
-                    idx = self.rng.integers(0, len(empty))
+                    idx = self.rng.randint(0, len(empty))
                     self.board[empty[idx, 0], empty[idx, 1]] = color
                     spawned += 1
         self._cc_labels = None

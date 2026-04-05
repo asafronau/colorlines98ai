@@ -151,7 +151,7 @@ class TestTDValues:
     def _make_synthetic_game(self, tmp_path):
         """Create a real game via engine and save as JSON with chosen_moves."""
         from game.board import ColorLinesGame
-        game = ColorLinesGame(seed=999)
+        game = ColorLinesGame(seed=669)  # scores at multiple turns with first-legal-move
         game.reset()
         moves_data = []
         for _ in range(80):  # play enough turns to score some points
@@ -179,7 +179,7 @@ class TestTDValues:
             game.move(move[0], move[1])
         final_score = game.score
         game_data = {
-            'seed': 999, 'score': final_score,
+            'seed': 669, 'score': final_score,
             'turns': len(moves_data), 'num_moves': len(moves_data),
             'moves': moves_data,
         }
@@ -188,7 +188,7 @@ class TestTDValues:
             m['game_score'] = final_score
         game_dir = tmp_path / "games"
         game_dir.mkdir(exist_ok=True)
-        path = game_dir / f"game_seed999_score{final_score}.json"
+        path = game_dir / f"game_seed669_score{final_score}.json"
         with open(path, 'w') as f:
             json.dump(game_data, f)
         return game_data, str(game_dir)
