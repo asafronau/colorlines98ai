@@ -495,12 +495,68 @@ Tested decoupled architecture: separate PolicyNet (10b×256ch) + ValueNet (6b×1
 - Decoupled architecture can't learn vision from 277K states alone
 - Key lesson: jointly-learned features are essential for value prediction
 
-### Next: Iteration 2 Self-Play
-Generate 1000 games with improved Pillar 2f model (MCTS 992 mean):
-- Seeds 500-1499, 400 sims, 16 workers MPS
-- Then build mixed training data and run Pillar 2g training
+### Pillar 2g: Hybrid Interleaved Training (FAILED)
+Two dataloaders interleaved per step: expert (ranking) + self-play (MSE value).
+- Self-play: 1000 games (seeds 500-1500), 400 sims, mean score 688
+- Policy sharpened T=0.3, selfplay data contributes both policy CE + value MSE
+- Config: val_weight=0.001, lr=5e-5, 15 epochs, bs=2048, warm start from 2f
+- **Result: Policy 410 (+8%), MCTS 539 (-39%)**
+- Root cause: "Distribution shift" — self-play data (mean 688) taught value head
+  what weak play looks like, overwriting expert calibration. Val overfitting:
+  train s_val=584, val s_val=3440. 4x cycling of selfplay amplified overfitting.
 
-### Lessons Learned (Phase 4)
+### Pillar 2h: Elite Filter + Expert-Only Policy (FAILED)
+Three fixes from Gemini post-mortem:
+1. Elite filter: only selfplay games scoring ≥1000 (220 games, 163K states, mean 1547)
+2. Policy from expert only: selfplay contributes value MSE only, no policy CE
+3. No cycling: selfplay drives epoch, expert restarts when exhausted
+- **Result: epoch 1 closest to 2f (MCTS 825), more training = worse (ep8: 536, ep10: 482)**
+- Root cause: even elite selfplay data hurts value head. "Dumber teacher" problem confirmed.
+- The self-play loop doesn't work until MCTS matches the heuristic player (~5700).
+
+### Technical Challenges During Training
+- **OOM on H100-80GB**: Both datasets GPU-resident + torch.compile = 78GB used.
+  Root cause: collate functions lacked @torch.no_grad(), causing autograd to track
+  ~150 intermediate tensors per batch. Also: itertools.cycle() caches all yielded
+  GPU tensors in memory (leaked 80+ GB). Fixes: @torch.no_grad() on all collate
+  methods, manual iterator restart instead of cycle, selfplay data CPU-resident.
+- **@torch.no_grad() on collate**: Critical fix identified by Gemini peer review.
+  Without it, the GPU observation building (BFS shifts, line scans) accumulated
+  autograd graph entries that were never freed.
+
+### Strategic Reset: Expert Data Generation
+
+Self-play training failed because the NN MCTS (mean 891) is too weak to teach
+itself — "dumber teacher" problem. Pivoted to generating more expert data from
+the heuristic tournament player.
+
+**Rust Engine Built (TDD, 44 tests):**
+- Complete game engine rewrite in Rust: 131x faster than Python (1.5 vs 196 µs/turn)
+- Custom SplitMix64 RNG: identical output in Python and Rust (cross-language parity)
+- Tournament bracket player with heuristic + ML oracle features
+- PyO3 bindings: 86x speedup through Python FFI
+- Golden tests: exact score verification for seeds 0-9 (50 rollouts)
+- Parity verified: old engine (xorshift64) exact match for seeds 0, 10, 12
+
+**Expert V2 Data Generated:**
+- 5,310 games, 200 rollouts, 18 workers on M5 Max + 176 workers on GCP
+- Mean score: 5,255 (climbing to ~5,500+ as more long games finish)
+- Total: 12.8M states with pairwise pairs from top-5 tournament candidates
+
+### Pillar 2i: Expert V2 Training (IN PROGRESS)
+Training with 10x more data, position-specific TD returns:
+- **TD returns (γ=0.99)**: discounted future rewards per position, mean=196, max=286
+  (vs game_score which was 5,255 for all positions in a game)
+- **max_score=2000**: covers 100% of TD values with 31-point bin resolution
+  (old data used max_score=500 with 7.8pt bins, first attempt used 30000 = disaster)
+- **Pairwise pairs**: top-1 vs top-5 tournament afterstates with score margins
+- **Sparse top-5 policy**: softmax over tournament evaluation scores
+- Same Pillar 2f recipe: val_weight=0.001, anchor_weight=0.001, rank_weight=1.0
+- Warm start from Pillar 2f, lr=1e-4 with cosine anneal to 1e-6, 10 epochs
+- Training on H100: anchor loss recalibrating (235K → 15K in 1700 steps), rank
+  loss healthy at 1.72, policy stable at 1.82
+
+### Lessons Learned (Phase 4 continued)
 8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
    value gradients steamroll policy features in shared backbone. Always check loss magnitudes.
 
@@ -521,3 +577,27 @@ Generate 1000 games with improved Pillar 2f model (MCTS 992 mean):
 
 14. **Don't over-train on converged data.** Pillar 2f plateaued by epoch 9. More epochs on
     the same data won't help — need better data (new self-play from improved model).
+
+15. **Self-play data hurts when teacher is too weak.** Pillars 2g/2h proved that ANY amount of
+    selfplay value data (even elite, even value-only) degrades MCTS when the self-play teacher
+    (mean 891) is weaker than the expert teacher (mean 5700).
+
+16. **@torch.no_grad() on collate is mandatory.** GPU observation building (BFS, line scans)
+    in collate creates 150+ intermediate tensors per batch. Without no_grad, autograd tracks
+    them all, leaking memory until OOM.
+
+17. **itertools.cycle() caches all GPU tensors.** Using it to cycle a GPU dataloader leaks
+    the entire dataset into memory. Use manual iterator restart instead.
+
+18. **max_score must match actual value range.** TD returns (γ=0.99) peak at ~286. Using
+    max_score=30000 wastes 99% of sigmoid resolution. max_score=2000 gives 31-point bins.
+
+19. **game_score is a game-level label — use TD returns instead.** Turn 1 and turn 2000 of a
+    5000-point game should NOT get the same value target. TD returns give position-specific
+    future potential (mean ~196, max ~286).
+
+20. **Cross-language RNG for deterministic Rust engine.** SplitMix64 in both Python and Rust.
+    Custom RNG avoids reverse-engineering numpy's PCG64+SeedSequence.
+
+21. **Golden tests guard performance optimizations.** Any optimization that changes game scores
+    has altered the algorithm. Verify exact score match before/after.
