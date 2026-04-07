@@ -22,8 +22,9 @@ import torch
 
 BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4  # 6561
-MAX_SCORE = 30000.0
+MAX_SCORE = 2000.0
 NUM_VALUE_BINS = 64
+GAMMA = 0.99
 
 
 def move_to_flat(sr, sc, tr, tc):
@@ -43,6 +44,49 @@ def score_to_twohot(score, max_score, num_bins):
     target[idx] = 1.0 - frac
     target[idx + 1] = frac
     return target
+
+
+def compute_td_returns(moves, final_score, gamma=GAMMA):
+    """Compute discounted TD returns for each position.
+
+    Reconstructs per-move rewards from board states (line clears at target),
+    then computes discounted returns: V(t) = sum_{k=0}^{T-t} gamma^k * reward(t+k).
+    """
+    from game.board import _find_lines_at, calculate_score as calc_score
+
+    # Step 1: compute per-move rewards from board snapshots
+    rewards = []
+    for m in moves:
+        board = np.array(m['board'], dtype=np.int8)
+        mv = m['chosen_move']
+        sr, sc, tr, tc = mv['sr'], mv['sc'], mv['tr'], mv['tc']
+        color = board[sr, sc]
+        board[sr, sc] = 0
+        board[tr, tc] = color
+        cleared = _find_lines_at(board, tr, tc)
+        reward = calc_score(cleared) if cleared > 0 else 0
+        rewards.append(reward)
+
+    # Step 2: adjust last reward to account for spawn clears (error correction)
+    total_from_clears = sum(rewards)
+    missing = final_score - total_from_clears
+    if missing > 0 and len(rewards) > 0:
+        # Distribute missing score proportionally to non-zero reward turns
+        nonzero = [i for i, r in enumerate(rewards) if r > 0]
+        if nonzero:
+            per_turn = missing / len(nonzero)
+            for i in nonzero:
+                rewards[i] += per_turn
+
+    # Step 3: compute discounted returns (backward pass)
+    T = len(rewards)
+    returns = np.zeros(T, dtype=np.float64)
+    running = 0.0
+    for t in range(T - 1, -1, -1):
+        running = rewards[t] + gamma * running
+        returns[t] = running
+
+    return returns.astype(np.float32)
 
 
 def make_afterstate(board, sr, sc, tr, tc):
@@ -81,6 +125,9 @@ def main():
 
     for fi, fpath in enumerate(files):
         game = json.load(open(fpath))
+
+        # Compute TD returns for this game (position-specific value targets)
+        td_returns = compute_td_returns(game['moves'], game['score'])
 
         for mi, move in enumerate(game['moves']):
             board = np.array(move['board'], dtype=np.int8)
@@ -123,8 +170,8 @@ def main():
             all_pol_values.append(values)
             all_pol_nnz.append(n_top)
 
-            # Value target: two-hot categorical from game score
-            val = score_to_twohot(move['game_score'], MAX_SCORE, NUM_VALUE_BINS)
+            # Value target: two-hot categorical from TD return (position-specific)
+            val = score_to_twohot(td_returns[mi], MAX_SCORE, NUM_VALUE_BINS)
             all_val_targets.append(val)
 
             # Pairwise: good (best move) vs bad (worst of top-5)
@@ -169,7 +216,7 @@ def main():
         'max_score': MAX_SCORE,
         'num_channels': 18,
         'value_mode': 'pairwise',
-        'gamma': 0.99,
+        'gamma': GAMMA,
         'n_pairs': total_pairs,
     }
 
