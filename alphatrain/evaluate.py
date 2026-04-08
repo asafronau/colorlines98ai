@@ -62,8 +62,11 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
              and k.startswith('blocks.'))
     ch = state['stem.0.weight'].shape[0]
     bins = state['value_fc2.weight'].shape[0]
+    vch = state['value_conv.weight'].shape[0]
+    vhid = state['value_fc1.weight'].shape[0]
     net = AlphaTrainNet(in_channels=in_ch, num_blocks=nb, channels=ch,
-                        num_value_bins=bins).to(device)
+                        num_value_bins=bins, value_channels=vch,
+                        value_hidden=vhid).to(device)
     net.load_state_dict(state)
     net.train(False)
     max_score = float(ckpt.get('max_score', 30000.0))

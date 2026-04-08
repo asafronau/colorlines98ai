@@ -410,7 +410,8 @@ class TensorDatasetGPU(Dataset):
     """
 
     def __init__(self, tensor_path, augment=True, device='cuda',
-                 trap_fraction=0.0, endgame_fraction=0.0, endgame_threshold=100):
+                 trap_fraction=0.0, endgame_fraction=0.0, endgame_threshold=100,
+                 adversarial_ranking=False):
         print(f"Loading tensors to {device}...", flush=True)
         t0 = time.time()
         data = torch.load(tensor_path, weights_only=True)
@@ -451,6 +452,11 @@ class TensorDatasetGPU(Dataset):
             if endgame_fraction > 0:
                 print("WARNING: endgame_fraction set but tensor has no turns_remaining",
                       flush=True)
+
+        self.adversarial_ranking = adversarial_ranking
+        if adversarial_ranking:
+            print("Adversarial ranking: top-1 vs random move (instead of top-1 vs top-5)",
+                  flush=True)
 
         self.augment = augment
         self.augment_factor = 8 if augment else 1
@@ -710,14 +716,34 @@ class TensorDatasetGPU(Dataset):
             # Zero policy target (no meaningful moves on trap boards)
             policy[trap_sel] = 0
 
-        # Sample afterstate pairs (randomly from the pair pool)
+        # Sample afterstate pairs
         pair_idx = torch.randint(0, self.n_pairs, (B,), device=self.device)
         base = self.pair_base_idx[pair_idx]
+        good_boards = self.good_boards[pair_idx]
+
+        if self.adversarial_ranking:
+            # Adversarial: good = top-1 afterstate, bad = random move afterstate
+            # Take parent boards and make a random move (move random ball to random empty)
+            parent_boards = self.boards[base].clone()
+            bad_boards = parent_boards.clone()
+            flat = bad_boards.reshape(B, 81)
+            for i in range(B):
+                occ = (flat[i] != 0).nonzero(as_tuple=True)[0]
+                emp = (flat[i] == 0).nonzero(as_tuple=True)[0]
+                if len(occ) > 0 and len(emp) > 0:
+                    s = occ[torch.randint(len(occ), (1,), device=self.device)]
+                    t = emp[torch.randint(len(emp), (1,), device=self.device)]
+                    flat[i, t] = flat[i, s]
+                    flat[i, s] = 0
+            bad_boards = flat.reshape(B, 81).reshape(B, 9, 9)
+            # Fixed margin (normalized to ~5.0 by the scaling in train.py)
+            margin = torch.full((B,), 50.0, device=self.device)
+        else:
+            bad_boards = self.bad_boards[pair_idx]
+            margin = self.margins[pair_idx]
 
         # Fuse good+bad into single obs build with parent's next_balls
-        # (next_balls are known information — visible in UI before the move)
-        both_boards = torch.cat([self.good_boards[pair_idx],
-                                  self.bad_boards[pair_idx]], dim=0)
+        both_boards = torch.cat([good_boards, bad_boards], dim=0)
         both_next_pos = self.next_pos[base].repeat(2, 1, 1)
         both_next_col = self.next_col[base].repeat(2, 1)
         both_n_next = self.n_next[base].repeat(2)
@@ -726,7 +752,6 @@ class TensorDatasetGPU(Dataset):
                                          next_col=both_next_col,
                                          n_next=both_n_next)
         good_obs, bad_obs = both_obs.chunk(2, dim=0)
-        margin = self.margins[pair_idx]
 
         return obs, policy, val, good_obs, bad_obs, margin
 

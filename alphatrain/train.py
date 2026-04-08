@@ -188,6 +188,12 @@ def main():
     p.add_argument('--channels', type=int, default=256)
     p.add_argument('--value-bins', type=int, default=64,
                    help='Value head output size (1=scalar for pure ranking, 64=categorical)')
+    p.add_argument('--value-channels', type=int, default=32,
+                   help='Value head conv channels (default 32)')
+    p.add_argument('--value-hidden', type=int, default=512,
+                   help='Value head FC hidden size (default 512)')
+    p.add_argument('--value-dropout', type=float, default=0.0,
+                   help='Value head dropout rate (default 0.0)')
     p.add_argument('--val-split', type=float, default=0.05)
     p.add_argument('--gpu-data', action='store_true')
     p.add_argument('--amp', action='store_true')
@@ -207,6 +213,8 @@ def main():
                    help='Fraction of batch to replace with endgame positions')
     p.add_argument('--endgame-threshold', type=int, default=100,
                    help='Turns remaining threshold for endgame positions')
+    p.add_argument('--adversarial-ranking', action='store_true',
+                   help='Use top-1 vs random move pairs instead of top-1 vs top-5')
     args = p.parse_args()
 
     if torch.backends.mps.is_available():
@@ -232,7 +240,8 @@ def main():
         dataset = TensorDatasetGPU(args.tensor_file, augment=True, device=str(device),
                                    trap_fraction=args.trap_fraction,
                                    endgame_fraction=args.endgame_fraction,
-                                   endgame_threshold=args.endgame_threshold)
+                                   endgame_threshold=args.endgame_threshold,
+                                   adversarial_ranking=args.adversarial_ranking)
 
     n_val = int(len(dataset) * args.val_split)
     n_train = len(dataset) - n_val
@@ -252,7 +261,10 @@ def main():
           f"{pairwise_str}", flush=True)
 
     model = AlphaTrainNet(num_blocks=args.num_blocks, channels=args.channels,
-                          num_value_bins=args.value_bins).to(device)
+                          num_value_bins=args.value_bins,
+                          value_channels=args.value_channels,
+                          value_hidden=args.value_hidden,
+                          value_dropout=args.value_dropout).to(device)
     scalar_value = (args.value_bins == 1)
     n_params = count_parameters(model)
     # channels_last gives better perf for small spatial dims on CUDA

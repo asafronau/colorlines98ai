@@ -50,7 +50,8 @@ class AlphaTrainNet(nn.Module):
     """
 
     def __init__(self, in_channels=18, num_blocks=10, channels=256,
-                 policy_channels=128, num_value_bins=64):
+                 policy_channels=128, num_value_bins=64,
+                 value_channels=32, value_hidden=512, value_dropout=0.0):
         super().__init__()
         self.in_channels = in_channels
         self.channels = channels
@@ -72,13 +73,12 @@ class AlphaTrainNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_conv2 = nn.Conv2d(policy_channels, 81, 1)
 
-        # Value head: conv → fc → output
-        # num_value_bins=1: scalar output for pure ranking (no categorical)
-        # num_value_bins>1: categorical output with two-hot targets
-        self.value_conv = nn.Conv2d(channels, 8, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(8)
-        self.value_fc1 = nn.Linear(8 * BOARD_SIZE * BOARD_SIZE, 256)
-        self.value_fc2 = nn.Linear(256, num_value_bins)
+        # Value head: conv → fc → dropout → fc → output
+        self.value_conv = nn.Conv2d(channels, value_channels, 1, bias=False)
+        self.value_bn = nn.BatchNorm2d(value_channels)
+        self.value_fc1 = nn.Linear(value_channels * BOARD_SIZE * BOARD_SIZE, value_hidden)
+        self.value_dropout = nn.Dropout(value_dropout) if value_dropout > 0 else nn.Identity()
+        self.value_fc2 = nn.Linear(value_hidden, num_value_bins)
 
     def forward(self, x):
         """Returns (policy_logits, value_logits)."""
