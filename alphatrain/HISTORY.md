@@ -575,7 +575,7 @@ distribution analysis: **84.3% of training positions have TD returns in [190, 24
 - Gemini peer review identified γ=0.99 (half-life 69 turns) as the culprit: averages
   everything into an indistinguishable blob. Also recommended categorical head over sigmoid.
 
-### Pillar 2j: High-Contrast Value Head (NEXT)
+### Pillar 2j: High-Contrast Value Head (MCTS 891 → 1,323, BREAKTHROUGH)
 Fixing the Mid-Game Blob with shorter horizon, categorical head, and endgame oversampling.
 
 **Changes from 2i:**
@@ -592,6 +592,67 @@ Fixing the Mid-Game Blob with shorter horizon, categorical head, and endgame ove
 - 531K endgame positions (4.1%) oversampled to 30% of each batch
 - Categorical head + higher val_weight = meaningful value gradient through backbone
 - Warm start from Pillar 2i (keeps improved policy at 1.638, reinits value_fc2)
+
+**Training:** H100, 10 epochs, bs=8192, lr=1e-4 cosine, 2-epoch warmup
+- val_loss now ACTIVE: started 4.50, dropped to 2.78 (was literally 0.0 in 2i)
+- Best checkpoint: **epoch 2** (overfits after — train val_CE 2.73 vs val 2.81 at epoch 3)
+- Policy preserved: pol CE 1.67 (vs 2i's 1.64, slight increase from backbone sharing)
+
+**Results (epoch 2 best, 50 seeds, 400 sims):**
+| | Pillar 2f | 2i Ep8 | **2j Ep2** |
+|---|---|---|---|
+| MCTS mean | 891 | 505 | **1,323** |
+| Policy mean | ~315 | 435 | 448 |
+| MCTS boost | +183% | +16% | **+195%** |
+| Max | ~3,135 | 1,303 | **3,784** |
+
+12 seeds broke 1,500+, 6 seeds broke 2,000+. Seed 46 hit 3,784.
+
+### "Value Hallucination" Discovery (1,600 Sims Test)
+Tested 7 strongest seeds with 4x more simulations (1,600 vs 400).
+**5 out of 7 seeds got WORSE with more search:**
+
+| Seed | 400 sims | 1,600 sims |
+|---|---|---|
+| 0 | 2,203 | 232 (-89%) |
+| 6 | 2,457 | **5,767 (+135%)** |
+| 17 | 3,207 | 815 (-75%) |
+| 23 | 3,510 | 1,973 (-44%) |
+| 46 | 3,784 | 1,061 (-72%) |
+
+**Diagnosis:** The value head is overconfident and wrong on novel positions. At 400 sims,
+the policy prior (which is good) still dominates. At 1,600 sims, deeper search relies
+more on value backup — and when the value estimates are confidently wrong, more search
+converges harder on the wrong answer.
+
+**Seed 6 = existence proof:** hit 5,767 (near heuristic level!) — backbone features ARE
+capable, the value head just can't use them consistently. Need better value architecture.
+
+### Pillar 2k: Heavy Value Head + Adversarial Ranking (NEXT)
+Fixing "Value Hallucination" with bigger value head, adversarial training, and dropout.
+
+**Changes from 2j:**
+| Component | Pillar 2j | Pillar 2k |
+|---|---|---|
+| value_conv | 8 channels | **32 channels** |
+| value_fc1 | 648→256 | **2,592→512** |
+| Dropout | None | **0.3** |
+| Value head params | 183K | **1.37M (7.5x)** |
+| Ranking pairs | top-1 vs top-5 | **top-1 vs random move** |
+| Total model | 12.1M | **13.3M** |
+
+**Why each change:**
+1. **Bigger head (183K→1.37M):** 8-channel conv bottleneck squeezes 256 backbone channels
+   to 8 before FC layers — value head couldn't see enough features. 32 channels + 512
+   hidden gives 7.5x more capacity to learn geometric patterns.
+2. **Adversarial ranking:** top-1 vs top-5 pairs compare two GOOD moves. The value head
+   never learned what "bad" looks like. top-1 vs random move forces it to distinguish
+   master play from random play — teaching the "strategic floor."
+3. **Dropout 0.3:** Epoch 2 overfitting with 12.8M states indicates memorization.
+   Dropout forces the value head to learn generalizable features instead of specific boards.
+
+**Success criterion:** MCTS must NOT regress when increasing from 400 to 1,600 sims.
+If more search helps, the value head is trustworthy.
 
 ### Lessons Learned (Phase 4 continued)
 8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
@@ -653,3 +714,24 @@ Fixing the Mid-Game Blob with shorter horizon, categorical head, and endgame ove
 25. **Training losses improving ≠ inference improving.** Pillar 2i had perfect rank loss (0.096)
     and low anchor MAE (30) but MCTS went from +76% to +16% boost. Always eval MCTS, not just
     training metrics.
+
+26. **Test with MORE sims to detect value hallucination.** If MCTS score drops when increasing
+    from 400 to 1,600 sims, the value head is overconfident and wrong. Deeper search amplifies
+    value errors. The value head must be trustworthy before increasing sim count.
+
+27. **Value head bottleneck kills search.** 8-channel conv (256→8) throws away 97% of backbone
+    information before the FC layers see it. The value head can't form strategic judgments
+    from 8 features per cell. Increase to 32+ channels.
+
+28. **Pairwise ranking of two good moves doesn't teach danger.** top-1 vs top-5 are both
+    expert-quality moves. The value head learns fine distinctions between "good" and "slightly
+    less good" but never sees "bad." Adversarial pairs (top-1 vs random) teach the strategic
+    floor — what catastrophically wrong looks like.
+
+29. **Dropout prevents value head memorization.** With 12.8M states, the 183K-param value head
+    overfits in 2 epochs. The head memorizes board→value shortcuts instead of learning
+    generalizable geometric features. Dropout forces redundant representations.
+
+30. **Seed-level analysis reveals hidden failures.** Pillar 2j's 1,323 mean looked great but
+    hid the fact that 5/7 top seeds regressed with more search. Mean scores mask per-seed
+    disasters. Always check whether more sims helps or hurts.
