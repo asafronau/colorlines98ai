@@ -26,7 +26,8 @@ class TestModelArchitecture:
         assert 10_000_000 < params < 15_000_000
 
     def test_small_model(self):
-        model = AlphaTrainNet(num_blocks=2, channels=64)
+        model = AlphaTrainNet(num_blocks=2, channels=64,
+                              value_channels=8, value_hidden=256)
         params = count_parameters(model)
         assert params < 500_000
 
@@ -125,7 +126,8 @@ class TestFP16:
 
 class TestScalarValueHead:
     def test_scalar_construction(self):
-        model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1)
+        model = AlphaTrainNet(num_blocks=2, channels=64, num_value_bins=1,
+                              value_channels=8, value_hidden=256)
         assert model.num_value_bins == 1
         assert model.value_fc2.weight.shape == (1, 256)
 
