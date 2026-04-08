@@ -543,18 +543,55 @@ the heuristic tournament player.
 - Mean score: 5,255 (climbing to ~5,500+ as more long games finish)
 - Total: 12.8M states with pairwise pairs from top-5 tournament candidates
 
-### Pillar 2i: Expert V2 Training (IN PROGRESS)
-Training with 10x more data, position-specific TD returns:
-- **TD returns (γ=0.99)**: discounted future rewards per position, mean=196, max=286
-  (vs game_score which was 5,255 for all positions in a game)
-- **max_score=2000**: covers 100% of TD values with 31-point bin resolution
-  (old data used max_score=500 with 7.8pt bins, first attempt used 30000 = disaster)
-- **Pairwise pairs**: top-1 vs top-5 tournament afterstates with score margins
-- **Sparse top-5 policy**: softmax over tournament evaluation scores
-- Same Pillar 2f recipe: val_weight=0.001, anchor_weight=0.001, rank_weight=1.0
-- Warm start from Pillar 2f, lr=1e-4 with cosine anneal to 1e-6, 10 epochs
-- Training on H100: anchor loss recalibrating (235K → 15K in 1700 steps), rank
-  loss healthy at 1.72, policy stable at 1.82
+### Pillar 2i: Expert V2 with Scalar Value Head (POLICY IMPROVED, MCTS STAGNANT)
+Training with 10x more data, position-specific TD returns, scalar value head:
+- **Data**: 12.8M states from 5,310 expert games (200 rollouts, mean score 5,255)
+- **TD returns (γ=0.99)**: mean=210, max=340, max_score=2000 (31 pts/bin)
+- **Value head**: scalar sigmoid (num_value_bins=1), output = sigmoid(logit) × 2000
+- **Losses**: pol_CE + 0.001×anchor_MSE + 1.0×rank_hinge (val_weight unused for scalar)
+- Warm start from Pillar 2f, lr=1e-4 cosine→1e-6, bs=8192, 10 epochs, H100
+
+**Training metrics (all improved steadily):**
+| Metric | Ep1 | Ep2 | Ep8 |
+|---|---|---|---|
+| pol CE | 1.779 | 1.710 | 1.638 |
+| rank loss | 0.653 | 0.382 | 0.096 |
+| anchor MAE | 105 | 68 | 30 |
+
+**MCTS eval (50 seeds, 400 sims) — did NOT improve:**
+| | Pillar 2f | 2i Ep1 | 2i Ep2 | 2i Ep8 |
+|---|---|---|---|---|
+| MCTS mean | 891 | 527 | 559 | 505 |
+| Policy mean | ~315 | 299 | 344 | 435 |
+| MCTS over policy | +183% | +76% | +63% | **+16%** |
+
+**Post-mortem — "The Mid-Game Blob":**
+Verified data pipeline is correct (no scale mismatch). Root cause identified through
+distribution analysis: **84.3% of training positions have TD returns in [190, 240]** — a
+50-point band. The value head trains on data where almost everything looks the same.
+- Only 29K positions (0.23%) have TD return = 0 (last ~5 moves of each game)
+- Value head learns "every board ≈ 210" — can't distinguish healthy from dying
+- Result: MCTS search gets no useful signal from value backup (+16% vs +183%)
+- Gemini peer review identified γ=0.99 (half-life 69 turns) as the culprit: averages
+  everything into an indistinguishable blob. Also recommended categorical head over sigmoid.
+
+### Pillar 2j: High-Contrast Value Head (NEXT)
+Fixing the Mid-Game Blob with shorter horizon, categorical head, and endgame oversampling.
+
+**Changes from 2i:**
+| Setting | Pillar 2i | Pillar 2j |
+|---|---|---|
+| γ | 0.99 (half-life 69 turns) | **0.95 (half-life 14 turns)** |
+| Value head | Scalar sigmoid × 2000 | **Categorical 64 bins** |
+| max_score | 2000 (31 pts/bin) | **100 (1.59 pts/bin)** |
+| val_weight | 0.001 (unused) | **0.01 (categorical CE)** |
+| Endgame | No special handling | **30% of batch from last 100 turns** |
+
+**New distribution (γ=0.95):** mean=43, median=43, range 0-155, max_score=100
+- P25=39, P75=47 (still concentrated but bin resolution is 20x better)
+- 531K endgame positions (4.1%) oversampled to 30% of each batch
+- Categorical head + higher val_weight = meaningful value gradient through backbone
+- Warm start from Pillar 2i (keeps improved policy at 1.638, reinits value_fc2)
 
 ### Lessons Learned (Phase 4 continued)
 8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
@@ -601,3 +638,18 @@ Training with 10x more data, position-specific TD returns:
 
 21. **Golden tests guard performance optimizations.** Any optimization that changes game scores
     has altered the algorithm. Verify exact score match before/after.
+
+22. **Scalar sigmoid compresses value signal.** TD returns [0-286] in sigmoid×2000 range means
+    logits cluster around -2.2. Categorical heads (64 bins) express fine-grained differences better.
+
+23. **The "Mid-Game Blob": γ too high → no contrast.** γ=0.99 averages 84% of positions into
+    [190-240] TD range. Value head can't distinguish healthy from dying. γ=0.95 (half-life 14)
+    focuses on tactical horizon, combined with max_score=100 gives 1.59 pts/bin resolution.
+
+24. **Endgame oversampling is essential.** Death spiral positions (last 100 turns) are only 4.1%
+    of expert data but carry the critical "this board is dying" signal. 30% oversampling ensures
+    the value head sees enough contrast between healthy and terminal board states.
+
+25. **Training losses improving ≠ inference improving.** Pillar 2i had perfect rank loss (0.096)
+    and low anchor MAE (30) but MCTS went from +76% to +16% boost. Always eval MCTS, not just
+    training metrics.
