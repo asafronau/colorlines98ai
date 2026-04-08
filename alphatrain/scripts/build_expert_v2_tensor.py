@@ -46,16 +46,22 @@ def score_to_twohot(score, max_score, num_bins):
     return target
 
 
-def compute_td_returns(moves, final_score, gamma=DEFAULT_GAMMA):
+def compute_td_returns(moves, final_score, gamma=DEFAULT_GAMMA,
+                       survival_bonus=0.0):
     """Compute discounted TD returns for each position.
 
     Reconstructs per-move rewards from board states (line clears at target),
     then computes discounted returns: V(t) = sum_{k=0}^{T-t} gamma^k * reward(t+k).
+
+    If survival_bonus > 0, each turn gets a base reward of survival_bonus
+    plus score_delta / C, where C = 1/survival_bonus. This creates a hybrid
+    "survival + scoring" signal: r(t) = survival_bonus + score_delta / C.
+    With survival_bonus=1.0 and C=10: r(t) = 1.0 + points/10.
     """
     from game.board import _find_lines_at, calculate_score as calc_score
 
-    # Step 1: compute per-move rewards from board snapshots
-    rewards = []
+    # Step 1: compute per-move score rewards from board snapshots
+    score_rewards = []
     for m in moves:
         board = np.array(m['board'], dtype=np.int8)
         mv = m['chosen_move']
@@ -65,20 +71,29 @@ def compute_td_returns(moves, final_score, gamma=DEFAULT_GAMMA):
         board[tr, tc] = color
         cleared = _find_lines_at(board, tr, tc)
         reward = calc_score(cleared) if cleared > 0 else 0
-        rewards.append(reward)
+        score_rewards.append(reward)
 
     # Step 2: adjust last reward to account for spawn clears (error correction)
-    total_from_clears = sum(rewards)
+    total_from_clears = sum(score_rewards)
     missing = final_score - total_from_clears
-    if missing > 0 and len(rewards) > 0:
-        # Distribute missing score proportionally to non-zero reward turns
-        nonzero = [i for i, r in enumerate(rewards) if r > 0]
+    if missing > 0 and len(score_rewards) > 0:
+        nonzero = [i for i, r in enumerate(score_rewards) if r > 0]
         if nonzero:
             per_turn = missing / len(nonzero)
             for i in nonzero:
-                rewards[i] += per_turn
+                score_rewards[i] += per_turn
 
-    # Step 3: compute discounted returns (backward pass)
+    # Step 3: build per-turn rewards
+    if survival_bonus > 0:
+        # Hybrid: survival base + scoring bonus
+        # r(t) = survival_bonus + score_delta / C, where C = 10 / survival_bonus
+        C = 10.0
+        rewards = [survival_bonus + s / C for s in score_rewards]
+    else:
+        # Pure score-based TD returns (original behavior)
+        rewards = score_rewards
+
+    # Step 4: compute discounted returns (backward pass)
     T = len(rewards)
     returns = np.zeros(T, dtype=np.float64)
     running = 0.0
@@ -107,18 +122,25 @@ def main():
     parser.add_argument('--gamma', type=float, default=DEFAULT_GAMMA)
     parser.add_argument('--max-score', type=float, default=None,
                         help='Max score for two-hot encoding (default: auto from data)')
+    parser.add_argument('--survival-bonus', type=float, default=0.0,
+                        help='Per-turn survival reward (0=pure score, 1.0=hybrid survival+score/10)')
+    parser.add_argument('--num-bins', type=int, default=NUM_VALUE_BINS,
+                        help='Number of categorical value bins (default 64)')
     args = parser.parse_args()
 
     gamma = args.gamma
+    num_bins = args.num_bins
     top_k_policy = 5
 
     if args.output is None:
         g_str = str(gamma).replace('.', '')
-        args.output = f'alphatrain/data/expert_v2_pairwise_g{g_str}.pt'
+        surv_str = f'_surv{args.survival_bonus}' if args.survival_bonus > 0 else ''
+        args.output = f'alphatrain/data/expert_v2_pairwise_g{g_str}{surv_str}.pt'
 
     files = sorted(glob.glob(os.path.join(args.games_dir, 'game_seed*.json')))
     print(f"Found {len(files)} game files in {args.games_dir}", flush=True)
-    print(f"Gamma: {gamma}, output: {args.output}", flush=True)
+    print(f"Gamma: {gamma}, survival_bonus: {args.survival_bonus}, "
+          f"bins: {num_bins}, output: {args.output}", flush=True)
 
     all_boards = []
     all_next_pos = []
@@ -143,7 +165,8 @@ def main():
         n_moves = len(game['moves'])
 
         # Compute TD returns for this game
-        td_returns = compute_td_returns(game['moves'], game['score'], gamma=gamma)
+        td_returns = compute_td_returns(game['moves'], game['score'], gamma=gamma,
+                                        survival_bonus=args.survival_bonus)
 
         for mi, move in enumerate(game['moves']):
             board = np.array(move['board'], dtype=np.int8)
@@ -241,7 +264,7 @@ def main():
         p999 = np.percentile(td_arr, 99.9)
         # Round up to next 50 with 20% headroom
         max_score = float(np.ceil(p999 * 1.2 / 50) * 50)
-    print(f"\nUsing max_score={max_score} (bin width={max_score/(NUM_VALUE_BINS-1):.2f})",
+    print(f"\nUsing max_score={max_score} (bin width={max_score/(num_bins-1):.2f})",
           flush=True)
     n_clipped = (td_arr > max_score).sum()
     print(f"  Clipped: {n_clipped:,} ({100*n_clipped/len(td_arr):.3f}%)", flush=True)
@@ -250,7 +273,7 @@ def main():
     print("Encoding two-hot targets...", flush=True)
     all_val_targets = []
     for v in all_td_scalars:
-        all_val_targets.append(score_to_twohot(v, max_score, NUM_VALUE_BINS))
+        all_val_targets.append(score_to_twohot(v, max_score, num_bins))
 
     # Stack into tensors
     print("Stacking tensors...", flush=True)
@@ -268,7 +291,7 @@ def main():
         'bad_boards': torch.tensor(np.stack(all_bad_boards), dtype=torch.int8),
         'margins': torch.tensor(all_margins, dtype=torch.float32),
         'pair_base_idx': torch.tensor(all_pair_base_idx, dtype=torch.int64),
-        'num_value_bins': NUM_VALUE_BINS,
+        'num_value_bins': num_bins,
         'max_score': max_score,
         'num_channels': 18,
         'value_mode': 'pairwise',
