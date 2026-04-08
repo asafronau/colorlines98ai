@@ -723,19 +723,19 @@ class TensorDatasetGPU(Dataset):
 
         if self.adversarial_ranking:
             # Adversarial: good = top-1 afterstate, bad = random move afterstate
-            # Take parent boards and make a random move (move random ball to random empty)
-            parent_boards = self.boards[base].clone()
-            bad_boards = parent_boards.clone()
-            flat = bad_boards.reshape(B, 81)
-            for i in range(B):
-                occ = (flat[i] != 0).nonzero(as_tuple=True)[0]
-                emp = (flat[i] == 0).nonzero(as_tuple=True)[0]
-                if len(occ) > 0 and len(emp) > 0:
-                    s = occ[torch.randint(len(occ), (1,), device=self.device)]
-                    t = emp[torch.randint(len(emp), (1,), device=self.device)]
-                    flat[i, t] = flat[i, s]
-                    flat[i, s] = 0
-            bad_boards = flat.reshape(B, 81).reshape(B, 9, 9)
+            # Vectorized: pick random occupied→random empty for each board
+            flat = self.boards[base].clone().reshape(B, 81)
+            occ_mask = (flat != 0).float()
+            emp_mask = (flat == 0).float()
+            # Random source: argmax of (uniform * occupied) picks random occupied cell
+            src_idx = (torch.rand(B, 81, device=self.device) * occ_mask).argmax(dim=1)
+            # Random target: argmax of (uniform * empty) picks random empty cell
+            tgt_idx = (torch.rand(B, 81, device=self.device) * emp_mask).argmax(dim=1)
+            # Move ball: copy color from src to tgt, clear src
+            batch_idx = torch.arange(B, device=self.device)
+            flat[batch_idx, tgt_idx] = flat[batch_idx, src_idx]
+            flat[batch_idx, src_idx] = 0
+            bad_boards = flat.reshape(B, 9, 9)
             # Fixed margin (normalized to ~5.0 by the scaling in train.py)
             margin = torch.full((B,), 50.0, device=self.device)
         else:
