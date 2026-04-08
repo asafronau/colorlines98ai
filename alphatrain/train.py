@@ -201,6 +201,12 @@ def main():
     p.add_argument('--save-dir', default='checkpoints/alphatrain')
     p.add_argument('--copy-to', type=str, default=None)
     p.add_argument('--num-workers', type=int, default=8)
+    p.add_argument('--trap-fraction', type=float, default=0.0,
+                   help='Fraction of batch to replace with trap boards (value=0)')
+    p.add_argument('--endgame-fraction', type=float, default=0.0,
+                   help='Fraction of batch to replace with endgame positions')
+    p.add_argument('--endgame-threshold', type=int, default=100,
+                   help='Turns remaining threshold for endgame positions')
     args = p.parse_args()
 
     if torch.backends.mps.is_available():
@@ -223,7 +229,10 @@ def main():
     if selfplay:
         dataset = SelfPlayDataset(args.tensor_file, augment=True, device=str(device))
     else:
-        dataset = TensorDatasetGPU(args.tensor_file, augment=True, device=str(device))
+        dataset = TensorDatasetGPU(args.tensor_file, augment=True, device=str(device),
+                                   trap_fraction=args.trap_fraction,
+                                   endgame_fraction=args.endgame_fraction,
+                                   endgame_threshold=args.endgame_threshold)
 
     n_val = int(len(dataset) * args.val_split)
     n_train = len(dataset) - n_val

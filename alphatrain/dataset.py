@@ -409,12 +409,14 @@ class TensorDatasetGPU(Dataset):
     applies augmentation, and reconstructs sparse policy targets — all on GPU.
     """
 
-    def __init__(self, tensor_path, augment=True, device='cuda'):
+    def __init__(self, tensor_path, augment=True, device='cuda',
+                 trap_fraction=0.0, endgame_fraction=0.0, endgame_threshold=100):
         print(f"Loading tensors to {device}...", flush=True)
         t0 = time.time()
         data = torch.load(tensor_path, weights_only=True)
 
         self.device = torch.device(device)
+        self.trap_fraction = trap_fraction
         self.boards = data['boards'].to(self.device)
         self.next_pos = data['next_pos'].to(self.device)
         self.next_col = data['next_col'].to(self.device)
@@ -433,6 +435,22 @@ class TensorDatasetGPU(Dataset):
             self.margins = data['margins'].to(self.device)
             self.pair_base_idx = data['pair_base_idx'].to(self.device)
             self.n_pairs = int(data['n_pairs'])
+
+        # Endgame oversampling: precompute indices of endgame positions
+        self.endgame_fraction = endgame_fraction
+        if 'turns_remaining' in data and endgame_fraction > 0:
+            turns_remaining = data['turns_remaining']
+            endgame_mask = turns_remaining <= endgame_threshold
+            self._endgame_indices = endgame_mask.nonzero(as_tuple=True)[0].to(self.device)
+            n_end = len(self._endgame_indices)
+            print(f"Endgame oversampling: {n_end:,} positions with "
+                  f"≤{endgame_threshold} turns remaining ({100*n_end/len(turns_remaining):.1f}%), "
+                  f"will be {endgame_fraction*100:.0f}% of each batch", flush=True)
+        else:
+            self._endgame_indices = None
+            if endgame_fraction > 0:
+                print("WARNING: endgame_fraction set but tensor has no turns_remaining",
+                      flush=True)
 
         self.augment = augment
         self.augment_factor = 8 if augment else 1
@@ -637,12 +655,62 @@ class TensorDatasetGPU(Dataset):
         """Build batch with afterstate pairs for pairwise value training.
 
         Returns (obs, policy, val, good_obs, bad_obs, margin).
+        Supports endgame oversampling (replace fraction of batch with endgame positions)
+        and optional trap boards (shuffled ball positions, value=0).
         """
+        # Endgame oversampling: replace fraction of indices with endgame positions
+        if self._endgame_indices is not None and self.endgame_fraction > 0:
+            B = len(indices)
+            n_replace = max(1, int(B * self.endgame_fraction))
+            # Pick random endgame positions (base indices, no augmentation)
+            eg_pool = self._endgame_indices
+            eg_sel = eg_pool[torch.randint(0, len(eg_pool), (n_replace,),
+                                           device=self.device)]
+            # Apply random augmentation transforms
+            eg_aug = eg_sel * self.augment_factor + torch.randint(
+                0, self.augment_factor, (n_replace,), device=self.device)
+            # Replace last n_replace indices in the batch
+            indices = list(indices)
+            eg_aug_cpu = eg_aug.cpu().tolist()
+            for i in range(n_replace):
+                indices[-(i + 1)] = eg_aug_cpu[i]
+
         # Standard collate for policy training
         obs, policy, val = self.collate(indices)
 
+        # Inject trap data: shuffle ball positions, set value to 0
+        B = obs.shape[0]
+        if self.trap_fraction > 0:
+            n_trap = max(1, int(B * self.trap_fraction))
+            trap_sel = torch.randperm(B, device=self.device)[:n_trap]
+
+            # Get original boards for trap samples
+            indices_t = torch.tensor(indices, dtype=torch.long, device=self.device)
+            base_trap = indices_t[trap_sel] // self.augment_factor
+            trap_boards = self.boards[base_trap].clone()
+
+            # Shuffle occupied cell positions within each board
+            flat = trap_boards.reshape(n_trap, 81)
+            for i in range(n_trap):
+                occ = (flat[i] != 0).nonzero(as_tuple=True)[0]
+                if len(occ) > 1:
+                    colors = flat[i, occ].clone()
+                    perm = torch.randperm(len(occ), device=self.device)
+                    flat[i, occ] = colors[perm]
+            trap_boards = flat.reshape(n_trap, 9, 9)
+
+            # Build obs for trap boards (no next_balls — scrambled board)
+            trap_obs = self._build_obs_core(trap_boards)
+            obs[trap_sel] = trap_obs
+
+            # Value target: all mass on bin 0 (value = 0)
+            val[trap_sel] = 0
+            val[trap_sel, 0] = 1.0
+
+            # Zero policy target (no meaningful moves on trap boards)
+            policy[trap_sel] = 0
+
         # Sample afterstate pairs (randomly from the pair pool)
-        B = len(indices)
         pair_idx = torch.randint(0, self.n_pairs, (B,), device=self.device)
         base = self.pair_base_idx[pair_idx]
 

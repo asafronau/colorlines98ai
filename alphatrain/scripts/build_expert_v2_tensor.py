@@ -22,9 +22,9 @@ import torch
 
 BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4  # 6561
-MAX_SCORE = 2000.0
+DEFAULT_MAX_SCORE = 2000.0
 NUM_VALUE_BINS = 64
-GAMMA = 0.99
+DEFAULT_GAMMA = 0.99
 
 
 def move_to_flat(sr, sc, tr, tc):
@@ -46,7 +46,7 @@ def score_to_twohot(score, max_score, num_bins):
     return target
 
 
-def compute_td_returns(moves, final_score, gamma=GAMMA):
+def compute_td_returns(moves, final_score, gamma=DEFAULT_GAMMA):
     """Compute discounted TD returns for each position.
 
     Reconstructs per-move rewards from board states (line clears at target),
@@ -99,12 +99,26 @@ def make_afterstate(board, sr, sc, tr, tc):
 
 
 def main():
-    games_dir = 'data/expert_v2'
-    output = 'alphatrain/data/expert_v2_pairwise.pt'
-    top_k_policy = 5  # store top-5 policy entries
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--games-dir', default='data/expert_v2')
+    parser.add_argument('--output', default=None,
+                        help='Output path (default: auto-named with gamma)')
+    parser.add_argument('--gamma', type=float, default=DEFAULT_GAMMA)
+    parser.add_argument('--max-score', type=float, default=None,
+                        help='Max score for two-hot encoding (default: auto from data)')
+    args = parser.parse_args()
 
-    files = sorted(glob.glob(os.path.join(games_dir, 'game_seed*.json')))
-    print(f"Found {len(files)} game files in {games_dir}", flush=True)
+    gamma = args.gamma
+    top_k_policy = 5
+
+    if args.output is None:
+        g_str = str(gamma).replace('.', '')
+        args.output = f'alphatrain/data/expert_v2_pairwise_g{g_str}.pt'
+
+    files = sorted(glob.glob(os.path.join(args.games_dir, 'game_seed*.json')))
+    print(f"Found {len(files)} game files in {args.games_dir}", flush=True)
+    print(f"Gamma: {gamma}, output: {args.output}", flush=True)
 
     all_boards = []
     all_next_pos = []
@@ -113,7 +127,8 @@ def main():
     all_pol_indices = []
     all_pol_values = []
     all_pol_nnz = []
-    all_val_targets = []
+    all_td_scalars = []  # raw TD returns (for distribution analysis)
+    all_turns_remaining = []  # turns until game over
     all_good_boards = []
     all_bad_boards = []
     all_margins = []
@@ -125,13 +140,20 @@ def main():
 
     for fi, fpath in enumerate(files):
         game = json.load(open(fpath))
+        n_moves = len(game['moves'])
 
-        # Compute TD returns for this game (position-specific value targets)
-        td_returns = compute_td_returns(game['moves'], game['score'])
+        # Compute TD returns for this game
+        td_returns = compute_td_returns(game['moves'], game['score'], gamma=gamma)
 
         for mi, move in enumerate(game['moves']):
             board = np.array(move['board'], dtype=np.int8)
             all_boards.append(board)
+
+            # Turns remaining until game over
+            all_turns_remaining.append(n_moves - mi)
+
+            # Raw TD return scalar
+            all_td_scalars.append(td_returns[mi])
 
             # Next balls
             npos = np.zeros((3, 2), dtype=np.int8)
@@ -170,10 +192,6 @@ def main():
             all_pol_values.append(values)
             all_pol_nnz.append(n_top)
 
-            # Value target: two-hot categorical from TD return (position-specific)
-            val = score_to_twohot(td_returns[mi], MAX_SCORE, NUM_VALUE_BINS)
-            all_val_targets.append(val)
-
             # Pairwise: good (best move) vs bad (worst of top-5)
             if n_top >= 2:
                 best = top[0]
@@ -197,6 +215,43 @@ def main():
     print(f"\nTotal: {total_states:,} states, {total_pairs:,} pairs from "
           f"{len(files)} games ({time.time()-t0:.0f}s)", flush=True)
 
+    # Analyze TD return distribution to determine max_score
+    td_arr = np.array(all_td_scalars, dtype=np.float32)
+    tr_arr = np.array(all_turns_remaining, dtype=np.int32)
+    print(f"\nTD returns (gamma={gamma}):", flush=True)
+    print(f"  Min:    {td_arr.min():.1f}", flush=True)
+    print(f"  P25:    {np.percentile(td_arr, 25):.1f}", flush=True)
+    print(f"  Median: {np.median(td_arr):.1f}", flush=True)
+    print(f"  Mean:   {td_arr.mean():.1f}", flush=True)
+    print(f"  P75:    {np.percentile(td_arr, 75):.1f}", flush=True)
+    print(f"  P95:    {np.percentile(td_arr, 95):.1f}", flush=True)
+    print(f"  P99:    {np.percentile(td_arr, 99):.1f}", flush=True)
+    print(f"  P99.9:  {np.percentile(td_arr, 99.9):.1f}", flush=True)
+    print(f"  Max:    {td_arr.max():.1f}", flush=True)
+    print(f"\nTurns remaining:", flush=True)
+    print(f"  Min: {tr_arr.min()}, Max: {tr_arr.max()}, "
+          f"Mean: {tr_arr.mean():.0f}, Median: {np.median(tr_arr):.0f}", flush=True)
+    endgame = (tr_arr <= 100).sum()
+    print(f"  Last 100 turns: {endgame:,} ({100*endgame/len(tr_arr):.1f}%)", flush=True)
+
+    # Set max_score: round up P99.9 to nice number with headroom
+    if args.max_score is not None:
+        max_score = args.max_score
+    else:
+        p999 = np.percentile(td_arr, 99.9)
+        # Round up to next 50 with 20% headroom
+        max_score = float(np.ceil(p999 * 1.2 / 50) * 50)
+    print(f"\nUsing max_score={max_score} (bin width={max_score/(NUM_VALUE_BINS-1):.2f})",
+          flush=True)
+    n_clipped = (td_arr > max_score).sum()
+    print(f"  Clipped: {n_clipped:,} ({100*n_clipped/len(td_arr):.3f}%)", flush=True)
+
+    # Encode value targets as two-hot categorical
+    print("Encoding two-hot targets...", flush=True)
+    all_val_targets = []
+    for v in all_td_scalars:
+        all_val_targets.append(score_to_twohot(v, max_score, NUM_VALUE_BINS))
+
     # Stack into tensors
     print("Stacking tensors...", flush=True)
     data = {
@@ -208,22 +263,23 @@ def main():
         'pol_values': torch.tensor(np.stack(all_pol_values), dtype=torch.float32),
         'pol_nnz': torch.tensor(all_pol_nnz, dtype=torch.int64),
         'val_targets': torch.tensor(np.stack(all_val_targets), dtype=torch.float32),
+        'turns_remaining': torch.tensor(all_turns_remaining, dtype=torch.int32),
         'good_boards': torch.tensor(np.stack(all_good_boards), dtype=torch.int8),
         'bad_boards': torch.tensor(np.stack(all_bad_boards), dtype=torch.int8),
         'margins': torch.tensor(all_margins, dtype=torch.float32),
         'pair_base_idx': torch.tensor(all_pair_base_idx, dtype=torch.int64),
         'num_value_bins': NUM_VALUE_BINS,
-        'max_score': MAX_SCORE,
+        'max_score': max_score,
         'num_channels': 18,
         'value_mode': 'pairwise',
-        'gamma': GAMMA,
+        'gamma': gamma,
         'n_pairs': total_pairs,
     }
 
-    os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
-    torch.save(data, output)
-    size_mb = os.path.getsize(output) / 1e6
-    print(f"\nSaved to {output} ({size_mb:.0f} MB)", flush=True)
+    os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+    torch.save(data, args.output)
+    size_mb = os.path.getsize(args.output) / 1e6
+    print(f"\nSaved to {args.output} ({size_mb:.0f} MB)", flush=True)
 
     # Summary
     print(f"\nShapes:", flush=True)
