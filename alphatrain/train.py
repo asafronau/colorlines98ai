@@ -24,7 +24,8 @@ def cross_entropy_soft(logits, targets):
 def train_epoch(model, loader, optimizer, device, max_score=500.0,
                 num_value_bins=64, scaler=None, pairwise=False,
                 scalar_value=False, selfplay=False, val_weight=1.0,
-                rank_weight=1.0, anchor_weight=0.0, log_interval=100):
+                rank_weight=1.0, anchor_weight=0.0, rank_subsample=1.0,
+                log_interval=100):
     model.train()
     total_loss = 0
     total_pol = 0
@@ -78,7 +79,13 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
                 good_obs = good_obs.to(device)
                 bad_obs = bad_obs.to(device)
                 margin = margin.to(device)
-                # Single forward pass for both afterstates (3→2 total passes)
+                # Subsample pairs for ranking (reduces 2nd forward pass)
+                if rank_subsample < 1.0:
+                    n_sub = max(64, int(good_obs.shape[0] * rank_subsample))
+                    idx = torch.randperm(good_obs.shape[0], device=device)[:n_sub]
+                    good_obs = good_obs[idx]
+                    bad_obs = bad_obs[idx]
+                    margin = margin[idx]
                 pair_obs = torch.cat([good_obs, bad_obs], dim=0)
                 _, pair_val = model(pair_obs)
                 good_val, bad_val = pair_val.chunk(2, dim=0)
@@ -215,6 +222,8 @@ def main():
                    help='Turns remaining threshold for endgame positions')
     p.add_argument('--adversarial-ranking', action='store_true',
                    help='Use top-1 vs random move pairs instead of top-1 vs top-5')
+    p.add_argument('--rank-subsample', type=float, default=1.0,
+                   help='Fraction of batch to use for ranking loss (0.25 = 4x faster pairs)')
     args = p.parse_args()
 
     if torch.backends.mps.is_available():
@@ -368,7 +377,8 @@ def main():
                                   selfplay=selfplay,
                                   val_weight=args.val_weight,
                                   rank_weight=args.rank_weight,
-                                  anchor_weight=args.anchor_weight)
+                                  anchor_weight=args.anchor_weight,
+                                  rank_subsample=args.rank_subsample)
         vl, vp, vv, vm = validate(model, val_loader, device,
                                    max_score=max_score,
                                    num_value_bins=dataset.num_value_bins,
