@@ -628,11 +628,11 @@ converges harder on the wrong answer.
 **Seed 6 = existence proof:** hit 5,767 (near heuristic level!) — backbone features ARE
 capable, the value head just can't use them consistently. Need better value architecture.
 
-### Pillar 2k: Heavy Value Head + Adversarial Ranking (NEXT)
-Fixing "Value Hallucination" with bigger value head, adversarial training, and dropout.
+### Pillar 2k-alpha: Heavy Value Head + Adversarial Ranking (HALLUCINATION PERSISTS)
+First attempt to fix "Value Hallucination" with architecture changes.
 
 **Changes from 2j:**
-| Component | Pillar 2j | Pillar 2k |
+| Component | Pillar 2j | Pillar 2k-alpha |
 |---|---|---|
 | value_conv | 8 channels | **32 channels** |
 | value_fc1 | 648→256 | **2,592→512** |
@@ -641,18 +641,156 @@ Fixing "Value Hallucination" with bigger value head, adversarial training, and d
 | Ranking pairs | top-1 vs top-5 | **top-1 vs random move** |
 | Total model | 12.1M | **13.3M** |
 
-**Why each change:**
-1. **Bigger head (183K→1.37M):** 8-channel conv bottleneck squeezes 256 backbone channels
-   to 8 before FC layers — value head couldn't see enough features. 32 channels + 512
-   hidden gives 7.5x more capacity to learn geometric patterns.
-2. **Adversarial ranking:** top-1 vs top-5 pairs compare two GOOD moves. The value head
-   never learned what "bad" looks like. top-1 vs random move forces it to distinguish
-   master play from random play — teaching the "strategic floor."
-3. **Dropout 0.3:** Epoch 2 overfitting with 12.8M states indicates memorization.
-   Dropout forces the value head to learn generalizable features instead of specific boards.
+**Results (epoch 2 best, 50 seeds, 400 sims):**
+| | 2j Ep2 | 2k-alpha Ep2 |
+|---|---|---|
+| MCTS mean | 1,323 | 1,134 |
+| Policy mean | 448 | 513 (best yet) |
+| MCTS boost | +195% | +121% |
 
-**Success criterion:** MCTS must NOT regress when increasing from 400 to 1,600 sims.
-If more search helps, the value head is trustworthy.
+**1,600-sim test: STILL FAILS.** 7/7 seeds regressed, mean dropped -66% (worse than 2j's -27%).
+The bigger value head, adversarial ranking, and dropout did NOT fix the fundamental problem.
+Architecture changes alone can't solve distribution shift.
+
+### The Forensic Diagnosis Breakthrough
+
+**Pivotal moment:** The user insisted on diagnosis before more architecture experiments.
+*"I want to understand why this is happening and how to have more confidence that the new
+architecture is better. Let's diagnose the problem."*
+
+Gemini suggested a forensic audit: feed the model expert boards, blunder boards (expert + 1
+random move), and chaos boards (random ball positions), then compare value predictions.
+
+**Built `diagnose_value_head.py` with three tests:**
+
+**Test 1 — Trap Test (can the model distinguish board types?):**
+| Board type | Value prediction |
+|---|---|
+| Expert mid-game | 43.8 |
+| Expert + 1 random move | 43.2 |
+| Random chaos | 32.2 |
+
+**SMOKING GUN #1:** Blunder boards indistinguishable from expert (gap: 0.6 out of 44).
+The value head literally cannot tell a master move from a random move.
+
+**Test 2 — Target correlation with board health (empty squares):**
+| Metric | Correlation |
+|---|---|
+| TD returns (γ=0.95) | **r = -0.036 (ZERO!)** |
+| Remaining turns | r = 0.121 (3x better) |
+
+**SMOKING GUN #2:** TD returns have NO correlation with board health. A dying board (20
+empty) gets TD=27, a pristine board (70 empty) gets TD=31. Only 4 points of contrast!
+This is because TD returns measure "are points scored nearby?" not "is this board healthy?"
+A dying board frantically clearing lines scores similarly to a quiet healthy board.
+
+**Test 3 — Death prediction accuracy:**
+| Game stage | NN prediction | Truth |
+|---|---|---|
+| Early/Mid | 43.9 | 44.1 (accurate) |
+| Endgame (<100 turns) | 34.4 | 31.0 (overconfident +3.4) |
+| **Death (<20 turns)** | **23.0** | **7.9 (3x too high!)** |
+
+**SMOKING GUN #3:** The value head tells MCTS "this position is fine" (23.0) when the board
+is 10 turns from death (truth: 7.9). This is exactly why deeper search hallucinates —
+it follows branches to dying positions and the value head says "keep going."
+
+**Root cause: TD returns (γ=0.95) are a terrible value target.** They encode "how many
+points are scored in the next ~14 turns" — which depends on luck and line-clearing
+frequency, NOT board health. The value head can't learn geometric health from this signal.
+
+### Pillar 2k-survival: The Survival Clock (MCTS 1,791, FIRST 9K+ SCORE)
+
+**The user's key insight about endgames:** *"Regardless of whether a game scores 300 or
+30,000, the endgame follows the same pattern. Once the board reaches a certain configuration,
+it spirals into death. The 30,000-point game just delayed this longer."*
+
+This led to the idea: predict SURVIVAL TIME, not score. The user also pointed out a concern
+with pure survival: *"I don't want the AI to panic and rush to clear every 5-ball line."*
+
+**Solution: hybrid survival + scoring reward.**
+`r(t) = 1.0 + score_delta / 10.0` — each turn you survive gives base reward 1.0, plus a
+scoring bonus. With γ=0.95, healthy positions get V≈25 (20 turns × 1.25 avg reward),
+dying positions get V≈8 (few turns left).
+
+Gemini reviewed the formula, approved C=10, recommended linear bins (no sqrt since γ=0.95
+already compresses to [0,35]), and suggested max_score=30 with 128 bins (0.24 pts/bin)
+for high resolution in the critical range.
+
+**Changes from 2k-alpha:**
+| | 2k-alpha | 2k-survival |
+|---|---|---|
+| Value target | TD returns (score only) | **Survival hybrid r=1+pts/10** |
+| Bins | 64, max_score=100 | **128, max_score=30** |
+| Head architecture | Same (32ch, 512h, dropout 0.3) | Same |
+
+**Training:** H100, best at **epoch 7** (no overfitting cliff — dropout working!)
+
+| Metric | 2k-alpha Ep2 | **2k-surv Ep7** |
+|---|---|---|
+| pol CE | 1.621 | **1.498** (best ever) |
+| val CE | 2.79 | 2.72 |
+| val MAE | 6 | **3** |
+
+**Results (50 seeds, 400 sims):**
+| | 2f | 2j | 2k-alpha | **2k-surv** |
+|---|---|---|---|---|
+| MCTS mean | 891 | 1,323 | 1,134 | **1,791** |
+| Policy mean | ~315 | 448 | 513 | **825** |
+| MCTS boost | +183% | +195% | +121% | +117% |
+| Max | ~3,135 | 3,784 | 2,715 | **5,326** |
+
+Policy at 825 (no search) outperforms Pillar 2f's MCTS (891). 5 seeds broke 3,000+.
+
+**1,600-sim hallucination test (7 strongest seeds):**
+| Seed | @400 | @1600 |
+|---|---|---|
+| 7 | 3,494 | **9,277 (+165%)** |
+| 10 | 5,326 | 4,411 (-17%) |
+| 43 | 4,619 | 982 (-79%) |
+| **Mean (7 seeds)** | **4,090** | **2,998 (-27%)** |
+
+**Seed 7 at 9,277 = existence proof.** First NN MCTS score above the heuristic mean (5,700).
+Hallucination reduced (-27% vs -66%) but not eliminated: 5/7 seeds still regress.
+
+### Post-Survival Forensic Re-Diagnosis
+
+Re-ran `diagnose_value_head.py` on the survival model to verify fixes:
+
+**Death prediction: FIXED**
+| Game stage | Old pred / truth | New pred / truth |
+|---|---|---|
+| Death (<20 turns) | 23.0 / 7.9 (3x over) | **8.0 / 8.1 (perfect!)** |
+| Endgame (<100 turns) | 34.4 / 31.0 (+3.4) | 15.0 / 19.4 (-4.4, conservative=safe) |
+
+**Board health correlation: 7x better**
+| | Old | New |
+|---|---|---|
+| r(value, empty_squares) | -0.036 | **0.264** |
+
+**Still unresolved: single-move discrimination**
+Expert board vs expert+1 random move: gap of 0.1 (was 0.6). But this may be CORRECT —
+one random move genuinely costs only 0.5-2.5% of survival time on a healthy board.
+
+**The remaining hallucination mechanism: compounding errors at depth.**
+At 1,600 sims, MCTS explores 5-10 moves deep. Each move is slightly suboptimal (the 0.1
+gap is invisible). After 5-10 suboptimal moves, cumulative damage degrades the board
+geometry. The value head evaluates the degraded board and says "looks fine" because it
+has never seen what happens after consecutive NN mistakes — only expert trajectories.
+
+**This is distribution shift, not a reward formula problem.** The fix requires the model
+to see positions from its own play distribution → self-play data generation.
+
+### Next: Self-Play Data (Pillar 2L)
+
+The model is now strong enough for viable self-play:
+- Policy 825 (was 315 at the failed 2g/2h attempts)
+- MCTS 1,791 (was 891 at the failed attempts)
+- The "dumber teacher" problem (lesson 15) may not apply at this level
+
+Plan: generate 1,000-2,000 games from current model (MCTS 400 sims), mix with expert
+data for training. Self-play data provides value targets calibrated to the model's own
+play level, addressing the distribution shift that architecture changes cannot fix.
 
 ### Lessons Learned (Phase 4 continued)
 8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
@@ -735,3 +873,33 @@ If more search helps, the value head is trustworthy.
 30. **Seed-level analysis reveals hidden failures.** Pillar 2j's 1,323 mean looked great but
     hid the fact that 5/7 top seeds regressed with more search. Mean scores mask per-seed
     disasters. Always check whether more sims helps or hurts.
+
+31. **Diagnose before fixing.** We wasted an H100 run on architecture changes (2k-alpha) that
+    didn't help because we hadn't identified the root cause. The forensic diagnostic
+    (diagnose_value_head.py) took 5 minutes and revealed TD returns have r=-0.036 correlation
+    with board health. Always measure the failure before proposing solutions.
+
+32. **TD returns are a terrible value target for survival games.** They measure "are points
+    scored nearby?" not "is this board healthy?" A dying board frantically clearing lines
+    gets similar TD to a quiet healthy board (27 vs 31). The "Inverted-U" trap: the metric
+    goes UP as the board gets MORE desperate because clearing is more frequent.
+
+33. **Survival time is the true strategic signal.** In Color Lines, score is an OUTPUT of
+    survival — if you stay alive longer, you score more. Predicting remaining turns gives
+    monotonic, high-contrast signal (471 vs 2,414 for dying vs healthy). 485x stronger SNR
+    than TD returns.
+
+34. **Hybrid reward balances survival with quality.** r(t) = 1 + score/10 prevents pure
+    survival from ignoring scoring opportunities. Survival dominates (base 1.0/turn) but
+    scoring provides tiebreaking between equal-survival moves.
+
+35. **The 1,600-sim test is the true benchmark.** If more search HELPS, the value head is
+    trustworthy. If it HURTS, the value head hallucinates. Architecture changes that improve
+    400-sim scores but fail at 1,600 sims haven't solved the real problem.
+
+36. **Distribution shift is the final boss.** Training on expert positions but evaluating on
+    NN-explored positions creates a gap no reward formula can close. The model needs to see
+    its own failure modes. Self-play is the only fix once the reward signal is correct.
+
+37. **Always run tests before declaring code ready for Colab.** Changed model defaults broke
+    2 tests that weren't caught until Colab. Run pytest as part of pre-flight verification.
