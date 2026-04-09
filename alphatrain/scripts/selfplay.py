@@ -32,15 +32,34 @@ import argparse
 import numpy as np
 import torch
 
+import json
+
 from game.board import ColorLinesGame
 from alphatrain.mcts import MCTS, _build_obs_for_game
 from alphatrain.evaluate import load_model
 
 
-def play_selfplay_game(mcts, seed, temperature_moves=30,
+def save_game_json(result, save_dir):
+    """Save game result as JSON compatible with build_expert_v2_tensor.py."""
+    seed = result['seed']
+    score = result['score']
+    path = os.path.join(save_dir, f'game_seed{seed}_score{score}.json')
+    with open(path, 'w') as f:
+        json.dump({
+            'seed': seed,
+            'score': score,
+            'moves': result['moves'],
+        }, f)
+    return path
+
+
+def play_selfplay_game(mcts, seed, temperature_moves=15,
                        dirichlet_alpha=0.3, dirichlet_weight=0.25,
-                       gamma=0.99):
-    """Play one self-play game, recording training data.
+                       top_k_save=5):
+    """Play one self-play game, recording raw board data for JSON output.
+
+    Saves in the same format as Rust expert games so build_expert_v2_tensor.py
+    can process self-play and expert data identically.
 
     Args:
         mcts: MCTS instance
@@ -48,29 +67,33 @@ def play_selfplay_game(mcts, seed, temperature_moves=30,
         temperature_moves: use temperature=1 for first N moves
         dirichlet_alpha: Dirichlet noise parameter
         dirichlet_weight: weight for noise at root
-        gamma: discount factor for TD returns
+        top_k_save: number of top moves to save from visit counts
 
     Returns:
-        dict with observations, policy_targets, value_targets, metadata
+        dict with 'seed', 'score', 'moves' (list of per-turn dicts)
     """
     game = ColorLinesGame(seed=seed)
     game.reset()
 
-    observations = []
-    policy_targets = []
-    scores_at_turn = []
-
+    moves_data = []
     t0 = time.time()
     turn = 0
 
     while not game.game_over:
-        # Temperature: explore for first N moves, greedy after
         temp = 1.0 if turn < temperature_moves else 0.0
 
-        # Build observation before move
-        obs = _build_obs_for_game(game)
+        # Record board state BEFORE move
+        board_snapshot = game.board.copy().tolist()
+        nb = game.next_balls
+        next_balls = []
+        for pos_col in nb:
+            next_balls.append({
+                'row': int(pos_col[0][0]),
+                'col': int(pos_col[0][1]),
+                'color': int(pos_col[1]),
+            })
 
-        # MCTS search with policy target
+        # MCTS search — get action + full visit count distribution
         result = mcts.search(
             game,
             temperature=temp,
@@ -83,10 +106,39 @@ def play_selfplay_game(mcts, seed, temperature_moves=30,
 
         action, policy_target = result
 
-        # Record training data
-        observations.append(obs)
-        policy_targets.append(policy_target)
-        scores_at_turn.append(game.score)
+        # Extract top-K moves from visit count distribution
+        top_indices = np.argsort(policy_target)[::-1][:top_k_save]
+        top_moves = []
+        top_scores = []
+        for idx in top_indices:
+            if policy_target[idx] <= 0:
+                break
+            flat = int(idx)
+            src_flat = flat // 81
+            tgt_flat = flat % 81
+            top_moves.append({
+                'sr': int(src_flat // 9), 'sc': int(src_flat % 9),
+                'tr': int(tgt_flat // 9), 'tc': int(tgt_flat % 9),
+            })
+            # Use log(visit_fraction + eps) as score — softmax in build script
+            # recovers the original distribution
+            top_scores.append(float(np.log(policy_target[idx] + 1e-8)))
+
+        # The chosen move
+        chosen_src, chosen_tgt = action
+        chosen_move = {
+            'sr': int(chosen_src[0]), 'sc': int(chosen_src[1]),
+            'tr': int(chosen_tgt[0]), 'tc': int(chosen_tgt[1]),
+        }
+
+        moves_data.append({
+            'board': board_snapshot,
+            'next_balls': next_balls,
+            'num_next': len(nb),
+            'chosen_move': chosen_move,
+            'top_moves': top_moves,
+            'top_scores': top_scores,
+        })
 
         # Execute move
         move_result = game.move(action[0], action[1])
@@ -94,38 +146,18 @@ def play_selfplay_game(mcts, seed, temperature_moves=30,
             break
 
         turn += 1
-        if turn % 200 == 0:
+        if turn % 500 == 0:
             elapsed = time.time() - t0
             print(f"    seed={seed} turn={turn} score={game.score} "
                   f"{elapsed:.0f}s", flush=True)
 
     elapsed = time.time() - t0
-    final_score = game.score
-
-    # Compute TD value targets (gamma=0.99 discounted remaining score)
-    n = len(scores_at_turn)
-    scores_at_turn.append(final_score)  # sentinel for final score
-    value_targets = np.zeros(n, dtype=np.float32)
-
-    if n > 0:
-        # Reward at each step = score delta
-        rewards = np.zeros(n, dtype=np.float32)
-        for i in range(n):
-            rewards[i] = scores_at_turn[i + 1] - scores_at_turn[i]
-
-        # Discounted return from each position
-        running = 0.0
-        for i in range(n - 1, -1, -1):
-            running = rewards[i] + gamma * running
-            value_targets[i] = running
 
     return {
-        'observations': np.stack(observations) if observations else np.empty((0, 18, 9, 9)),
-        'policy_targets': np.stack(policy_targets) if policy_targets else np.empty((0, 6561)),
-        'value_targets': value_targets,
-        'score': final_score,
-        'turns': turn,
         'seed': seed,
+        'score': game.score,
+        'turns': turn,
+        'moves': moves_data,
         'time': elapsed,
     }
 
@@ -140,7 +172,7 @@ def _server_worker(slot_id, seed_queue, result_queue,
                    num_workers, max_batch,
                    request_queue, response_queue,
                    num_sims, batch_size, max_score,
-                   temperature_moves, dirichlet_alpha, dirichlet_weight, gamma):
+                   temperature_moves, dirichlet_alpha, dirichlet_weight):
     """Persistent worker for GPU server mode self-play.
 
     Pulls seeds from seed_queue, plays games using shared-memory GPU
@@ -175,8 +207,7 @@ def _server_worker(slot_id, seed_queue, result_queue,
             mcts, seed,
             temperature_moves=temperature_moves,
             dirichlet_alpha=dirichlet_alpha,
-            dirichlet_weight=dirichlet_weight,
-            gamma=gamma)
+            dirichlet_weight=dirichlet_weight)
 
         print(f"  [w{slot_id}] seed={seed}: score={result['score']}, "
               f"turns={result['turns']}, {result['time']:.0f}s", flush=True)
@@ -191,12 +222,11 @@ def _server_worker(slot_id, seed_queue, result_queue,
 def _worker_play(args):
     """Worker function for CPU multiprocessing."""
     seed, model_path, device_str, num_sims, batch_size, \
-        temperature_moves, dirichlet_alpha, dirichlet_weight, gamma = args
+        temperature_moves, dirichlet_alpha, dirichlet_weight = args
 
     _limit_threads()
     device = torch.device(device_str)
 
-    # Load model (each worker loads independently)
     net, max_score = load_model(model_path, device,
                                 fp16=(device_str != 'cpu'),
                                 jit_trace=True)
@@ -209,8 +239,7 @@ def _worker_play(args):
         mcts, seed,
         temperature_moves=temperature_moves,
         dirichlet_alpha=dirichlet_alpha,
-        dirichlet_weight=dirichlet_weight,
-        gamma=gamma)
+        dirichlet_weight=dirichlet_weight)
 
     print(f"  seed={seed}: score={result['score']}, "
           f"turns={result['turns']}, {result['time']:.0f}s", flush=True)
@@ -233,10 +262,9 @@ def main():
     p.add_argument('--deterministic', action='store_true',
                    help='Per-request GPU processing (exact scores, slower)')
     p.add_argument('--save-dir', default='data/selfplay')
-    p.add_argument('--temperature-moves', type=int, default=30)
+    p.add_argument('--temperature-moves', type=int, default=15)
     p.add_argument('--dirichlet-alpha', type=float, default=0.3)
     p.add_argument('--dirichlet-weight', type=float, default=0.25)
-    p.add_argument('--gamma', type=float, default=0.99)
     args = p.parse_args()
 
     if args.device:
@@ -253,12 +281,11 @@ def main():
 
     # Resume: skip seeds with existing game files
     completed = set()
+    import re
     for f in os.listdir(args.save_dir):
-        if f.startswith('game_') and f.endswith('.pt'):
-            try:
-                completed.add(int(f[5:11]))
-            except ValueError:
-                pass
+        m = re.match(r'game_seed(\d+)_score\d+\.json', f)
+        if m:
+            completed.add(int(m.group(1)))
     if completed:
         before = len(seeds)
         seeds = [s for s in seeds if s not in completed]
@@ -306,19 +333,9 @@ def main():
                 mcts, seed,
                 temperature_moves=args.temperature_moves,
                 dirichlet_alpha=args.dirichlet_alpha,
-                dirichlet_weight=args.dirichlet_weight,
-                gamma=args.gamma)
+                dirichlet_weight=args.dirichlet_weight)
 
-            # Save individual game
-            save_path = os.path.join(args.save_dir, f'game_{seed:06d}.pt')
-            torch.save({
-                'observations': torch.from_numpy(result['observations']),
-                'policy_targets': torch.from_numpy(result['policy_targets']),
-                'value_targets': torch.from_numpy(result['value_targets']),
-                'score': result['score'],
-                'turns': result['turns'],
-                'seed': seed,
-            }, save_path)
+            save_game_json(result, args.save_dir)
 
             total_states += result['turns']
             total_score += result['score']
@@ -335,31 +352,22 @@ def main():
         worker_args = [
             (seed, args.model, 'cpu', args.sims, args.batch_size,
              args.temperature_moves, args.dirichlet_alpha,
-             args.dirichlet_weight, args.gamma)
+             args.dirichlet_weight)
             for seed in seeds
         ]
 
         with Pool(args.workers) as pool:
             for i, result in enumerate(pool.imap_unordered(
                     _worker_play, worker_args)):
-                save_path = os.path.join(
-                    args.save_dir, f'game_{result["seed"]:06d}.pt')
-                torch.save({
-                    'observations': torch.from_numpy(result['observations']),
-                    'policy_targets': torch.from_numpy(result['policy_targets']),
-                    'value_targets': torch.from_numpy(result['value_targets']),
-                    'score': result['score'],
-                    'turns': result['turns'],
-                    'seed': result['seed'],
-                }, save_path)
+                save_game_json(result, args.save_dir)
 
                 total_states += result['turns']
                 total_score += result['score']
                 elapsed = time.time() - t0
                 eta = elapsed / (i + 1) * (n_games - i - 1)
 
-                print(f"  [{i+1}/{n_games}] saved game_{result['seed']:06d}.pt "
-                      f"(ETA {eta/60:.0f}m)", flush=True)
+                print(f"  [{i+1}/{n_games}] seed={result['seed']}: "
+                      f"score={result['score']} (ETA {eta/60:.0f}m)", flush=True)
 
     else:
         # GPU server mode: workers>1 + MPS/CUDA
@@ -401,7 +409,7 @@ def main():
                       server.request_queue, server.response_queues[i],
                       args.sims, args.batch_size, max_score,
                       args.temperature_moves, args.dirichlet_alpha,
-                      args.dirichlet_weight, args.gamma))
+                      args.dirichlet_weight))
             p.start()
             workers.append(p)
 
@@ -409,24 +417,15 @@ def main():
             for i in range(n_games):
                 result = result_queue.get(timeout=7200)
 
-                save_path = os.path.join(
-                    args.save_dir, f'game_{result["seed"]:06d}.pt')
-                torch.save({
-                    'observations': torch.from_numpy(result['observations']),
-                    'policy_targets': torch.from_numpy(result['policy_targets']),
-                    'value_targets': torch.from_numpy(result['value_targets']),
-                    'score': result['score'],
-                    'turns': result['turns'],
-                    'seed': result['seed'],
-                }, save_path)
+                save_game_json(result, args.save_dir)
 
                 total_states += result['turns']
                 total_score += result['score']
                 elapsed = time.time() - t0
                 eta = elapsed / (i + 1) * (n_games - i - 1)
 
-                print(f"  [{i+1}/{n_games}] saved game_{result['seed']:06d}.pt "
-                      f"(ETA {eta/60:.0f}m)", flush=True)
+                print(f"  [{i+1}/{n_games}] seed={result['seed']}: "
+                      f"score={result['score']} (ETA {eta/60:.0f}m)", flush=True)
         finally:
             for p in workers:
                 p.join(timeout=30)
