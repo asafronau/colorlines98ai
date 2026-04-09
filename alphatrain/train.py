@@ -222,6 +222,10 @@ def main():
                    help='Turns remaining threshold for endgame positions')
     p.add_argument('--adversarial-ranking', action='store_true',
                    help='Use top-1 vs random move pairs instead of top-1 vs top-5')
+    p.add_argument('--selfplay-tensor', type=str, default=None,
+                   help='Path to self-play tensor for mixed training')
+    p.add_argument('--selfplay-fraction', type=float, default=0.0,
+                   help='Fraction of batch to replace with self-play data (e.g., 0.3)')
     p.add_argument('--rank-subsample', type=float, default=1.0,
                    help='Fraction of batch to use for ranking loss (0.25 = 4x faster pairs)')
     args = p.parse_args()
@@ -250,7 +254,9 @@ def main():
                                    trap_fraction=args.trap_fraction,
                                    endgame_fraction=args.endgame_fraction,
                                    endgame_threshold=args.endgame_threshold,
-                                   adversarial_ranking=args.adversarial_ranking)
+                                   adversarial_ranking=args.adversarial_ranking,
+                                   selfplay_path=args.selfplay_tensor,
+                                   selfplay_fraction=args.selfplay_fraction)
 
     n_val = int(len(dataset) * args.val_split)
     n_train = len(dataset) - n_val
