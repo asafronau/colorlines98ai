@@ -411,7 +411,7 @@ class TensorDatasetGPU(Dataset):
 
     def __init__(self, tensor_path, augment=True, device='cuda',
                  trap_fraction=0.0, endgame_fraction=0.0, endgame_threshold=100,
-                 adversarial_ranking=False):
+                 adversarial_ranking=False, selfplay_path=None, selfplay_fraction=0.0):
         print(f"Loading tensors to {device}...", flush=True)
         t0 = time.time()
         data = torch.load(tensor_path, weights_only=True)
@@ -457,6 +457,28 @@ class TensorDatasetGPU(Dataset):
         if adversarial_ranking:
             print("Adversarial ranking: top-1 vs random move (instead of top-1 vs top-5)",
                   flush=True)
+
+        # Self-play data mixing: load second tensor, replace fraction of each batch
+        self.selfplay_fraction = selfplay_fraction
+        if selfplay_path and selfplay_fraction > 0:
+            print(f"Loading self-play tensor from {selfplay_path}...", flush=True)
+            sp = torch.load(selfplay_path, weights_only=True)
+            self._sp_boards = sp['boards'].to(self.device)
+            self._sp_next_pos = sp['next_pos'].to(self.device)
+            self._sp_next_col = sp['next_col'].to(self.device)
+            self._sp_n_next = sp['n_next'].to(self.device)
+            self._sp_pol_indices = sp['pol_indices'].to(self.device)
+            self._sp_pol_values = sp['pol_values'].to(self.device)
+            self._sp_val_targets = sp['val_targets'].to(self.device)
+            self._sp_good_boards = sp['good_boards'].to(self.device)
+            self._sp_pair_base_idx = sp['pair_base_idx'].to(self.device)
+            self._sp_n = self._sp_boards.shape[0]
+            self._sp_n_pairs = int(sp['n_pairs'])
+            print(f"Self-play: {self._sp_n:,} states, {selfplay_fraction*100:.0f}% of each batch",
+                  flush=True)
+            del sp
+        else:
+            self._sp_n = 0
 
         self.augment = augment
         self.augment_factor = 8 if augment else 1
@@ -681,11 +703,30 @@ class TensorDatasetGPU(Dataset):
             for i in range(n_replace):
                 indices[-(i + 1)] = eg_aug_cpu[i]
 
-        # Standard collate for policy training
+        # Standard collate for policy training (expert data)
         obs, policy, val = self.collate(indices)
+        B = obs.shape[0]
+
+        # Self-play mixing: replace fraction of batch with self-play data
+        if self._sp_n > 0 and self.selfplay_fraction > 0:
+            n_sp = max(1, int(B * self.selfplay_fraction))
+            sp_sel = torch.randperm(B, device=self.device)[:n_sp]
+            # Random self-play positions
+            sp_idx = torch.randint(0, self._sp_n, (n_sp,), device=self.device)
+            sp_boards = self._sp_boards[sp_idx]
+            sp_obs = self._build_obs_core(
+                sp_boards,
+                next_pos=self._sp_next_pos[sp_idx],
+                next_col=self._sp_next_col[sp_idx],
+                n_next=self._sp_n_next[sp_idx])
+            obs[sp_sel] = sp_obs
+            val[sp_sel] = self._sp_val_targets[sp_idx]
+            # Self-play policy targets
+            sp_pol = torch.zeros(n_sp, NUM_MOVES, device=self.device)
+            sp_pol.scatter_(1, self._sp_pol_indices[sp_idx], self._sp_pol_values[sp_idx])
+            policy[sp_sel] = sp_pol
 
         # Inject trap data: shuffle ball positions, set value to 0
-        B = obs.shape[0]
         if self.trap_fraction > 0:
             n_trap = max(1, int(B * self.trap_fraction))
             trap_sel = torch.randperm(B, device=self.device)[:n_trap]

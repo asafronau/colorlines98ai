@@ -1,109 +1,69 @@
 #!/bin/bash
-# GCP self-play deployment script.
+# Self-play on GCP A3 (H100 + 26 vCPUs).
 #
-# From local machine:
+# Upload:
+#   gcloud compute scp colorlines_selfplay_train.tar.gz <instance>:~/
+#   gcloud compute scp alphatrain/data/pillar2k_surv_best.pt <instance>:~/
+#   gcloud compute scp scripts/gcp_selfplay.sh <instance>:~/
 #
-#   # 1. Start instance
-#   gcloud compute instances start coloreval98 --zone=us-central1-b
+# Run:
+#   gcloud compute ssh <instance> -- bash gcp_selfplay.sh
 #
-#   # 2. Build tarball and upload code + model
-#   tar czf /tmp/colorlines98.tar.gz \
-#       --exclude='.venv' --exclude='data' --exclude='alphatrain/data' \
-#       --exclude='*.tar.gz' --exclude='__pycache__' --exclude='.git' \
-#       -C /Users/andreis/local/source colorlines98
-#   gcloud compute scp /tmp/colorlines98.tar.gz coloreval98:~ --zone=us-central1-b
-#   gcloud compute scp alphatrain/data/alphatrain_td_best.pt coloreval98:~/model.pt --zone=us-central1-b
+# Monitor:
+#   gcloud compute ssh <instance> -- tail -f ~/selfplay.log
 #
-#   # 3. SSH and run setup + selfplay
-#   gcloud compute ssh coloreval98 --zone=us-central1-b -- bash -s < scripts/gcp_selfplay.sh
-#
-#   # 4. Monitor
-#   gcloud compute ssh coloreval98 --zone=us-central1-b -- tail -f ~/selfplay.log
-#
-#   # 5. Download results
-#   gcloud compute scp --recurse coloreval98:~/selfplay_data/ data/selfplay/ --zone=us-central1-b
-#
-#   # 6. Stop instance
-#   gcloud compute instances stop coloreval98 --zone=us-central1-b
+# Download:
+#   gcloud compute scp --recurse <instance>:~/selfplay_v1/ data/selfplay_v1/
 
 set -euo pipefail
 
-GAMES=200
-SEED_START=300
-SIMS=800
-BS=8
-WORKERS=$(nproc)
-SAVE_DIR="$HOME/selfplay_data"
+cd ~
 
-echo "=== GCP Self-Play Setup ==="
-echo "vCPUs: $WORKERS"
-echo "Games: $GAMES (seeds $SEED_START-$((SEED_START + GAMES - 1)))"
-echo "Sims: $SIMS, batch_size: $BS"
+echo "=== Setup ==="
 
-cd "$HOME"
-
-# Install system dependencies
-echo "Installing system packages..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq python3 python3-venv python3-pip tar gzip > /dev/null
-
-# Extract code tarball
-if [ -f colorlines98.tar.gz ]; then
-    echo "Extracting code..."
-    tar xzf colorlines98.tar.gz
-else
-    echo "ERROR: ~/colorlines98.tar.gz not found. Upload it first."
-    exit 1
-fi
-
-cd colorlines98
-
-# Setup venv with CPU-only torch
+# Venv
 if [ ! -d .venv ]; then
-    echo "Creating venv..."
     python3 -m venv .venv
 fi
 source .venv/bin/activate
 
-echo "Installing Python dependencies (CPU-only torch)..."
+# Install CUDA torch + deps
 pip install -q --upgrade pip
-pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-pip install -q numpy numba scipy pytest
+pip install -q torch numpy numba scipy
 
-# Copy model
-if [ -f "$HOME/model.pt" ]; then
-    mkdir -p alphatrain/data
-    cp "$HOME/model.pt" alphatrain/data/alphatrain_td_best.pt
-    echo "Model copied."
-else
-    echo "ERROR: ~/model.pt not found. Upload it first."
-    exit 1
-fi
+# Extract code
+tar xzf colorlines_selfplay_train.tar.gz
 
-# Sanity test
-echo "Running tests..."
-python -m pytest alphatrain/tests/test_mcts.py -v --tb=short 2>&1 | tail -3
+# Model
+mkdir -p alphatrain/data
+cp pillar2k_surv_best.pt alphatrain/data/
 
-# Start self-play
-mkdir -p "$SAVE_DIR"
-SEED_END=$((SEED_START + GAMES))
+# Verify
+python3 -c "
+import torch
+print(f'PyTorch: {torch.__version__}')
+print(f'CUDA: {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'GPU: {torch.cuda.get_device_name(0)}')
+"
 
 echo ""
-echo "=== Starting Self-Play ==="
-echo "Output: ~/selfplay.log"
+echo "=== Starting self-play: seeds 10500-12000 (1500 games) ==="
+echo "=== 20 workers, 400 sims, batch 32, H100 CUDA ==="
+echo "=== Output: ~/selfplay.log ==="
 echo ""
 
-nohup python -m alphatrain.scripts.selfplay \
-    --model alphatrain/data/alphatrain_td_best.pt \
-    --seed-start "$SEED_START" \
-    --seed-end "$SEED_END" \
-    --sims "$SIMS" \
-    --batch-size "$BS" \
-    --device cpu \
-    --workers "$WORKERS" \
-    --save-dir "$SAVE_DIR" \
-    > "$HOME/selfplay.log" 2>&1 &
+mkdir -p selfplay_v1
 
-echo "Self-play started (PID: $!)"
+nohup python3 -m alphatrain.scripts.selfplay \
+    --model alphatrain/data/pillar2k_surv_best.pt \
+    --seed-start 10500 --seed-end 12000 \
+    --sims 400 --batch-size 32 \
+    --save-dir selfplay_v1 \
+    --workers 20 --device cuda \
+    --temperature-moves 15 \
+    > selfplay.log 2>&1 &
+
+echo "Started (PID: $!)"
 echo "Monitor: tail -f ~/selfplay.log"
-echo "Check: ls $SAVE_DIR/game_*.pt 2>/dev/null | wc -l"
+echo "Progress: ls ~/selfplay_v1/*.json 2>/dev/null | wc -l"
