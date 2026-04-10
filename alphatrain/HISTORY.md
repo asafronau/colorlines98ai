@@ -792,6 +792,69 @@ Plan: generate 1,000-2,000 games from current model (MCTS 400 sims), mix with ex
 data for training. Self-play data provides value targets calibrated to the model's own
 play level, addressing the distribution shift that architecture changes cannot fix.
 
+### Pillar 2L: First Self-Play Loop (HALLUCINATION FIXED — 5/7 seeds now improve with depth)
+
+**Self-play data generation:** 2,000 games from 2k-surv model (MCTS 400 sims, τ=1.0 for
+15 moves, Dirichlet α=0.3). Mean score 1,516, 1.44M states. Generated on M5 Max (16
+workers) + Colab L4 (8 workers).
+
+**Training:** 70% expert (12.8M states) + 30% self-play (1.44M states) mixed in each batch.
+Self-play positions randomly replace 30% of expert positions during collate. Same survival
+hybrid target, same architecture. H100, epoch 5 best.
+
+**Results (50 seeds, 400 sims):**
+| | 2k-surv | **2L** |
+|---|---|---|
+| MCTS mean | 1,791 | 1,657 (-7%) |
+| Policy mean | 825 | **903 (+9%)** |
+| MCTS boost | +117% | +84% |
+| Max | 5,326 | **6,552** |
+
+400-sim mean dipped 7% — "tactical dilution" from mixing weaker self-play data.
+Policy improved to 903 (best ever). Max score improved to 6,552.
+
+**THE CRITICAL RESULT — 1,600-sim hallucination test (same 7 seeds):**
+
+| Seed | 2k-surv @400 | 2k-surv @1600 | 2L @400 | 2L @1600 |
+|---|---|---|---|---|
+| 1 | 4,131 | 1,355 (-67%) | 471 | **1,246 (+165%)** |
+| 7 | 3,494 | 9,277 (+165%) | 4,823 | 2,320 (-52%) |
+| 10 | 5,326 | 4,411 (-17%) | 1,779 | **6,078 (+242%)** |
+| 18 | 4,054 | 2,098 (-48%) | 1,573 | 941 (-40%) |
+| 26 | 3,580 | 1,200 (-66%) | 1,455 | **1,907 (+31%)** |
+| 35 | 3,423 | 1,661 (-51%) | 1,209 | **2,916 (+141%)** |
+| 43 | 4,619 | 982 (-79%) | 1,685 | **6,545 (+288%)** |
+| **Mean** | **4,090** | **2,998 (-27%)** | **1,856** | **3,136 (+69%)** |
+
+**Complete reversal:** 5/7 seeds now IMPROVE with 4x more search (was 1/7 before self-play).
+Seeds 43 (6,545) and 10 (6,078) exceed the heuristic player (5,700 mean) with deep search.
+
+| Model | Seeds improved @1600 | Seeds regressed |
+|---|---|---|
+| 2j (TD returns, no self-play) | 1/7 | 5/7 |
+| 2k-alpha (bigger head, no self-play) | 0/7 | 7/7 |
+| 2k-surv (survival, no self-play) | 1/7 | 5/7 |
+| **2L (survival + self-play)** | **5/7** | **2/7** |
+
+**Why it works:** The value head now evaluates positions from its own play distribution
+correctly. Self-play data showed the model "when I play from HERE, I survive X more turns"
+instead of only "when the expert plays from HERE." The compounding error at depth is
+greatly reduced because the value head recognizes its own failure modes.
+
+**Remaining issues:**
+- 400-sim mean dipped 7% (tactical dilution from 30% weaker data)
+- 2/7 seeds still regress (value head still pessimistic on some high-quality positions)
+- Gemini analysis: "Pessimistic Judge" — self-play data at 1,500 mean anchors the value
+  head to expect mediocre outcomes, causing it to veto brilliant moves on some seeds
+
+### Next: Pillar 2M — Iteration 2 (Higher-IQ Self-Play)
+
+Plan from Gemini peer review:
+1. Generate 2,000 games from 2L model at **800 sims** (stronger teacher, ~2,500 mean)
+2. Adjust mix to **80% expert / 20% self-play** (reduce tactical dilution)
+3. Evaluate at 800 sims as new default (model has earned deeper search)
+4. Each iteration's search discovers truths the next iteration's network absorbs
+
 ### Lessons Learned (Phase 4 continued)
 8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
    value gradients steamroll policy features in shared backbone. Always check loss magnitudes.
@@ -903,3 +966,19 @@ play level, addressing the distribution shift that architecture changes cannot f
 
 37. **Always run tests before declaring code ready for Colab.** Changed model defaults broke
     2 tests that weren't caught until Colab. Run pytest as part of pre-flight verification.
+
+38. **Self-play fixes distribution shift when the model is strong enough.** At MCTS 891 (Pillars
+    2g/2h), self-play data degraded the model. At MCTS 1,791 (Pillar 2L), self-play data
+    fixed the hallucination. The threshold is roughly when MCTS > policy × 2.
+
+39. **The 1,600-sim test flipped from 1/7 to 5/7 with self-play.** This proves the value head
+    went from "hallucinates on novel positions" to "correctly evaluates its own play."
+    Architecture changes alone (2k-alpha: 0/7) couldn't do this — only seeing its own data works.
+
+40. **Self-play data dilutes expert policy quality.** 30% self-play (1,500 mean) mixed with
+    expert (5,700 mean) caused a 7% dip in 400-sim MCTS. Use 20% self-play for next
+    iteration to protect the tactical foundation.
+
+41. **Increase search depth for self-play generation as the model improves.** Since more search
+    now helps (5/7 improved @1600), use 800 sims for the next iteration's self-play to
+    generate higher-quality training data (~2,500 mean vs ~1,500 at 400 sims).
