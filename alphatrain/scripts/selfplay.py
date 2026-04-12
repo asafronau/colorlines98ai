@@ -44,18 +44,22 @@ def save_game_json(result, save_dir):
     seed = result['seed']
     score = result['score']
     path = os.path.join(save_dir, f'game_seed{seed}_score{score}.json')
+    data = {
+        'seed': seed,
+        'score': score,
+        'moves': result['moves'],
+    }
+    if result.get('capped', False):
+        data['capped'] = True
+        data['bootstrap_value'] = result['bootstrap_value']
     with open(path, 'w') as f:
-        json.dump({
-            'seed': seed,
-            'score': score,
-            'moves': result['moves'],
-        }, f)
+        json.dump(data, f)
     return path
 
 
 def play_selfplay_game(mcts, seed, temperature_moves=15,
                        dirichlet_alpha=0.3, dirichlet_weight=0.25,
-                       top_k_save=5):
+                       top_k_save=5, max_turns=0):
     """Play one self-play game, recording raw board data for JSON output.
 
     Saves in the same format as Rust expert games so build_expert_v2_tensor.py
@@ -68,9 +72,11 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         dirichlet_alpha: Dirichlet noise parameter
         dirichlet_weight: weight for noise at root
         top_k_save: number of top moves to save from visit counts
+        max_turns: cap game at this many turns (0=no cap).
+            Capped games get bootstrap_value instead of death.
 
     Returns:
-        dict with 'seed', 'score', 'moves' (list of per-turn dicts)
+        dict with 'seed', 'score', 'moves', 'capped', 'bootstrap_value'
     """
     game = ColorLinesGame(seed=seed)
     game.reset()
@@ -78,8 +84,12 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
     moves_data = []
     t0 = time.time()
     turn = 0
+    capped = False
 
     while not game.game_over:
+        if max_turns > 0 and turn >= max_turns:
+            capped = True
+            break
         temp = 1.0 if turn < temperature_moves else 0.0
 
         # Record board state BEFORE move
@@ -153,11 +163,18 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
 
     elapsed = time.time() - t0
 
+    # Bootstrap value for capped games: the model's estimate of V(final_board).
+    # With gamma=0.95, max V ≈ 25. A board that survived 5000 turns is "very healthy".
+    # Use 24.0 (96% of max) — accurate for any non-dying board.
+    bootstrap_value = 24.0 if capped else 0.0
+
     return {
         'seed': seed,
         'score': game.score,
         'turns': turn,
         'moves': moves_data,
+        'capped': capped,
+        'bootstrap_value': bootstrap_value,
         'time': elapsed,
     }
 
@@ -172,12 +189,9 @@ def _server_worker(slot_id, seed_queue, result_queue,
                    num_workers, max_batch,
                    request_queue, response_queue,
                    num_sims, batch_size, max_score,
-                   temperature_moves, dirichlet_alpha, dirichlet_weight):
-    """Persistent worker for GPU server mode self-play.
-
-    Pulls seeds from seed_queue, plays games using shared-memory GPU
-    inference, pushes results to result_queue. Exits on None sentinel.
-    """
+                   temperature_moves, dirichlet_alpha, dirichlet_weight,
+                   max_turns):
+    """Persistent worker for GPU server mode self-play."""
     torch.set_num_threads(1)
 
     from multiprocessing.shared_memory import SharedMemory
@@ -207,10 +221,12 @@ def _server_worker(slot_id, seed_queue, result_queue,
             mcts, seed,
             temperature_moves=temperature_moves,
             dirichlet_alpha=dirichlet_alpha,
-            dirichlet_weight=dirichlet_weight)
+            dirichlet_weight=dirichlet_weight,
+            max_turns=max_turns)
 
+        cap_str = " [CAPPED]" if result.get('capped') else ""
         print(f"  [w{slot_id}] seed={seed}: score={result['score']}, "
-              f"turns={result['turns']}, {result['time']:.0f}s", flush=True)
+              f"turns={result['turns']}{cap_str}, {result['time']:.0f}s", flush=True)
 
         result_queue.put(result)
 
@@ -222,7 +238,7 @@ def _server_worker(slot_id, seed_queue, result_queue,
 def _worker_play(args):
     """Worker function for CPU multiprocessing."""
     seed, model_path, device_str, num_sims, batch_size, \
-        temperature_moves, dirichlet_alpha, dirichlet_weight = args
+        temperature_moves, dirichlet_alpha, dirichlet_weight, max_turns = args
 
     _limit_threads()
     device = torch.device(device_str)
@@ -239,7 +255,8 @@ def _worker_play(args):
         mcts, seed,
         temperature_moves=temperature_moves,
         dirichlet_alpha=dirichlet_alpha,
-        dirichlet_weight=dirichlet_weight)
+        dirichlet_weight=dirichlet_weight,
+        max_turns=max_turns)
 
     print(f"  seed={seed}: score={result['score']}, "
           f"turns={result['turns']}, {result['time']:.0f}s", flush=True)
@@ -265,6 +282,9 @@ def main():
     p.add_argument('--temperature-moves', type=int, default=15)
     p.add_argument('--dirichlet-alpha', type=float, default=0.3)
     p.add_argument('--dirichlet-weight', type=float, default=0.25)
+    p.add_argument('--max-turns', type=int, default=0,
+                   help='Cap games at this many turns (0=no cap). '
+                        'Capped games use bootstrap value instead of death.')
     args = p.parse_args()
 
     if args.device:
@@ -333,7 +353,8 @@ def main():
                 mcts, seed,
                 temperature_moves=args.temperature_moves,
                 dirichlet_alpha=args.dirichlet_alpha,
-                dirichlet_weight=args.dirichlet_weight)
+                dirichlet_weight=args.dirichlet_weight,
+                max_turns=args.max_turns)
 
             save_game_json(result, args.save_dir)
 
@@ -352,7 +373,7 @@ def main():
         worker_args = [
             (seed, args.model, 'cpu', args.sims, args.batch_size,
              args.temperature_moves, args.dirichlet_alpha,
-             args.dirichlet_weight)
+             args.dirichlet_weight, args.max_turns)
             for seed in seeds
         ]
 
@@ -409,7 +430,7 @@ def main():
                       server.request_queue, server.response_queues[i],
                       args.sims, args.batch_size, max_score,
                       args.temperature_moves, args.dirichlet_alpha,
-                      args.dirichlet_weight))
+                      args.dirichlet_weight, args.max_turns))
             p.start()
             workers.append(p)
 
