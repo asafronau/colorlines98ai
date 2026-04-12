@@ -47,7 +47,7 @@ def score_to_twohot(score, max_score, num_bins):
 
 
 def compute_td_returns(moves, final_score, gamma=DEFAULT_GAMMA,
-                       survival_bonus=0.0):
+                       survival_bonus=0.0, bootstrap_value=0.0):
     """Compute discounted TD returns for each position.
 
     Reconstructs per-move rewards from board states (line clears at target),
@@ -94,9 +94,11 @@ def compute_td_returns(moves, final_score, gamma=DEFAULT_GAMMA,
         rewards = score_rewards
 
     # Step 4: compute discounted returns (backward pass)
+    # bootstrap_value > 0 for capped games (not natural death):
+    # V(T) = bootstrap instead of 0, so the model doesn't learn "fake death"
     T = len(rewards)
     returns = np.zeros(T, dtype=np.float64)
-    running = 0.0
+    running = float(bootstrap_value)
     for t in range(T - 1, -1, -1):
         running = rewards[t] + gamma * running
         returns[t] = running
@@ -165,8 +167,11 @@ def main():
         n_moves = len(game['moves'])
 
         # Compute TD returns for this game
+        # Capped games use bootstrap value instead of 0 at terminal state
+        bootstrap = float(game.get('bootstrap_value', 0.0))
         td_returns = compute_td_returns(game['moves'], game['score'], gamma=gamma,
-                                        survival_bonus=args.survival_bonus)
+                                        survival_bonus=args.survival_bonus,
+                                        bootstrap_value=bootstrap)
 
         for mi, move in enumerate(game['moves']):
             board = np.array(move['board'], dtype=np.int8)
