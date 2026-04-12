@@ -847,13 +847,52 @@ greatly reduced because the value head recognizes its own failure modes.
 - Gemini analysis: "Pessimistic Judge" — self-play data at 1,500 mean anchors the value
   head to expect mediocre outcomes, causing it to veto brilliant moves on some seeds
 
-### Next: Pillar 2M — Iteration 2 (Higher-IQ Self-Play)
+### Pillar 2M: Self-Play Iteration 2 (800-sim teacher, 80/20 mix)
 
-Plan from Gemini peer review:
-1. Generate 2,000 games from 2L model at **800 sims** (stronger teacher, ~2,500 mean)
-2. Adjust mix to **80% expert / 20% self-play** (reduce tactical dilution)
-3. Evaluate at 800 sims as new default (model has earned deeper search)
-4. Each iteration's search discovers truths the next iteration's network absorbs
+1,500 games at 800 sims from 2L model (mean 1,754). 80/20 expert/self-play.
+Epoch 2 best. MCTS@400=1,559, MCTS@1600=3,908 (6/7 improved). Best 1600-sim result.
+
+### Pillar 2N: Self-Play Iteration 3 (800-sim teacher, 80/20 mix, v3 data)
+
+1,760 games at 800 sims from 2M model (mean 1,818). 80/20 mix. Epoch 1 best.
+MCTS@400=1,683 (trend reversed upward), MCTS@1600=2,829 (5/7 improved, high variance).
+Attempted lr=3e-5 first — model barely learned, wasted run. Reverted to lr=1e-4.
+Also wasted a run when --resume silently skipped missing file (fixed: now errors).
+
+### Self-Play Plateau Discovery
+
+After 3 iterations, the self-play loop plateaued:
+- Self-play scores: v1=1,516 → v2=1,754 → v3=1,818 (+15% per iteration)
+- 1,600-sim eval: 3,136 → 3,908 → 2,829 (no clear upward trend)
+- Root cause (Gemini): student caught the teacher. Model scores 1,791 at 400 sims,
+  self-play teacher scores 1,818 at 800 sims. Only 1.5% search advantage → no gradient.
+
+### Pillar 2P: Strategic Escalation (1,600-sim teacher, 60/40 mix, IN PROGRESS)
+
+Scaled search to 1,600 sims. 965 games completed so far (mean 2,528, +39% over v3).
+- 11.1% of games exceed heuristic level (5,700)
+- Best game: 16,623 (7,740 turns)
+- Score/turn nearly constant across all tiers (2.0-2.2) — confirms game is about SURVIVAL
+
+### Expert vs Self-Play Quality Analysis
+
+Compared 500 expert heuristic games vs 965 NN self-play games:
+
+| Metric | Expert | NN Self-Play |
+|---|---|---|
+| Score/turn | 2.14 | 2.07 |
+| Mean survival | 2,430 turns | 1,190 turns |
+| CV (luck sensitivity) | 0.92 | 0.91 |
+| Lucky/unlucky ratio | 9.9x | 8.9x |
+
+**Key finding:** Both players score at nearly the same rate (2.14 vs 2.07). The ONLY
+difference is survival time. Both are equally luck-dependent (CV≈0.92). The expert
+data teaches nothing the NN hasn't already learned — scoring efficiency is matched.
+Expert survival comes from brute-force 200-rollout search, not learnable strategy.
+
+**Conclusion:** Expert data is dead weight. The NN needs to learn survival from its own
+experience (self-play), not from imitating a heuristic that "survives" via brute-force.
+Plan: drop expert data entirely after Pillar 2P.
 
 ### Lessons Learned (Phase 4 continued)
 8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
@@ -982,3 +1021,23 @@ Plan from Gemini peer review:
 41. **Increase search depth for self-play generation as the model improves.** Since more search
     now helps (5/7 improved @1600), use 800 sims for the next iteration's self-play to
     generate higher-quality training data (~2,500 mean vs ~1,500 at 400 sims).
+
+42. **The self-play loop plateaus when student ≈ teacher.** Model at 1,791 vs teacher at 1,818
+    = only 1.5% search advantage. No learning gradient. Fix: increase teacher sims (800→1600)
+    to restore the search advantage gap.
+
+43. **Expert data becomes dead weight once scoring efficiency is matched.** Expert scores
+    2.14 pts/turn, NN scores 2.07 — nearly identical. The expert's advantage (2x survival)
+    comes from brute-force rollout search, not learnable patterns. Self-play is the only
+    path to learning survival.
+
+44. **Color Lines is 100% a survival game.** Score/turn is constant at ~2.1 across all skill
+    levels (500-point games to 16,000-point games). The ONLY difference between good and bad
+    games is how long you survive. This validates the survival hybrid value target.
+
+45. **--resume must error on missing file.** Silent skip caused an entire H100 training run
+    to start from scratch (random init). Always fail loud on missing inputs.
+
+46. **Lower learning rate doesn't fix epoch saturation.** lr=3e-5 made the model learn nothing
+    in 2 epochs (pol barely moved). The saturation comes from stale data (12.8M expert states
+    seen every iteration), not from learning too fast. Fix: more fresh data, not slower learning.
