@@ -292,6 +292,12 @@ def main():
     start_epoch = 0
     best_val = float('inf')
 
+    if args.resume and not os.path.exists(args.resume):
+        raise FileNotFoundError(
+            f"--resume file not found: {args.resume}\n"
+            f"  Training would start from scratch — refusing to continue.\n"
+            f"  Check the path or remove --resume to train from scratch intentionally.")
+
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         state = ckpt['model']
