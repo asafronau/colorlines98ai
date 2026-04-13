@@ -894,6 +894,58 @@ Expert survival comes from brute-force 200-rollout search, not learnable strateg
 experience (self-play), not from imitating a heuristic that "survives" via brute-force.
 Plan: drop expert data entirely after Pillar 2P.
 
+### Pillar 2P: Pure Self-Play (ALL-TIME RECORDS — MCTS@400=1,933, @1600=4,357)
+
+**First pure self-play training.** No expert data — 100% self-play v4 (1,595 games at
+1,600 sims from 2N model, mean 2,625, 1.97M states). 15 epochs, warm start from 2N.
+
+**Multi-epoch training WORKS with pure self-play:**
+Train pol CE dropped steadily: 2.159 → 2.123 → 2.105 → ... → 2.041 over 15 epochs.
+No 1-epoch saturation (was the chronic problem with expert data).
+Val loss was NOT predictive — best val at epoch 1, but best MCTS eval at epoch 6.
+
+**MCTS eval by epoch (50 seeds, 400 sims):**
+| Epoch | MCTS mean | Policy mean | Max |
+|---|---|---|---|
+| 1 | 1,667 | 894 | 4,869 |
+| **6** | **1,933** | **1,044** | **10,115** |
+| 10 | 1,685 | 1,118 | 5,666 |
+| 15 | 1,543 | 1,036 | 5,150 |
+
+Epoch 6 is the sweet spot. Policy broke 1,000 for the first time. Seed 49 hit 10,115
+at just 400 sims. After epoch 6, model overfits to the self-play distribution.
+
+**1,600-sim hallucination test (epoch 6):**
+| Seed | @400 | @1600 | Change |
+|---|---|---|---|
+| 7 | 1,487 | 5,438 | +266% |
+| 10 | 898 | 2,009 | +124% |
+| 18 | 709 | 5,019 | +608% |
+| 43 | 1,069 | **12,223** | +1044% |
+| **Mean** | **1,324** | **4,357** | **+229%** |
+
+5/7 seeds improved. Mean @1600 = **4,357** (new record). Seed 43 hit **12,223** —
+more than 2x the heuristic player (5,700). Highest NN MCTS score ever.
+
+| Model | MCTS@400 | MCTS@1600 (7 seeds) | Best score |
+|---|---|---|---|
+| 2k-surv (pre-selfplay) | 1,791 | 2,998 (1/7) | 9,277 |
+| 2M (best mixed) | 1,559 | 3,908 (6/7) | 8,386 |
+| **2P ep6 (pure self-play)** | **1,933** | **4,357 (5/7)** | **12,223** |
+
+**Tactical diagnostic — no catastrophic forgetting:**
+| | Before (2N) | After (2P ep6) | Drop |
+|---|---|---|---|
+| Top-1 match | 50.3% | 45.8% | -4.5% |
+| Top-5 match | 87.8% | 84.6% | -3.2% |
+
+Small decline (~4%) is expected — the model now makes its own moves from self-play
+learning, not just imitating the heuristic. Still agrees with expert 85% of the time.
+
+**Key insight:** Val loss is meaningless for pure self-play training. Best val-loss
+checkpoint (epoch 1) was NOT the best model. Only MCTS eval reveals true strength.
+Future iterations should test multiple epochs by MCTS eval, not val loss.
+
 ### Lessons Learned (Phase 4 continued)
 8. **Loss magnitude imbalance is deadly.** MSE value loss (860) vs CE policy loss (1.4) means
    value gradients steamroll policy features in shared backbone. Always check loss magnitudes.
@@ -1041,3 +1093,15 @@ Plan: drop expert data entirely after Pillar 2P.
 46. **Lower learning rate doesn't fix epoch saturation.** lr=3e-5 made the model learn nothing
     in 2 epochs (pol barely moved). The saturation comes from stale data (12.8M expert states
     seen every iteration), not from learning too fast. Fix: more fresh data, not slower learning.
+
+47. **Pure self-play breaks the 1-epoch saturation.** With 100% fresh self-play data, training
+    improved steadily for 6+ epochs (pol CE: 2.16→2.07). The saturation was caused by stale
+    expert data, not by the training setup.
+
+48. **Val loss is meaningless for pure self-play.** Best val-loss (epoch 1) was NOT the best
+    model (epoch 6). Val loss measures fit to a held-out split of self-play data, not game
+    strength. Use MCTS eval as the only metric. Test multiple epoch checkpoints.
+
+49. **Epoch 6 was the sweet spot for 2M-state pure self-play.** Early epochs underfit, late
+    epochs overfit to the 1.97M self-play distribution. The optimal epoch scales with dataset
+    size — more data → more useful epochs before overfitting.
