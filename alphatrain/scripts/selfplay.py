@@ -163,10 +163,13 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
 
     elapsed = time.time() - t0
 
-    # Bootstrap value for capped games: the model's estimate of V(final_board).
-    # With gamma=0.95, max V ≈ 25. A board that survived 5000 turns is "very healthy".
-    # Use 24.0 (96% of max) — accurate for any non-dying board.
-    bootstrap_value = 24.0 if capped else 0.0
+    # Bootstrap value for capped games: use the model's own value prediction
+    # of the final board instead of 0 (death). This teaches the model that
+    # turn 5000 boards are "still alive" with varying health levels.
+    bootstrap_value = 0.0
+    if capped:
+        _, bootstrap_value = mcts._nn_evaluate_single(game)
+        bootstrap_value = float(bootstrap_value)
 
     return {
         'seed': seed,
