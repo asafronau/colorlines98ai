@@ -1105,3 +1105,59 @@ Future iterations should test multiple epochs by MCTS eval, not val loss.
 49. **Epoch 6 was the sweet spot for 2M-state pure self-play.** Early epochs underfit, late
     epochs overfit to the 1.97M self-play distribution. The optimal epoch scales with dataset
     size — more data → more useful epochs before overfitting.
+
+### Pillar 2Q: Escape Velocity Attempts (VALUE BLOB PARADOX DISCOVERED)
+
+**Attempt 1 (v4+v5 combined):** Mixed v4 (1.97M stale states from 2N) with v5 (2.38M
+fresh states from 2P). Peaked at epoch 4 MCTS@400=1,801 — below 2P's 1,933.
+Diagnosis: v4 data was stale (already trained on in 2P). 45% of batches had zero
+learning gradient. Same failure mode as expert data staleness.
+
+**Attempt 2 (pure v5):** Trained on 4.68M pure v5 states (1,953 games, mean 5,117).
+Policy improved to 1,244 (+19%) but MCTS@400 declined from 1,933 to 1,871.
+MCTS boost collapsed: +85% (2P) → +59% (ep3) → +39% (ep6).
+
+**1,600-sim test (2Q ep3):** Mean 3,347 (7 seeds). Seed 26 hit 10,720. The model IS
+learning but needs deeper search to show it. Not a total failure — but not the jump
+we expected from 5,117-mean data.
+
+**Root cause: The Value Blob Paradox.**
+With γ=0.95 and games averaging 2,397 turns, **97.4% of v5 positions have V > 23**
+(the blob). Only 1.3% have V < 20 (meaningful endgame signal). Only 4.2% are in the
+last 100 turns (vs 8.1% for v4's weaker games).
+
+The better the model plays → longer games → fewer death examples → less value contrast.
+The value head STARVES for training signal as the model improves. In a typical batch:
+- 70% non-endgame: V ≈ 24.3 ± 0.6 (zero gradient)
+- 30% endgame oversampled: V ≈ 19.9 ± 5.9 (the only useful signal)
+
+**The fundamental paradox:** Improving play quality HURTS value training quality.
+The policy keeps improving (learns from 1,600-sim search targets regardless of value
+distribution), but the value head degrades (no contrast in the survival target).
+
+**Fix plan for 2Q-v3:**
+1. γ=0.98 (half-life 34 turns): expands useful zone from 100→300 turns, pushes
+   saturation to V≈62.5. Positions 100-200 turns from death become distinguishable.
+2. Endgame oversampling 50% (from 30%): if 70% of batch has zero gradient, give more
+   to the endgame pool.
+3. rank_weight=2.0 (from 1.0): stronger mid-game ranking signal since categorical CE
+   can't discriminate within the blob.
+4. Same v5 data, just re-encoded with new gamma. No new generation needed.
+
+50. **ALWAYS sanity-check data distribution before training.** The v5 blob (97.4% of data
+    at V≈24.3) should have been caught before wasting H100 compute. Check value target
+    histograms, endgame fractions, and contrast metrics before every training run.
+
+51. **Stale data from previous iterations provides zero gradient.** v4 data in 2Q-attempt-1
+    was already learned in 2P. Mixing old+new self-play has the same failure mode as
+    mixing expert+self-play. Use ONLY the latest generation's data.
+
+52. **The Value Blob Paradox: better play → worse value training.** With γ=0.95, stronger
+    models produce longer games with fewer deaths. 97.4% of positions compress to V≈24.3.
+    The value head can't learn mid-game discrimination. Fix: raise γ (wider horizon),
+    increase endgame oversampling, strengthen ranking loss.
+
+53. **γ must scale with game length.** γ=0.95 was perfect when games lasted 700 turns
+    (v1, 2,625 mean). At 2,400 turns (v5, 5,117 mean), it compresses everything.
+    γ=0.98 (half-life 34 turns) matches the longer horizon. As games get even longer,
+    γ may need to increase further.
