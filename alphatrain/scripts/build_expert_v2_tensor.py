@@ -47,23 +47,26 @@ def score_to_twohot(score, max_score, num_bins):
 
 
 def compute_td_returns(moves, final_score, gamma=DEFAULT_GAMMA,
-                       survival_bonus=0.0, bootstrap_value=0.0):
+                       survival_bonus=0.0, bootstrap_value=0.0,
+                       density_reward=False):
     """Compute discounted TD returns for each position.
 
     Reconstructs per-move rewards from board states (line clears at target),
     then computes discounted returns: V(t) = sum_{k=0}^{T-t} gamma^k * reward(t+k).
 
-    If survival_bonus > 0, each turn gets a base reward of survival_bonus
-    plus score_delta / C, where C = 1/survival_bonus. This creates a hybrid
-    "survival + scoring" signal: r(t) = survival_bonus + score_delta / C.
-    With survival_bonus=1.0 and C=10: r(t) = 1.0 + points/10.
+    If survival_bonus > 0:
+        r(t) = survival_bonus + score_delta / 10 [+ empty_squares / 81 if density_reward]
+    The density reward adds board occupancy to each turn's reward, providing
+    continuous gradient signal that breaks the "value blob" for long games.
     """
     from game.board import _find_lines_at, calculate_score as calc_score
 
-    # Step 1: compute per-move score rewards from board snapshots
+    # Step 1: compute per-move score rewards and board density
     score_rewards = []
+    empty_fractions = []
     for m in moves:
         board = np.array(m['board'], dtype=np.int8)
+        empty_fractions.append(np.sum(board == 0) / 81.0)
         mv = m['chosen_move']
         sr, sc, tr, tc = mv['sr'], mv['sc'], mv['tr'], mv['tc']
         color = board[sr, sc]
@@ -85,12 +88,15 @@ def compute_td_returns(moves, final_score, gamma=DEFAULT_GAMMA,
 
     # Step 3: build per-turn rewards
     if survival_bonus > 0:
-        # Hybrid: survival base + scoring bonus
-        # r(t) = survival_bonus + score_delta / C, where C = 10 / survival_bonus
         C = 10.0
-        rewards = [survival_bonus + s / C for s in score_rewards]
+        if density_reward:
+            # r(t) = 1.0 + empty/81 + score/10
+            rewards = [survival_bonus + empty_fractions[i] + score_rewards[i] / C
+                       for i in range(len(score_rewards))]
+        else:
+            # r(t) = 1.0 + score/10
+            rewards = [survival_bonus + s / C for s in score_rewards]
     else:
-        # Pure score-based TD returns (original behavior)
         rewards = score_rewards
 
     # Step 4: compute discounted returns (backward pass)
@@ -126,6 +132,8 @@ def main():
                         help='Max score for two-hot encoding (default: auto from data)')
     parser.add_argument('--survival-bonus', type=float, default=0.0,
                         help='Per-turn survival reward (0=pure score, 1.0=hybrid survival+score/10)')
+    parser.add_argument('--density-reward', action='store_true',
+                        help='Add empty_squares/81 to per-turn reward (breaks value blob)')
     parser.add_argument('--num-bins', type=int, default=NUM_VALUE_BINS,
                         help='Number of categorical value bins (default 64)')
     args = parser.parse_args()
@@ -171,7 +179,8 @@ def main():
         bootstrap = float(game.get('bootstrap_value', 0.0))
         td_returns = compute_td_returns(game['moves'], game['score'], gamma=gamma,
                                         survival_bonus=args.survival_bonus,
-                                        bootstrap_value=bootstrap)
+                                        bootstrap_value=bootstrap,
+                                        density_reward=args.density_reward)
 
         for mi, move in enumerate(game['moves']):
             board = np.array(move['board'], dtype=np.int8)
