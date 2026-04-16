@@ -25,13 +25,15 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
                 num_value_bins=64, scaler=None, pairwise=False,
                 scalar_value=False, selfplay=False, val_weight=1.0,
                 rank_weight=1.0, anchor_weight=0.0, rank_subsample=1.0,
-                log_interval=100):
+                rank_margin_target=5.0, log_interval=100):
     model.train()
     total_loss = 0
     total_pol = 0
     total_val = 0
     total_rank = 0
     total_anchor = 0
+    total_rank_gap = 0  # track v_good - v_bad
+    total_rank_violations = 0  # track fraction of pairs violating margin
     n = 0
     t0 = time.time()
     use_amp = scaler is not None
@@ -92,9 +94,13 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
                 v_good = model.predict_value(good_val, max_val=max_score)
                 v_bad = model.predict_value(bad_val, max_val=max_score)
                 # Ranking: V(good) must exceed V(bad) by scaled margin
-                margin_scaled = margin * (5.0 / (margin.mean() + 1e-8))
-                rank_loss = F.relu(margin_scaled - (v_good - v_bad)).mean()
+                margin_scaled = margin * (rank_margin_target / (margin.mean() + 1e-8))
+                v_diff = v_good - v_bad
+                rank_loss = F.relu(margin_scaled - v_diff).mean()
                 loss = loss + rank_weight * rank_loss
+                # Diagnostic tracking
+                total_rank_gap += v_diff.mean().item()
+                total_rank_violations += (v_diff < margin_scaled).float().mean().item()
 
         optimizer.zero_grad(set_to_none=True)
         if use_amp:
@@ -121,11 +127,14 @@ def train_epoch(model, loader, optimizer, device, max_score=500.0,
             sps = (bi + 1) * loader.batch_size / elapsed
             eta = (len(loader) - bi - 1) * loader.batch_size / max(sps, 1)
             rank_str = f" rank={total_rank/n:.4f}" if pairwise else ""
+            rank_diag = (f" [gap={total_rank_gap/n:.1f} "
+                         f"viol={100*total_rank_violations/n:.0f}%]"
+                         if pairwise else "")
             anchor_str = f" anchor={total_anchor/n:.4f}" if anchor_weight > 0 else ""
             print(f"  [{bi+1}/{len(loader)}] "
                   f"loss={total_loss/n:.4f} "
                   f"(pol={total_pol/n:.4f} val={total_val/n:.4f}"
-                  f"{rank_str}{anchor_str}) "
+                  f"{rank_str}{anchor_str}){rank_diag} "
                   f"{sps:.0f} s/s ETA {eta/60:.0f}m", flush=True)
 
     return total_loss / n, total_pol / n, total_val / n
@@ -228,6 +237,8 @@ def main():
                    help='Fraction of batch to replace with self-play data (e.g., 0.3)')
     p.add_argument('--rank-subsample', type=float, default=1.0,
                    help='Fraction of batch to use for ranking loss (0.25 = 4x faster pairs)')
+    p.add_argument('--rank-margin-target', type=float, default=5.0,
+                   help='Target margin for ranking loss normalization (default 5.0)')
     args = p.parse_args()
 
     if torch.backends.mps.is_available():
@@ -390,7 +401,8 @@ def main():
                                   val_weight=args.val_weight,
                                   rank_weight=args.rank_weight,
                                   anchor_weight=args.anchor_weight,
-                                  rank_subsample=args.rank_subsample)
+                                  rank_subsample=args.rank_subsample,
+                                  rank_margin_target=args.rank_margin_target)
         vl, vp, vv, vm = validate(model, val_loader, device,
                                    max_score=max_score,
                                    num_value_bins=dataset.num_value_bins,

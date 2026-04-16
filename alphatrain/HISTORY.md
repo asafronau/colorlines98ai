@@ -1161,3 +1161,69 @@ distribution), but the value head degrades (no contrast in the survival target).
     (v1, 2,625 mean). At 2,400 turns (v5, 5,117 mean), it compresses everything.
     γ=0.98 (half-life 34 turns) matches the longer horizon. As games get even longer,
     γ may need to increase further.
+
+### Pillar 2R: Value Head SNR Crisis (DIAGNOSED)
+
+**Diagnosis: Value head has 0.03 SNR for move discrimination.**
+- Expert mid-game boards: V = 64.5 ± 13.3
+- Blunder boards (expert + 1 random move): V = 63.6 ± 13.7
+- Signal (gap): 0.4 points. Noise (std): 13.3. SNR = 0.03.
+- The value head CAN distinguish game stages (early=65, death=14) but CANNOT
+  distinguish good moves from bad moves on general boards.
+
+**Afterstate ranking was "dead" — trivially satisfied.**
+Adversarial ranking (top-1 vs random) had rank_loss=0.05. ~99% of pairs already
+satisfied the 5.0 margin. The model trivially distinguished "best move" from
+"random nonsense" with a 22-point gap. Zero gradient for fine-grained discrimination.
+
+**2R-v1 (hard ranking pairs): Confirmed afterstate gap ≠ board gap.**
+Switched to pre-computed top-1 vs top-5 MCTS pairs with margin_target=10.
+Gap immediately 22 points with only 25% violations. Gap stayed flat at 21.3 across
+4,000+ batches — the model already had afterstate discrimination from 2P training.
+Afterstate ranking doesn't transfer to board-level evaluation because MCTS evaluates
+leaf nodes (general boards post-spawn), not clean afterstates.
+
+**2R-v2 (val_weight=0.1): Give the value head a voice.**
+Root cause: val_weight=0.01 gave value CE only 1% of total gradient. The backbone
+had zero incentive to learn value-discriminating features. Increased to 0.1 (11% of
+gradient). Early results: MAE dropped 38→27 in 2 epochs, policy stable at 2.07.
+
+**Game autopsy: The 8-square cliff.**
+Analyzed worst V5 game (seed 50726: 62 points, 56 turns) vs good game (seed 50004:
+10,807 points, 5,000 turns). Heuristic tournament player scores 7,800+ on same seed.
+- Both games had identical temperature damage (12 random moves, 6 outside top-5)
+- Difference: good game cleared a line during temperature → 58 empty at turn 13 vs 50
+- 8 extra squares → 32% clear rate vs 20% → positive feedback loop vs death spiral
+- Model treats 50-empty and 58-empty as identical (0.03 SNR) — can't trigger recovery
+- Density reward encodes 50 vs 58 as ~4 bins (3.0 value points) — learnable with
+  sufficient val_weight
+
+**Self-play data stored log-visit-fractions, NOT Q-values.**
+top_scores in JSON = log(visit_count/total_visits), not MCTS Q-values. The build
+script recovers the visit distribution via softmax. Value predictions are not stored
+in the self-play data.
+
+54. **Value head SNR = 0.03 makes MCTS blind.** The value head predicts 64.5±13.3 for
+    all mid-game boards. With Q normalization, MCTS gets random value signals. Policy
+    prior drives all search decisions. The "MCTS boost" comes from policy refinement
+    through visit counts, not value guidance.
+
+55. **Afterstate ranking ≠ board-level discrimination.** The model separates top-1 vs
+    top-5 afterstates by 22 points (trivially easy) but general boards by only 0.4.
+    Afterstates differ in line potentials and connectivity; general boards (post-spawn)
+    have 3 random balls that destroy the clean afterstate signal.
+
+56. **Gradient starvation kills value learning.** val_weight=0.01 gave value CE only
+    1% of total loss. The backbone optimized 42x more for policy. The value head was
+    a passive observer that never shaped backbone features. Fix: val_weight=0.1.
+
+57. **8 empty squares compound into 10,000+ point difference.** In Color Lines, a
+    small early advantage (58 vs 50 empty at turn 13) cascades: more room → more lines
+    → more room → survival. The model can't see this because the value head treats both
+    as identical. The density reward encodes this as ~4 bins — learnable once the
+    backbone is forced to pay attention (val_weight=0.1).
+
+58. **Temperature exploration is NOT the cause of catastrophic games.** Good and bad
+    games have identical temperature damage (~12 random moves, ~6 outside top-5).
+    The difference is RNG-driven clear rate during temperature. Reduce to 5 moves
+    for next self-play to avoid unnecessary variance without losing exploration.
