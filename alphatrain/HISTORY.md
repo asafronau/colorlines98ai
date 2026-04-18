@@ -1276,36 +1276,44 @@ from a single forward pass.
 +85% policy performance. The val_weight increases across 2R→2S→2T were actively
 DESTROYING the policy while the value head never learned.
 
-59. **The shared backbone is a zero-sum game.** val_weight=0.01→0.1→1.0 progressively
+59. **Human domain expertise cracked the value head mystery.** The project owner's
+    insights — "danger is multi-colored clusters," "I never score below 1,000,"
+    "the game might be infinite for a perfect player" — directly led to: (a) the
+    tipping point analysis proving structural features matter more than density,
+    (b) diagnosing that val_weight increases destroyed policy (the regression from
+    1,244 to 943 was OUR fault), (c) the realization that Color Lines may not need
+    a value head at all, leading to the Pillar 2U breakthrough.
+
+61. **The shared backbone is a zero-sum game.** val_weight=0.01→0.1→1.0 progressively
     destroyed policy (1,244→954→943) while never improving value MAE. The backbone
     can serve policy OR value, not both. For Color Lines, policy wins.
 
-60. **Drop the value head for pure policy distillation.** val_weight=0, rank_weight=0.
+62. **Drop the value head for pure policy distillation.** val_weight=0, rank_weight=0.
     The policy improved from 954 to 1,763 (+85%). The backbone concentrated 100% on
     learning move selection, resulting in expert-level play (9,061 max) with no search.
 
-61. **Color Lines may not need a value head at all.** A perfect player survives
+63. **Color Lines may not need a value head at all.** A perfect player survives
     infinitely — the "value" of every healthy board is the same (∞). Value prediction
     is only useful in the endgame. The policy can learn survival tactics directly from
     the search distribution without needing an explicit value function.
 
-62. **The 400/1600 convergence ratio tracks value head quality.** Matched-seed comparison
+64. **The 400/1600 convergence ratio tracks value head quality.** Matched-seed comparison
     (89 seeds): 400-sim mean / 1600-sim mean = 0.34. Zero correlation (r=0.014) between
     scores at different sim counts — search depth dominates seed difficulty.
 
-63. **V6 self-play: temperature_moves=5 eliminated catastrophic games.** V5 had 11.2%
+65. **V6 self-play: temperature_moves=5 eliminated catastrophic games.** V5 had 11.2%
     under 1,000 (min 62). V6 has 6.3% under 1,000 (min 282). Mean improved 5,117→6,971
     (+36%). 39% of games hit the 5,000-turn cap.
 
-64. **The tipping point is at 41 empty squares.** Boards 50 turns before death look
+66. **The tipping point is at 41 empty squares.** Boards 50 turns before death look
     identical to healthy boards (43.3 vs 42.8 empty). The difference is structural:
     connectivity, partition risk, multi-color cluster density. A human sees this
     instantly; the density reward encodes the same score for both.
 
-65. **"Easy" positions have FEWER empty squares than "hard" positions.** Search entropy
+67. **"Easy" positions have FEWER empty squares than "hard" positions.** Search entropy
     analysis: uncertain decisions (top-1 < 30%) happen at mean 44.7 empty, while
     confident decisions (top-1 > 70%) happen at mean 39.1. Crowded boards have obvious
     forced moves; open boards have subtle strategic choices.
 
-66. **Skip pairwise collate when rank_weight=0.** Saves ~30% per batch by avoiding
+68. **Skip pairwise collate when rank_weight=0.** Saves ~30% per batch by avoiding
     pair observation building and extra forward pass when ranking loss is disabled.
