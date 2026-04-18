@@ -134,6 +134,11 @@ def main():
                         help='Per-turn survival reward (0=pure score, 1.0=hybrid survival+score/10)')
     parser.add_argument('--density-reward', action='store_true',
                         help='Add empty_squares/81 to per-turn reward (breaks value blob)')
+    parser.add_argument('--sqrt-turns', action='store_true',
+                        help='Use sqrt(remaining_turns) as value target instead of TD returns. '
+                             'Gives 485x stronger SNR for survival prediction.')
+    parser.add_argument('--sqrt-turns-bonus', type=int, default=2000,
+                        help='Estimated bonus turns beyond cap for capped games (default 2000)')
     parser.add_argument('--num-bins', type=int, default=NUM_VALUE_BINS,
                         help='Number of categorical value bins (default 64)')
     args = parser.parse_args()
@@ -174,13 +179,21 @@ def main():
         game = json.load(open(fpath))
         n_moves = len(game['moves'])
 
-        # Compute TD returns for this game
-        # Capped games use bootstrap value instead of 0 at terminal state
-        bootstrap = float(game.get('bootstrap_value', 0.0))
-        td_returns = compute_td_returns(game['moves'], game['score'], gamma=gamma,
-                                        survival_bonus=args.survival_bonus,
-                                        bootstrap_value=bootstrap,
-                                        density_reward=args.density_reward)
+        if args.sqrt_turns:
+            # sqrt(remaining_turns) value target — loud survival signal
+            is_capped = game.get('capped', False)
+            bonus = args.sqrt_turns_bonus if is_capped else 0
+            effective_length = n_moves + bonus
+            td_returns = np.array([np.sqrt(effective_length - t)
+                                   for t in range(n_moves)], dtype=np.float32)
+        else:
+            # Compute TD returns for this game
+            # Capped games use bootstrap value instead of 0 at terminal state
+            bootstrap = float(game.get('bootstrap_value', 0.0))
+            td_returns = compute_td_returns(game['moves'], game['score'], gamma=gamma,
+                                            survival_bonus=args.survival_bonus,
+                                            bootstrap_value=bootstrap,
+                                            density_reward=args.density_reward)
 
         for mi, move in enumerate(game['moves']):
             board = np.array(move['board'], dtype=np.int8)

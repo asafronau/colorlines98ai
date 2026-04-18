@@ -274,7 +274,7 @@ def main():
     train_set, val_set = random_split(dataset, [n_train, n_val],
                                        generator=torch.Generator().manual_seed(42))
 
-    pairwise = dataset.has_pairs
+    pairwise = dataset.has_pairs and args.rank_weight > 0
     collate_fn = dataset.collate_pairwise if pairwise else dataset.collate
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                               num_workers=0, collate_fn=collate_fn)

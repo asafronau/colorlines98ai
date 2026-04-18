@@ -1227,3 +1227,85 @@ in the self-play data.
     games have identical temperature damage (~12 random moves, ~6 outside top-5).
     The difference is RNG-driven clear rate during temperature. Reduce to 5 moves
     for next self-play to avoid unnecessary variance without losing exploration.
+
+### Pillar 2S-2T: The Value Head Plateau (PROVEN DEAD END)
+
+**2S (density TD, max_score=200):** MCTS@400 = 2,271 on CUDA. Better data (mean 6,971
+vs 5,117) gave NO improvement over 2R (2,389 on MPS). The "victory blob" persists:
+41% of capped games at V≈90, IQR=3.9 within capped games. max_score=200 removed
+ceiling clamp (0% clipped) but didn't fix the compression.
+
+**2T (sqrt(remaining_turns) value target):** The topology pivot. sqrt(turns) has
+IQR=29.1 (6.6x more contrast than density TD's 4.4). But MAE stuck at 20-22 for
+8 epochs despite val_weight=1.0. The value head cannot learn to predict remaining
+turns — the backbone can't extract structural features (connectivity, partitions)
+while serving the policy. MCTS@400 = 2,266 (ep3), collapsed to 1,449 (ep6).
+
+**Five value approaches, same result (~2,200 MCTS@400):**
+| Target | val_weight | MCTS@400 |
+| TD returns | 0.01 | ~2,100 |
+| Density TD | 0.1 | ~2,400 |
+| Density TD ms=200 | 0.1 | 2,271 |
+| sqrt(turns) | 0.1 | 1,830 |
+| sqrt(turns) | 1.0 | 2,266 |
+
+**Root cause: the shared backbone conflict.** The policy needs local features (line
+potential, path availability). The value head needs global features (connectivity,
+partition detection, cluster analysis). A single 10-block ResNet can't learn both.
+Every val_weight increase steals backbone capacity from policy.
+
+### Pillar 2U: Pure Policy Distillation (BREAKTHROUGH)
+
+**The fix: drop the value head entirely.** val_weight=0, rank_weight=0. All 13M
+parameters focused on one job: learn the 1,600-sim search distribution.
+
+Warm start from 2P ep6 (best policy checkpoint, 50.5% top-1 accuracy, before
+val_weight increases destroyed it). Trained on V6 data (1,654 games, mean 6,971).
+
+**Results — best standalone policy EVER:**
+| Epoch | Policy Mean | Policy Median | Max |
+| 3 | 1,394 | 1,036 | 3,719 |
+| 5 | 1,410 | 1,184 | 5,158 |
+| 8 | **1,763** | 1,176 | **9,061** |
+
+Previous best: 954 (CUDA), 1,244 (MPS). Epoch 8 is +85% over CUDA best.
+Five seeds scored 3,000+ with ZERO search. Seed 12 scored 9,061 — expert level
+from a single forward pass.
+
+**The backbone conflict was the entire problem.** Removing the value head unlocked
++85% policy performance. The val_weight increases across 2R→2S→2T were actively
+DESTROYING the policy while the value head never learned.
+
+59. **The shared backbone is a zero-sum game.** val_weight=0.01→0.1→1.0 progressively
+    destroyed policy (1,244→954→943) while never improving value MAE. The backbone
+    can serve policy OR value, not both. For Color Lines, policy wins.
+
+60. **Drop the value head for pure policy distillation.** val_weight=0, rank_weight=0.
+    The policy improved from 954 to 1,763 (+85%). The backbone concentrated 100% on
+    learning move selection, resulting in expert-level play (9,061 max) with no search.
+
+61. **Color Lines may not need a value head at all.** A perfect player survives
+    infinitely — the "value" of every healthy board is the same (∞). Value prediction
+    is only useful in the endgame. The policy can learn survival tactics directly from
+    the search distribution without needing an explicit value function.
+
+62. **The 400/1600 convergence ratio tracks value head quality.** Matched-seed comparison
+    (89 seeds): 400-sim mean / 1600-sim mean = 0.34. Zero correlation (r=0.014) between
+    scores at different sim counts — search depth dominates seed difficulty.
+
+63. **V6 self-play: temperature_moves=5 eliminated catastrophic games.** V5 had 11.2%
+    under 1,000 (min 62). V6 has 6.3% under 1,000 (min 282). Mean improved 5,117→6,971
+    (+36%). 39% of games hit the 5,000-turn cap.
+
+64. **The tipping point is at 41 empty squares.** Boards 50 turns before death look
+    identical to healthy boards (43.3 vs 42.8 empty). The difference is structural:
+    connectivity, partition risk, multi-color cluster density. A human sees this
+    instantly; the density reward encodes the same score for both.
+
+65. **"Easy" positions have FEWER empty squares than "hard" positions.** Search entropy
+    analysis: uncertain decisions (top-1 < 30%) happen at mean 44.7 empty, while
+    confident decisions (top-1 > 70%) happen at mean 39.1. Crowded boards have obvious
+    forced moves; open boards have subtle strategic choices.
+
+66. **Skip pairwise collate when rank_weight=0.** Saves ~30% per batch by avoiding
+    pair observation building and extra forward pass when ranking loss is disabled.
