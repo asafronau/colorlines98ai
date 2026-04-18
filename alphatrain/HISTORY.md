@@ -1317,3 +1317,34 @@ DESTROYING the policy while the value head never learned.
 
 68. **Skip pairwise collate when rank_weight=0.** Saves ~30% per batch by avoiding
     pair observation building and extra forward pass when ranking loss is disabled.
+
+### Pillar 2U MCTS Evaluation: THE BREAKTHROUGH
+
+**MCTS@400 (epoch 8, 50 seeds):** mean=**5,436**, median=3,940, max=**30,544**.
+This is **+139% over previous best** (2,271) and **95% of the heuristic** (5,700).
+Seed 48 scored 30,544 — first 30K+ score at 400 sims.
+
+**MCTS@1600 (epoch 3, 50 seeds):** mean=**8,552**, median=6,249, max=**30,330**.
+This is **+23% over previous** (6,971) and **150% of the heuristic** (5,700).
+Five seeds scored 20K+. Three seeds scored 25K+.
+
+**400/1600 convergence ratio improved from 0.32 to ~0.64** (2x improvement).
+Despite the value head being garbage (MAE=67), the stronger policy guides
+MCTS so effectively that search quality doubled.
+
+**The value head was HURTING search.** With a broken value head removed from the
+loss (val_weight=0), MCTS@400 jumped from 2,271 to 5,436. The previous value
+head actively misled search on ~24% of seeds. Now only 16% of seeds regress.
+
+69. **A strong policy compensates for a broken value head.** MCTS@400 with no value
+    learning (MAE=67) scored 5,436 — vs 2,271 with active value training. The policy
+    prior alone drives +208% MCTS boost through visit count refinement. The value
+    head was a net negative.
+
+70. **MCTS@400 nearly matches the heuristic tournament player.** 5,436 vs 5,700 (95%).
+    At 1,600 sims, the NN exceeds the heuristic by 50%. The AlphaZero approach works
+    — but only when the backbone is fully dedicated to policy.
+
+71. **30K+ scores are achievable.** Seed 48 scored 30,544 at 400 sims. Multiple seeds
+    exceeded 20K at 1,600 sims. The 15-20K target range is within reach. The game IS
+    "infinite" for a sufficiently strong player — some seeds survive 15,000+ turns.
