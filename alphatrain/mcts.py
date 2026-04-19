@@ -433,6 +433,8 @@ class MCTS:
                 num_sims = max(min(num_sims, 50), 1)
             elif max_prior > 0.7:
                 num_sims = max(min(num_sims, num_sims // 4), 50)
+        self._last_effective_sims = num_sims
+        self._last_max_prior = max(c.prior for c in root.children.values()) if root.children else 0.0
         sim_rng = self._sim_rng
         use_server = self.inference_client is not None
         if use_server:
