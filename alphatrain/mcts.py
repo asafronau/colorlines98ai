@@ -408,6 +408,10 @@ class MCTS:
         root.visit_count = 1
         root.value_sum = root_value
 
+        # Measure policy confidence BEFORE Dirichlet noise
+        # (Dirichlet reduces P_max by ~25%, masking true confidence)
+        raw_max_prior = max(c.prior for c in root.children.values()) if root.children else 0.0
+
         # Dirichlet noise at root for exploration
         if dirichlet_alpha > 0 and dirichlet_weight > 0:
             noise = self._sim_rng.dirichlet(
@@ -426,15 +430,15 @@ class MCTS:
         num_sims = self.num_simulations
 
         # Dynamic sims: reduce search for positions where policy is confident.
-        # High P_max → visit distribution is determined by prior, not search.
+        # Check raw prior (before Dirichlet) — reflects true policy confidence.
+        # With top_k=30 softmax, P_max typically ranges 0.05-0.70.
         if self.dynamic_sims and root.children:
-            max_prior = max(c.prior for c in root.children.values())
-            if max_prior > 0.9:
+            if raw_max_prior > 0.5:
                 num_sims = max(min(num_sims, 50), 1)
-            elif max_prior > 0.7:
+            elif raw_max_prior > 0.3:
                 num_sims = max(min(num_sims, num_sims // 4), 50)
         self._last_effective_sims = num_sims
-        self._last_max_prior = max(c.prior for c in root.children.values()) if root.children else 0.0
+        self._last_max_prior = raw_max_prior
         sim_rng = self._sim_rng
         use_server = self.inference_client is not None
         if use_server:
