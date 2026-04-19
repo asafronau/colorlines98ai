@@ -1348,3 +1348,48 @@ head actively misled search on ~24% of seeds. Now only 16% of seeds regress.
 71. **30K+ scores are achievable.** Seed 48 scored 30,544 at 400 sims. Multiple seeds
     exceeded 20K at 1,600 sims. The 15-20K target range is within reach. The game IS
     "infinite" for a sufficiently strong player — some seeds survive 15,000+ turns.
+
+### Dynamic Sims: Adaptive Search for Self-Play
+
+**The problem:** With 2U's strong policy (1,763 standalone), games last 3,000-5,000
+turns. At 800+ sims per move, a single game takes ~80 minutes. Generating 1,000
+games for training takes days.
+
+**The insight (from human player analysis + Gemini):** When the policy is confident
+(P_max > 0.5), the visit distribution from 50 sims is nearly identical to 1600 sims
+— the search just confirms what the policy already knows. Only when the policy is
+uncertain (P_max < 0.3) does deep search add information.
+
+**Implementation:** Check raw policy max prior (before Dirichlet noise) after root
+expansion. P_max > 0.5 → 50 sims. P_max > 0.3 → sims/4. P_max < 0.3 → full sims.
+
+**A/B test results (50 games each, same seeds 80000-80049):**
+| Setting          | Mean  | Median | Min | Max    | Time | Capped |
+|------------------|-------|--------|-----|--------|------|--------|
+| 400 static       | 4,308 | 3,315  | 466 | 10,840 | 53m  | 14%    |
+| 400 dynamic      | 4,018 | 3,158  | 248 | 10,865 | 21m  | 6%     |
+| 800 dynamic      | 6,232 | 6,306  | 427 | 10,910 | 63m  | 22%    |
+
+**Key finding:** 400 dynamic is 2.5x faster with only -7% score drop. 800 dynamic
+gives +45% score over 400 static in the same compute budget. Dynamic sims saves
+compute on "no-brainer" moves and spends it on the strategic crossroads.
+
+**V7 generation plan:** 1,000 games with 1200 dynamic sims (estimated mean ~7,500).
+100 existing games at 800 static + 900 new at 1200 dynamic. Same seeds dir, mixed
+sim counts are fine — policy visit distributions are valid regardless.
+
+72. **Dynamic sims: adapt search depth to policy confidence.** When P_max > 0.5,
+    50 sims produces the same visit distribution as full search. Saves 2.5x compute
+    on confident moves. The training targets remain consistent because the visit
+    distribution for confident positions is determined by the policy prior, not
+    the search depth.
+
+73. **Check policy confidence BEFORE Dirichlet noise.** Dirichlet (weight=0.25) +
+    30-way softmax caps P_max at ~0.6, making confidence thresholds unreachable.
+    Raw priors reflect true policy certainty.
+
+74. **Color Lines may be "infinite" for a perfect player.** Human insight: score is
+    purely a function of survival time (~2.1 pts/turn). A player that maintains
+    board connectivity indefinitely scores indefinitely. The value of every healthy
+    board is ∞ — only endgame boards have finite value. This is why the value head
+    failed: it tried to predict a number that doesn't meaningfully vary mid-game.
