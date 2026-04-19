@@ -86,6 +86,13 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
     turn = 0
     capped = False
 
+    # Dynamic sims tracking
+    ds_high = 0   # P_max > 0.9
+    ds_mid = 0    # 0.7 < P_max <= 0.9
+    ds_low = 0    # P_max <= 0.7
+    ds_total_sims = 0
+    ds_last_report = 0  # turn at last report
+
     while not game.game_over:
         if max_turns > 0 and turn >= max_turns:
             capped = True
@@ -115,6 +122,17 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
             break
 
         action, policy_target = result
+
+        # Track dynamic sims stats
+        if hasattr(mcts, '_last_max_prior'):
+            mp = mcts._last_max_prior
+            if mp > 0.9:
+                ds_high += 1
+            elif mp > 0.7:
+                ds_mid += 1
+            else:
+                ds_low += 1
+            ds_total_sims += mcts._last_effective_sims
 
         # Extract top-K moves from visit count distribution
         top_indices = np.argsort(policy_target)[::-1][:top_k_save]
@@ -158,8 +176,21 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         turn += 1
         if turn % 500 == 0:
             elapsed = time.time() - t0
-            print(f"    seed={seed} turn={turn} score={game.score} "
-                  f"{elapsed:.0f}s", flush=True)
+            ds_total = ds_high + ds_mid + ds_low
+            if ds_total > 0:
+                avg_sims = ds_total_sims / ds_total
+                # Stats since last report
+                ds_since = ds_total - ds_last_report
+                print(f"    seed={seed} turn={turn} score={game.score} "
+                      f"{elapsed:.0f}s | "
+                      f"P>.9:{100*ds_high/ds_total:.0f}% "
+                      f".7-.9:{100*ds_mid/ds_total:.0f}% "
+                      f"<.7:{100*ds_low/ds_total:.0f}% "
+                      f"avg_sims={avg_sims:.0f}", flush=True)
+                ds_last_report = ds_total
+            else:
+                print(f"    seed={seed} turn={turn} score={game.score} "
+                      f"{elapsed:.0f}s", flush=True)
 
     elapsed = time.time() - t0
 
@@ -171,6 +202,17 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         _, bootstrap_value = mcts._nn_evaluate_single(game)
         bootstrap_value = float(bootstrap_value)
 
+    # Dynamic sims summary
+    ds_total = ds_high + ds_mid + ds_low
+    ds_stats = None
+    if ds_total > 0:
+        ds_stats = {
+            'high_pct': 100 * ds_high / ds_total,
+            'mid_pct': 100 * ds_mid / ds_total,
+            'low_pct': 100 * ds_low / ds_total,
+            'avg_sims': ds_total_sims / ds_total,
+        }
+
     return {
         'seed': seed,
         'score': game.score,
@@ -179,6 +221,7 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         'capped': capped,
         'bootstrap_value': bootstrap_value,
         'time': elapsed,
+        'dynamic_sims_stats': ds_stats,
     }
 
 
@@ -228,8 +271,13 @@ def _server_worker(slot_id, seed_queue, result_queue,
             max_turns=max_turns)
 
         cap_str = " [CAPPED]" if result.get('capped') else ""
+        ds = result.get('dynamic_sims_stats')
+        ds_str = (f" | P>.9:{ds['high_pct']:.0f}% .7-.9:{ds['mid_pct']:.0f}% "
+                  f"<.7:{ds['low_pct']:.0f}% avg={ds['avg_sims']:.0f}sims"
+                  if ds else "")
         print(f"  [w{slot_id}] seed={seed}: score={result['score']}, "
-              f"turns={result['turns']}{cap_str}, {result['time']:.0f}s", flush=True)
+              f"turns={result['turns']}{cap_str}, {result['time']:.0f}s{ds_str}",
+              flush=True)
 
         result_queue.put(result)
 
@@ -262,8 +310,12 @@ def _worker_play(args):
         dirichlet_weight=dirichlet_weight,
         max_turns=max_turns)
 
+    ds = result.get('dynamic_sims_stats')
+    ds_str = (f" | P>.9:{ds['high_pct']:.0f}% .7-.9:{ds['mid_pct']:.0f}% "
+              f"<.7:{ds['low_pct']:.0f}% avg={ds['avg_sims']:.0f}sims"
+              if ds else "")
     print(f"  seed={seed}: score={result['score']}, "
-          f"turns={result['turns']}, {result['time']:.0f}s", flush=True)
+          f"turns={result['turns']}, {result['time']:.0f}s{ds_str}", flush=True)
     return result
 
 
@@ -370,9 +422,13 @@ def main():
             elapsed = time.time() - t0
             eta = elapsed / (i + 1) * (n_games - i - 1)
 
+            ds = result.get('dynamic_sims_stats')
+            ds_str = (f" | P>.9:{ds['high_pct']:.0f}% .7-.9:{ds['mid_pct']:.0f}% "
+                      f"<.7:{ds['low_pct']:.0f}% avg={ds['avg_sims']:.0f}sims"
+                      if ds else "")
             print(f"  [{i+1}/{n_games}] seed={seed}: score={result['score']}, "
                   f"turns={result['turns']}, {result['time']:.0f}s "
-                  f"(ETA {eta/60:.0f}m)", flush=True)
+                  f"(ETA {eta/60:.0f}m){ds_str}", flush=True)
     elif device_str == 'cpu':
         # CPU multiprocessing — env vars already set at module top
         _limit_threads()
