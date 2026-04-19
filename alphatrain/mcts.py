@@ -434,9 +434,9 @@ class MCTS:
         # With top_k=30 softmax, P_max typically ranges 0.05-0.70.
         if self.dynamic_sims and root.children:
             if raw_max_prior > 0.5:
-                num_sims = max(min(num_sims, 50), 1)
+                num_sims = max(50, num_sims // 10)
             elif raw_max_prior > 0.3:
-                num_sims = max(min(num_sims, num_sims // 4), 50)
+                num_sims = max(100, num_sims // 4)
         self._last_effective_sims = num_sims
         self._last_max_prior = raw_max_prior
         sim_rng = self._sim_rng
