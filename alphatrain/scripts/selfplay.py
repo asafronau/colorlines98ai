@@ -126,9 +126,9 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         # Track dynamic sims stats
         if hasattr(mcts, '_last_max_prior'):
             mp = mcts._last_max_prior
-            if mp > 0.9:
+            if mp > 0.5:
                 ds_high += 1
-            elif mp > 0.7:
+            elif mp > 0.3:
                 ds_mid += 1
             else:
                 ds_low += 1
@@ -183,9 +183,9 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
                 ds_since = ds_total - ds_last_report
                 print(f"    seed={seed} turn={turn} score={game.score} "
                       f"{elapsed:.0f}s | "
-                      f"P>.9:{100*ds_high/ds_total:.0f}% "
-                      f".7-.9:{100*ds_mid/ds_total:.0f}% "
-                      f"<.7:{100*ds_low/ds_total:.0f}% "
+                      f"P>.5:{100*ds_high/ds_total:.0f}% "
+                      f".3-.5:{100*ds_mid/ds_total:.0f}% "
+                      f"<.3:{100*ds_low/ds_total:.0f}% "
                       f"avg_sims={avg_sims:.0f}", flush=True)
                 ds_last_report = ds_total
             else:
@@ -311,8 +311,8 @@ def _worker_play(args):
         max_turns=max_turns)
 
     ds = result.get('dynamic_sims_stats')
-    ds_str = (f" | P>.9:{ds['high_pct']:.0f}% .7-.9:{ds['mid_pct']:.0f}% "
-              f"<.7:{ds['low_pct']:.0f}% avg={ds['avg_sims']:.0f}sims"
+    ds_str = (f" | P>.5:{ds['high_pct']:.0f}% .3-.5:{ds['mid_pct']:.0f}% "
+              f"<.3:{ds['low_pct']:.0f}% avg={ds['avg_sims']:.0f}sims"
               if ds else "")
     print(f"  seed={seed}: score={result['score']}, "
           f"turns={result['turns']}, {result['time']:.0f}s{ds_str}", flush=True)
