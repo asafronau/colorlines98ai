@@ -300,7 +300,7 @@ class MCTS:
 
     def __init__(self, net=None, device=None, max_score=30000.0,
                  num_simulations=400, c_puct=2.5, top_k=30, batch_size=16,
-                 inference_client=None):
+                 inference_client=None, dynamic_sims=False):
         self.net = net
         self.device = device
         self.max_score = max_score
@@ -309,6 +309,7 @@ class MCTS:
         self.top_k = top_k
         self.batch_size = batch_size
         self.inference_client = inference_client
+        self.dynamic_sims = dynamic_sims
         self._fp16 = False
         self._sim_rng = None  # SimpleRng, set per search
         # Pre-allocate obs buffer for server mode (reused across searches)
@@ -423,6 +424,15 @@ class MCTS:
         top_k = self.top_k
         batch_size = self.batch_size
         num_sims = self.num_simulations
+
+        # Dynamic sims: reduce search for positions where policy is confident.
+        # High P_max → visit distribution is determined by prior, not search.
+        if self.dynamic_sims and root.children:
+            max_prior = max(c.prior for c in root.children.values())
+            if max_prior > 0.9:
+                num_sims = max(min(num_sims, 50), 1)
+            elif max_prior > 0.7:
+                num_sims = max(min(num_sims, num_sims // 4), 50)
         sim_rng = self._sim_rng
         use_server = self.inference_client is not None
         if use_server:
