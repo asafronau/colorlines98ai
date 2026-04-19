@@ -193,7 +193,7 @@ def _server_worker(slot_id, seed_queue, result_queue,
                    request_queue, response_queue,
                    num_sims, batch_size, max_score,
                    temperature_moves, dirichlet_alpha, dirichlet_weight,
-                   max_turns):
+                   max_turns, dynamic_sims=False):
     """Persistent worker for GPU server mode self-play."""
     torch.set_num_threads(1)
 
@@ -213,7 +213,7 @@ def _server_worker(slot_id, seed_queue, result_queue,
                              request_queue, response_queue)
     mcts = MCTS(inference_client=client, max_score=max_score,
                 num_simulations=num_sims, batch_size=batch_size,
-                top_k=30, c_puct=2.5)
+                top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims)
 
     while True:
         seed = seed_queue.get()
@@ -241,7 +241,8 @@ def _server_worker(slot_id, seed_queue, result_queue,
 def _worker_play(args):
     """Worker function for CPU multiprocessing."""
     seed, model_path, device_str, num_sims, batch_size, \
-        temperature_moves, dirichlet_alpha, dirichlet_weight, max_turns = args
+        temperature_moves, dirichlet_alpha, dirichlet_weight, max_turns, \
+        dynamic_sims = args
 
     _limit_threads()
     device = torch.device(device_str)
@@ -252,7 +253,7 @@ def _worker_play(args):
 
     mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_sims, batch_size=batch_size,
-                top_k=30, c_puct=2.5)
+                top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims)
 
     result = play_selfplay_game(
         mcts, seed,
@@ -288,6 +289,9 @@ def main():
     p.add_argument('--max-turns', type=int, default=0,
                    help='Cap games at this many turns (0=no cap). '
                         'Capped games use bootstrap value instead of death.')
+    p.add_argument('--dynamic-sims', action='store_true',
+                   help='Reduce sims for confident moves (P_max>0.9: 50 sims, '
+                        'P_max>0.7: sims/4). Saves ~2-3x compute.')
     args = p.parse_args()
 
     if args.device:
@@ -349,7 +353,7 @@ def main():
                                         jit_trace=True)
         mcts = MCTS(net, torch.device(device_str), max_score=max_score,
                      num_simulations=args.sims, batch_size=args.batch_size,
-                     top_k=30, c_puct=2.5)
+                     top_k=30, c_puct=2.5, dynamic_sims=args.dynamic_sims)
 
         for i, seed in enumerate(seeds):
             result = play_selfplay_game(
@@ -376,7 +380,7 @@ def main():
         worker_args = [
             (seed, args.model, 'cpu', args.sims, args.batch_size,
              args.temperature_moves, args.dirichlet_alpha,
-             args.dirichlet_weight, args.max_turns)
+             args.dirichlet_weight, args.max_turns, args.dynamic_sims)
             for seed in seeds
         ]
 
@@ -433,7 +437,8 @@ def main():
                       server.request_queue, server.response_queues[i],
                       args.sims, args.batch_size, max_score,
                       args.temperature_moves, args.dirichlet_alpha,
-                      args.dirichlet_weight, args.max_turns))
+                      args.dirichlet_weight, args.max_turns,
+                      args.dynamic_sims))
             p.start()
             workers.append(p)
 
