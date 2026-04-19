@@ -372,7 +372,8 @@ class MCTS:
         return best_action, best_child
 
     def search(self, game, temperature=0.0, dirichlet_alpha=0.0,
-               dirichlet_weight=0.0, return_policy=False):
+               dirichlet_weight=0.0, return_policy=False,
+               force_full_search=False):
         """Run batched MCTS with virtual loss from current game state.
 
         Args:
@@ -432,7 +433,7 @@ class MCTS:
         # Dynamic sims: reduce search for positions where policy is confident.
         # Check raw prior (before Dirichlet) — reflects true policy confidence.
         # With top_k=30 softmax, P_max typically ranges 0.05-0.70.
-        if self.dynamic_sims and root.children:
+        if self.dynamic_sims and root.children and not force_full_search:
             if raw_max_prior > 0.5:
                 num_sims = max(50, num_sims // 10)
             elif raw_max_prior > 0.3:

@@ -59,7 +59,7 @@ def save_game_json(result, save_dir):
 
 def play_selfplay_game(mcts, seed, temperature_moves=15,
                        dirichlet_alpha=0.3, dirichlet_weight=0.25,
-                       top_k_save=5, max_turns=0):
+                       top_k_save=5, max_turns=0, static_turns=0):
     """Play one self-play game, recording raw board data for JSON output.
 
     Saves in the same format as Rust expert games so build_expert_v2_tensor.py
@@ -116,7 +116,8 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
             temperature=temp,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_weight=dirichlet_weight,
-            return_policy=True)
+            return_policy=True,
+            force_full_search=(static_turns > 0 and turn < static_turns))
 
         if result[0] is None:
             break
@@ -236,7 +237,7 @@ def _server_worker(slot_id, seed_queue, result_queue,
                    request_queue, response_queue,
                    num_sims, batch_size, max_score,
                    temperature_moves, dirichlet_alpha, dirichlet_weight,
-                   max_turns, dynamic_sims=False):
+                   max_turns, dynamic_sims=False, static_turns=0):
     """Persistent worker for GPU server mode self-play."""
     torch.set_num_threads(1)
 
@@ -268,7 +269,8 @@ def _server_worker(slot_id, seed_queue, result_queue,
             temperature_moves=temperature_moves,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_weight=dirichlet_weight,
-            max_turns=max_turns)
+            max_turns=max_turns,
+            static_turns=static_turns)
 
         cap_str = " [CAPPED]" if result.get('capped') else ""
         ds = result.get('dynamic_sims_stats')
@@ -290,7 +292,7 @@ def _worker_play(args):
     """Worker function for CPU multiprocessing."""
     seed, model_path, device_str, num_sims, batch_size, \
         temperature_moves, dirichlet_alpha, dirichlet_weight, max_turns, \
-        dynamic_sims = args
+        dynamic_sims, static_turns = args
 
     _limit_threads()
     device = torch.device(device_str)
@@ -308,7 +310,8 @@ def _worker_play(args):
         temperature_moves=temperature_moves,
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_weight=dirichlet_weight,
-        max_turns=max_turns)
+        max_turns=max_turns,
+        static_turns=static_turns)
 
     ds = result.get('dynamic_sims_stats')
     ds_str = (f" | P>.5:{ds['high_pct']:.0f}% .3-.5:{ds['mid_pct']:.0f}% "
@@ -342,8 +345,11 @@ def main():
                    help='Cap games at this many turns (0=no cap). '
                         'Capped games use bootstrap value instead of death.')
     p.add_argument('--dynamic-sims', action='store_true',
-                   help='Reduce sims for confident moves (P_max>0.9: 50 sims, '
-                        'P_max>0.7: sims/4). Saves ~2-3x compute.')
+                   help='Reduce sims for confident moves (P_max>0.5: sims/10, '
+                        'P_max>0.3: sims/4). Saves ~2-3x compute.')
+    p.add_argument('--static-turns', type=int, default=0,
+                   help='Force full sims for first N turns (overrides dynamic). '
+                        'Ensures maximum search quality in the critical opening.')
     args = p.parse_args()
 
     if args.device:
@@ -413,7 +419,8 @@ def main():
                 temperature_moves=args.temperature_moves,
                 dirichlet_alpha=args.dirichlet_alpha,
                 dirichlet_weight=args.dirichlet_weight,
-                max_turns=args.max_turns)
+                max_turns=args.max_turns,
+                static_turns=args.static_turns)
 
             save_game_json(result, args.save_dir)
 
@@ -436,7 +443,8 @@ def main():
         worker_args = [
             (seed, args.model, 'cpu', args.sims, args.batch_size,
              args.temperature_moves, args.dirichlet_alpha,
-             args.dirichlet_weight, args.max_turns, args.dynamic_sims)
+             args.dirichlet_weight, args.max_turns, args.dynamic_sims,
+             args.static_turns)
             for seed in seeds
         ]
 
@@ -494,7 +502,7 @@ def main():
                       args.sims, args.batch_size, max_score,
                       args.temperature_moves, args.dirichlet_alpha,
                       args.dirichlet_weight, args.max_turns,
-                      args.dynamic_sims))
+                      args.dynamic_sims, args.static_turns))
             p.start()
             workers.append(p)
 
