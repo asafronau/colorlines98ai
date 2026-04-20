@@ -1393,3 +1393,65 @@ sim counts are fine — policy visit distributions are valid regardless.
     board connectivity indefinitely scores indefinitely. The value of every healthy
     board is ∞ — only endgame boards have finite value. This is why the value head
     failed: it tried to predict a number that doesn't meaningfully vary mid-game.
+
+### Static vs Dynamic Sims: The Quality Gap
+
+**Static 1600 sims (2U ep8) vs V6 baseline (2R ep3, 1600 static):**
+| Metric | V6 (2R ep3) | V7 static 1600 (2U ep8) |
+| Median | 7,629 | **10,618** (+39%) |
+| Capped | 39% | **67%** |
+| <1000 | 6.3% | **2.7%** |
+| Min | 282 | **489** |
+
+**Dynamic sims produces inferior data.** V7 dynamic 2000 (avg ~870 effective sims)
+scored median 10,130 — close to static, but 4.6% games under 1000 vs 2.7% static.
+The "Confidence Trap": when the model is confidently wrong (P_max > 0.3), dynamic
+sims reduces to 100-500 sims, too shallow to correct the error. Static 1600 corrects
+every mistake. The floor jumped from 282→489 with static.
+
+75. **Dynamic sims is a Confidence Trap.** On "confident" moves (72% of turns), search
+    drops to 100-500 sims. If the model is confidently WRONG, the shallow search
+    confirms the error. Static 1600 sims corrects every mistake — floor improved from
+    min=282 to min=489, <1000 dropped from 6.3% to 2.7%.
+
+76. **Static search is non-negotiable for quality.** For production self-play, use full
+    static sims on every move. Solve the speed problem through smaller surrogate
+    models (5b×128ch = 4x faster inference), not through search shortcuts.
+
+### Crisis Mining (Human Insight: "solve actual difficult positions")
+
+**The idea (from project owner):** Use cheap policy-only play (0 sims) to instantly
+find positions where the model dies, then replay from those positions with 1600+
+sims to generate high-quality recovery training data.
+
+**The flow:**
+1. Policy plays instantly → dies at turn T (~1 second per game)
+2. Recovery: rewind to T-25, replay with 2000 sims → "emergency survival"
+3. Prevention: rewind to T-75, replay with 1600 sims → "avoid the crisis"
+
+**Why it matters:** Full static games are 90% cruise control (healthy boards the model
+already handles). Crisis mining concentrates compute on the 10% of positions where
+the model actually fails. Each crisis scenario costs ~450K evals vs 8M for a full
+game — 18x cheaper for the data that matters most.
+
+**Early results:** Seed 100000 policy died at turn 185 (318 pts). The rw75 replay
+at 400 sims was at turn 1000+ scoring 2,064 — the deep search SAVED the game from
+a board where the policy gave up.
+
+77. **Crisis mining: find failures with policy, solve with search.** Policy-only games
+    are instant (~1 second). Use them to probe thousands of seeds for crisis positions.
+    Then spend expensive search (1600+ sims) only on the boards where the model
+    actually needs help. 18x cheaper per crisis scenario than full static games.
+    Compatible with build_expert_v2_tensor.py for seamless training data.
+
+78. **The self-play loop plateaued on same-quality data.** 2V training on V7 dynamic
+    data showed zero progress (pol 1.854→1.846 in 4 epochs). The search didn't
+    disagree with the policy enough. Fix: static sims + crisis mining provides
+    positions where search finds genuinely different moves than the policy predicts.
+
+### Surrogate Model for Fast Self-Play (planned for V8)
+
+5b × 128ch model (2.9M params, 4x faster inference on MPS: 45K vs 11K evals/s).
+Trained on V6 data via pure policy distillation. Enables static 1600 sims at the
+speed of current dynamic. Training started but paused to focus on static 1600
+data generation for 2V.
