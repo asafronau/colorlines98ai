@@ -227,11 +227,11 @@ def main():
                    help='Rewind N turns before death for recovery replay')
     p.add_argument('--recovery-sims', type=int, default=2000,
                    help='Sims for recovery replay')
-    p.add_argument('--prevention-turns', type=int, default=75,
+    p.add_argument('--prevention-turns', type=int, default=50,
                    help='Rewind N turns before death for prevention replay')
     p.add_argument('--prevention-sims', type=int, default=1600,
                    help='Sims for prevention replay')
-    p.add_argument('--continue-turns', type=int, default=1000,
+    p.add_argument('--continue-turns', type=int, default=500,
                    help='Max turns to play from rewind point')
     p.add_argument('--max-turns', type=int, default=5000,
                    help='Max turns for policy-only probe game')
