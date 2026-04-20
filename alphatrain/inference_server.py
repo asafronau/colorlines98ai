@@ -341,7 +341,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
             total_gpu_batches += 1
 
         total_batches += len(pending)
-        if total_batches % 2000 == 0:
+        if total_batches % 10000 == 0:
             elapsed = time.time() - t_start
             avg_bs = total_evals / max(total_gpu_batches, 1)
             print(f"  [GPU] {total_evals} evals, {total_gpu_batches} fwd "
