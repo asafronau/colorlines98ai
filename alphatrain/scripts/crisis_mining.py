@@ -1,9 +1,7 @@
 """Crisis Mining: find hard positions with policy, solve with deep search.
 
-1. Play games with policy-only (0 sims) — dies fast, finds crisis positions
-2. Recovery: rewind N turns before death, replay with deep search
-3. Crisis prevention: rewind M turns before death, replay with deep search
-4. Save high-quality training data for the hard positions
+Phase 1: Play policy-only (0 sims) on all seeds — instant, finds crisis positions.
+Phase 2: Dispatch replay tasks to parallel GPU workers via InferenceServer.
 
 Usage:
     python -m alphatrain.scripts.crisis_mining \
@@ -12,7 +10,7 @@ Usage:
         --recovery-turns 25 --recovery-sims 2000 \
         --prevention-turns 75 --prevention-sims 1600 \
         --continue-turns 1000 \
-        --device mps --batch-size 64 \
+        --device mps --workers 16 --batch-size 64 \
         --save-dir data/crisis_v1
 """
 
@@ -155,6 +153,7 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
 
     return {
         'seed': replay_seed,
+        'original_seed': snapshot.get('original_seed', replay_seed),
         'score': game.score,
         'turns': snapshot['turn'] + turn,
         'replay_from_turn': snapshot['turn'],
@@ -164,6 +163,59 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
         'bootstrap_value': bootstrap_value,
         'time': time.time() - t0,
     }
+
+
+def _replay_worker(slot_id, task_queue, result_queue,
+                    obs_shm_name, pol_shm_name, val_shm_name,
+                    num_workers, max_batch,
+                    request_queue, response_queue,
+                    batch_size, max_score, continue_turns, max_turns):
+    """Persistent worker for GPU server mode replay."""
+    torch.set_num_threads(1)
+
+    from multiprocessing.shared_memory import SharedMemory
+    from alphatrain.inference_server import InferenceClient
+
+    N, B = num_workers, max_batch
+    obs_shm = SharedMemory(name=obs_shm_name)
+    pol_shm = SharedMemory(name=pol_shm_name)
+    val_shm = SharedMemory(name=val_shm_name)
+
+    obs_buf = np.ndarray((N, B, 18, 9, 9), dtype=np.float32, buffer=obs_shm.buf)
+    pol_buf = np.ndarray((N, B, 6561), dtype=np.float32, buffer=pol_shm.buf)
+    val_buf = np.ndarray((N, B), dtype=np.float32, buffer=val_shm.buf)
+
+    client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
+                             request_queue, response_queue)
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+
+        snapshot, replay_seed, num_sims, label = task
+
+        mcts = MCTS(inference_client=client, max_score=max_score,
+                    num_simulations=num_sims, batch_size=batch_size,
+                    top_k=30, c_puct=2.5)
+
+        result = replay_from_snapshot(
+            mcts, snapshot, replay_seed, num_sims,
+            continue_turns, max_turns)
+        result['label'] = label
+        result['original_seed'] = snapshot.get('original_seed', replay_seed)
+
+        cap = " [CAP]" if result.get('capped') else ""
+        survived = result['turns'] - result['replay_from_turn']
+        print(f"  [w{slot_id}] seed={result['original_seed']} {label}: "
+              f"{result['score']}pts ({survived}t, {result['time']:.0f}s){cap}",
+              flush=True)
+
+        result_queue.put(result)
+
+    obs_shm.close()
+    pol_shm.close()
+    val_shm.close()
 
 
 def main():
@@ -184,65 +236,63 @@ def main():
     p.add_argument('--max-turns', type=int, default=5000,
                    help='Max turns for policy-only probe game')
     p.add_argument('--device', default=None)
+    p.add_argument('--workers', type=int, default=1,
+                   help='Parallel workers (1=serial, >1=GPU server)')
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--save-dir', default='data/crisis_v1')
     args = p.parse_args()
 
     if args.device:
+        device_str = args.device
         device = torch.device(args.device)
     elif torch.backends.mps.is_available():
+        device_str = 'mps'
         device = torch.device('mps')
     elif torch.cuda.is_available():
+        device_str = 'cuda'
         device = torch.device('cuda')
     else:
+        device_str = 'cpu'
         device = torch.device('cpu')
 
-    print(f"Crisis Mining: seeds {args.seed_start}-{args.seed_end}", flush=True)
-    print(f"Recovery: rw{args.recovery_turns} @ {args.recovery_sims} sims", flush=True)
-    print(f"Prevention: rw{args.prevention_turns} @ {args.prevention_sims} sims", flush=True)
-    print(f"Continue: {args.continue_turns} turns | Device: {device}", flush=True)
+    n_seeds = args.seed_end - args.seed_start
+    print(f"Crisis Mining: {n_seeds} seeds ({args.seed_start}-{args.seed_end})",
+          flush=True)
+    print(f"Recovery: rw{args.recovery_turns} @ {args.recovery_sims} sims",
+          flush=True)
+    print(f"Prevention: rw{args.prevention_turns} @ {args.prevention_sims} sims",
+          flush=True)
+    print(f"Continue: {args.continue_turns} turns | Device: {device} | "
+          f"Workers: {args.workers}", flush=True)
 
     net, max_score = load_model(args.model, device,
-                                fp16=(str(device) != 'cpu'),
+                                fp16=(device_str != 'cpu'),
                                 jit_trace=True)
-
-    # Detect fp16
     fp16 = False
     try:
         fp16 = next(net.parameters()).dtype == torch.float16
     except (StopIteration, AttributeError):
         pass
 
-    mcts = MCTS(net, device, max_score=max_score,
-                num_simulations=args.recovery_sims,
-                batch_size=args.batch_size,
-                top_k=30, c_puct=2.5)
-
     os.makedirs(args.save_dir, exist_ok=True)
 
-    total_replays = 0
-    total_states = 0
-    skipped = 0
+    # ── Phase 1: Policy probes (serial, instant) ──
+    print(f"\n=== Phase 1: Policy probes ===", flush=True)
     t0 = time.time()
-    n_seeds = args.seed_end - args.seed_start
+    replay_tasks = []  # (snapshot, replay_seed, num_sims, label)
+    skipped = 0
+    died = 0
 
-    for si, seed in enumerate(range(args.seed_start, args.seed_end)):
-        # Step 1: Fast policy-only game
+    for seed in range(args.seed_start, args.seed_end):
         snapshots, pol_score, pol_turns = play_policy_only(
             net, device, seed, fp16=fp16, max_turns=args.max_turns)
 
         if pol_turns >= args.max_turns:
             skipped += 1
-            if skipped % 50 == 0:
-                print(f"  seed={seed}: policy SURVIVED (capped) — skipped "
-                      f"({skipped} total)", flush=True)
             continue
 
-        print(f"  seed={seed}: policy died turn {pol_turns} "
-              f"(score={pol_score}, empty={snapshots[-1]['empty']})",
-              end='', flush=True)
+        died += 1
 
-        # Step 2: Recovery replay (close to death)
         replays = [
             ('recovery', args.recovery_turns, args.recovery_sims),
             ('prevention', args.prevention_turns, args.prevention_sims),
@@ -253,22 +303,53 @@ def main():
             if rewind_idx >= len(snapshots):
                 continue
 
-            snapshot = snapshots[rewind_idx]
-            replay_seed = seed * 37 + rewind  # unique per rewind point
-
             # Skip if already exists
             pattern = f"game_seed{seed}_{label}_score"
-            existing = [f for f in os.listdir(args.save_dir) if f.startswith(pattern)]
+            existing = [f for f in os.listdir(args.save_dir)
+                        if f.startswith(pattern)]
             if existing:
                 continue
 
+            snapshot = snapshots[rewind_idx]
+            snapshot['original_seed'] = seed
+            replay_seed = seed * 37 + rewind
+            replay_tasks.append((snapshot, replay_seed, sims, label))
+
+        if (died + skipped) % 100 == 0:
+            print(f"  Probed {died + skipped}/{n_seeds}: "
+                  f"{died} died, {skipped} survived, "
+                  f"{len(replay_tasks)} replay tasks", flush=True)
+
+    probe_time = time.time() - t0
+    print(f"Phase 1 done: {died} died, {skipped} survived, "
+          f"{len(replay_tasks)} replay tasks ({probe_time:.0f}s)", flush=True)
+
+    if not replay_tasks:
+        print("No replay tasks — all seeds survived!", flush=True)
+        return
+
+    # ── Phase 2: Replays ──
+    print(f"\n=== Phase 2: {len(replay_tasks)} replays "
+          f"({args.workers} workers) ===", flush=True)
+    t1 = time.time()
+    total_replays = 0
+    total_states = 0
+
+    if args.workers <= 1:
+        # Serial mode
+        mcts = MCTS(net, device, max_score=max_score,
+                    num_simulations=args.recovery_sims,
+                    batch_size=args.batch_size,
+                    top_k=30, c_puct=2.5)
+
+        for ti, (snapshot, replay_seed, sims, label) in enumerate(replay_tasks):
             result = replay_from_snapshot(
                 mcts, snapshot, replay_seed, sims,
                 args.continue_turns, args.max_turns)
 
-            fname = f"game_seed{seed}_{label}_score{result['score']}.json"
-            path = os.path.join(args.save_dir, fname)
-            with open(path, 'w') as f:
+            orig_seed = snapshot.get('original_seed', replay_seed)
+            fname = f"game_seed{orig_seed}_{label}_score{result['score']}.json"
+            with open(os.path.join(args.save_dir, fname), 'w') as f:
                 json.dump(result, f)
 
             total_replays += 1
@@ -276,19 +357,71 @@ def main():
 
             cap = " [CAP]" if result.get('capped') else ""
             survived = result['turns'] - snapshot['turn']
-            print(f" | {label}: {result['score']}pts "
-                  f"({survived}t/{args.continue_turns}, "
-                  f"{result['time']:.0f}s){cap}", end='', flush=True)
+            elapsed = time.time() - t1
+            eta = elapsed / (ti + 1) * (len(replay_tasks) - ti - 1)
+            print(f"  [{ti+1}/{len(replay_tasks)}] seed={orig_seed} {label}: "
+                  f"{result['score']}pts ({survived}t, {result['time']:.0f}s)"
+                  f"{cap} ETA {eta/60:.0f}m", flush=True)
 
-        print(flush=True)
+    else:
+        # GPU server mode
+        from multiprocessing import Process, Queue as MPQueue
+        from alphatrain.inference_server import InferenceServer
 
-        if (si + 1) % 20 == 0:
-            elapsed = time.time() - t0
-            done = si + 1
-            eta = elapsed / done * (n_seeds - done)
-            print(f"  --- [{done}/{n_seeds}] {total_replays} replays, "
-                  f"{total_states:,} states, {skipped} skipped, "
-                  f"ETA {eta/60:.0f}m ---", flush=True)
+        ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
+        srv_max_score = float(ckpt.get('max_score', 30000.0))
+        del ckpt
+
+        server = InferenceServer(args.model, args.workers,
+                                 device=device_str,
+                                 max_batch_per_worker=args.batch_size)
+        server.start()
+
+        task_queue = MPQueue()
+        for task in replay_tasks:
+            task_queue.put(task)
+        for _ in range(args.workers):
+            task_queue.put(None)
+
+        result_queue = MPQueue()
+
+        workers = []
+        for i in range(args.workers):
+            p = Process(
+                target=_replay_worker,
+                args=(i, task_queue, result_queue,
+                      server._obs_shm.name, server._pol_shm.name,
+                      server._val_shm.name,
+                      args.workers, args.batch_size,
+                      server.request_queue, server.response_queues[i],
+                      args.batch_size, srv_max_score,
+                      args.continue_turns, args.max_turns))
+            p.start()
+            workers.append(p)
+
+        try:
+            for ti in range(len(replay_tasks)):
+                result = result_queue.get(timeout=7200)
+
+                orig_seed = result.get('original_seed', result['seed'])
+                label = result.get('label', 'replay')
+                fname = f"game_seed{orig_seed}_{label}_score{result['score']}.json"
+                with open(os.path.join(args.save_dir, fname), 'w') as f:
+                    json.dump(result, f)
+
+                total_replays += 1
+                total_states += len(result['moves'])
+
+                elapsed = time.time() - t1
+                eta = elapsed / (ti + 1) * (len(replay_tasks) - ti - 1)
+                if (ti + 1) % 10 == 0:
+                    print(f"  [{ti+1}/{len(replay_tasks)}] "
+                          f"{total_states:,} states, "
+                          f"ETA {eta/60:.0f}m", flush=True)
+        finally:
+            for p in workers:
+                p.join(timeout=5)
+            server.stop()
 
     elapsed = time.time() - t0
     print(f"\nDone: {total_replays} replays, {total_states:,} states, "
