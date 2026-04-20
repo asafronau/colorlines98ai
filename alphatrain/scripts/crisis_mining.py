@@ -20,6 +20,13 @@ import argparse
 import json
 import numpy as np
 import torch
+import torch.multiprocessing as mp
+
+# Use 'spawn' so CUDA can be used in main process (probes) AND workers
+try:
+    mp.set_start_method('spawn')
+except RuntimeError:
+    pass  # already set
 
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
@@ -265,13 +272,16 @@ def main():
     print(f"Continue: {args.continue_turns} turns | Device: {device} | "
           f"Workers: {args.workers}", flush=True)
 
-    # Load model on CPU for policy probes (Phase 1).
-    # CUDA can't be initialized before fork() — workers need it for Phase 2.
-    # CPU probes are fast enough (single forward pass per turn, no search).
-    probe_device = torch.device('cpu')
-    net, max_score = load_model(args.model, probe_device,
-                                fp16=False, jit_trace=False)
+    # Load model on target device for fast policy probes.
+    # Uses 'spawn' start method so CUDA works in both main and workers.
+    net, max_score = load_model(args.model, device,
+                                fp16=(device_str != 'cpu'),
+                                jit_trace=True)
     fp16 = False
+    try:
+        fp16 = next(net.parameters()).dtype == torch.float16
+    except (StopIteration, AttributeError):
+        pass
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -292,7 +302,7 @@ def main():
 
     for seed in range(args.seed_start, args.seed_end):
         snapshots, pol_score, pol_turns = play_policy_only(
-            net, probe_device, seed, fp16=fp16, max_turns=args.max_turns)
+            net, device, seed, fp16=fp16, max_turns=args.max_turns)
 
         if pol_turns >= args.max_turns:
             skipped += 1
@@ -375,9 +385,10 @@ def main():
                   f"{cap} ETA {eta/60:.0f}m", flush=True)
 
     else:
-        # GPU server mode
-        from multiprocessing import Process, Queue as MPQueue
+        # GPU server mode (spawn-safe)
         from alphatrain.inference_server import InferenceServer
+        MPQueue = mp.Queue
+        Process = mp.Process
 
         ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
         srv_max_score = float(ckpt.get('max_score', 30000.0))
