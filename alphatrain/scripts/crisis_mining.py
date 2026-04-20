@@ -443,7 +443,7 @@ def main():
         finally:
             for p in workers:
                 p.join(timeout=5)
-            server.stop()
+            server.shutdown()
 
     elapsed = time.time() - t0
     print(f"\nDone: {total_replays} replays, {total_states:,} states, "
