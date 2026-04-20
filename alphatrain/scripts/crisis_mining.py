@@ -276,12 +276,20 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Check existing files for resume
+    existing_files = set(os.listdir(args.save_dir))
+    already_done = len([f for f in existing_files if f.endswith('.json')])
+    if already_done > 0:
+        print(f"Resuming: {already_done} replays already in {args.save_dir}",
+              flush=True)
+
     # ── Phase 1: Policy probes (serial, instant) ──
     print(f"\n=== Phase 1: Policy probes ===", flush=True)
     t0 = time.time()
     replay_tasks = []  # (snapshot, replay_seed, num_sims, label)
     skipped = 0
     died = 0
+    already_skipped = 0
 
     for seed in range(args.seed_start, args.seed_end):
         snapshots, pol_score, pol_turns = play_policy_only(
@@ -303,11 +311,10 @@ def main():
             if rewind_idx >= len(snapshots):
                 continue
 
-            # Skip if already exists
+            # Skip if already exists (resume-safe)
             pattern = f"game_seed{seed}_{label}_score"
-            existing = [f for f in os.listdir(args.save_dir)
-                        if f.startswith(pattern)]
-            if existing:
+            if any(f.startswith(pattern) for f in existing_files):
+                already_skipped += 1
                 continue
 
             snapshot = snapshots[rewind_idx]
@@ -321,6 +328,8 @@ def main():
                   f"{len(replay_tasks)} replay tasks", flush=True)
 
     probe_time = time.time() - t0
+    if already_skipped > 0:
+        print(f"  ({already_skipped} replays already done, skipped)", flush=True)
     print(f"Phase 1 done: {died} died, {skipped} survived, "
           f"{len(replay_tasks)} replay tasks ({probe_time:.0f}s)", flush=True)
 
