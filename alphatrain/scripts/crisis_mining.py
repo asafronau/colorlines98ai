@@ -265,14 +265,13 @@ def main():
     print(f"Continue: {args.continue_turns} turns | Device: {device} | "
           f"Workers: {args.workers}", flush=True)
 
-    net, max_score = load_model(args.model, device,
-                                fp16=(device_str != 'cpu'),
-                                jit_trace=True)
+    # Load model on CPU for policy probes (Phase 1).
+    # CUDA can't be initialized before fork() — workers need it for Phase 2.
+    # CPU probes are fast enough (single forward pass per turn, no search).
+    probe_device = torch.device('cpu')
+    net, max_score = load_model(args.model, probe_device,
+                                fp16=False, jit_trace=False)
     fp16 = False
-    try:
-        fp16 = next(net.parameters()).dtype == torch.float16
-    except (StopIteration, AttributeError):
-        pass
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -293,7 +292,7 @@ def main():
 
     for seed in range(args.seed_start, args.seed_end):
         snapshots, pol_score, pol_turns = play_policy_only(
-            net, device, seed, fp16=fp16, max_turns=args.max_turns)
+            net, probe_device, seed, fp16=fp16, max_turns=args.max_turns)
 
         if pol_turns >= args.max_turns:
             skipped += 1
@@ -345,8 +344,11 @@ def main():
     total_states = 0
 
     if args.workers <= 1:
-        # Serial mode
-        mcts = MCTS(net, device, max_score=max_score,
+        # Serial mode — reload model on target device (safe, no fork)
+        net_gpu, _ = load_model(args.model, device,
+                                fp16=(device_str != 'cpu'),
+                                jit_trace=True)
+        mcts = MCTS(net_gpu, device, max_score=max_score,
                     num_simulations=args.recovery_sims,
                     batch_size=args.batch_size,
                     top_k=30, c_puct=2.5)
