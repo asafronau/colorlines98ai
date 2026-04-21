@@ -39,14 +39,14 @@ class ResBlock(nn.Module):
 
 
 class AlphaTrainNet(nn.Module):
-    """Dual-head ResNet for AlphaTrain.
+    """Policy ResNet for AlphaTrain.
 
     Args:
         in_channels: observation channels (default 18)
         num_blocks: residual blocks (default 10)
         channels: hidden width (default 256)
         policy_channels: intermediate policy conv channels (default 128)
-        num_value_bins: categorical value bins (default 64)
+        num_value_bins: kept for checkpoint compatibility (ignored)
     """
 
     def __init__(self, in_channels=18, num_blocks=10, channels=256,
@@ -73,44 +73,21 @@ class AlphaTrainNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_conv2 = nn.Conv2d(policy_channels, 81, 1)
 
-        # Value head: conv → fc → dropout → fc → output
-        self.value_conv = nn.Conv2d(channels, value_channels, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(value_channels)
-        self.value_fc1 = nn.Linear(value_channels * BOARD_SIZE * BOARD_SIZE, value_hidden)
-        self.value_dropout = nn.Dropout(value_dropout) if value_dropout > 0 else nn.Identity()
-        self.value_fc2 = nn.Linear(value_hidden, num_value_bins)
-
     def forward(self, x):
-        """Returns (policy_logits, value_logits)."""
+        """Returns (policy_logits, None)."""
         out = self.stem(x)
         out = self.blocks(out)
         out = F.relu(self.backbone_bn(out))
 
-        # Policy
         p = F.relu(self.policy_bn(self.policy_conv1(out)))
         p = self.policy_conv2(p)
         policy_logits = p.reshape(p.size(0), -1)
 
-        # Value
-        v = F.relu(self.value_bn(self.value_conv(out)))
-        v = v.reshape(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
-        value_logits = self.value_fc2(v)
-
-        return policy_logits, value_logits
+        return policy_logits, None
 
     def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
-        """Decode value head output to scalar.
-
-        For scalar head (num_value_bins=1): sigmoid clamped to [0, max_val].
-        For categorical head (num_value_bins>1): softmax over bins.
-        """
-        if self.num_value_bins == 1:
-            return torch.sigmoid(value_logits.squeeze(-1)) * max_val
-        probs = F.softmax(value_logits, dim=-1)
-        bins = torch.linspace(min_val, max_val, self.num_value_bins,
-                              device=value_logits.device)
-        return (probs * bins).sum(dim=-1)
+        """Stub for compatibility. Returns 0."""
+        return torch.zeros(1, device=next(self.parameters()).device)
 
 
 class ValueNet(nn.Module):
