@@ -51,9 +51,9 @@ def _play_policy(seed):
 # ── MCTS eval worker (persistent, shared-memory GPU inference) ──────
 
 def _eval_mcts_worker(slot_id, seed_queue, result_queue,
-                      obs_shm_name, pol_shm_name, val_shm_name,
+                      obs_shm_name, pol_shm_name,
                       num_workers, max_batch, request_queue, response_queue,
-                      num_sims, c_puct, top_k, max_score):
+                      num_sims, c_puct, top_k):
     """Persistent worker: pull seeds, play greedy MCTS games, push results."""
     torch.set_num_threads(1)
 
@@ -64,16 +64,14 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
 
     obs_shm = SharedMemory(name=obs_shm_name)
     pol_shm = SharedMemory(name=pol_shm_name)
-    val_shm = SharedMemory(name=val_shm_name)
 
     N, B = num_workers, max_batch
     obs_buf = np.ndarray((N, B) + OBS_SHAPE, dtype=np.float32, buffer=obs_shm.buf)
     pol_buf = np.ndarray((N, B, POL_SIZE), dtype=np.float32, buffer=pol_shm.buf)
-    val_buf = np.ndarray((N, B), dtype=np.float32, buffer=val_shm.buf)
 
-    client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
+    client = InferenceClient(slot_id, obs_buf, pol_buf,
                              request_queue, response_queue)
-    mcts = MCTS(inference_client=client, max_score=max_score,
+    mcts = MCTS(inference_client=client,
                 num_simulations=num_sims, c_puct=c_puct, top_k=top_k,
                 batch_size=max_batch)
 
@@ -108,7 +106,6 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
 
     obs_shm.close()
     pol_shm.close()
-    val_shm.close()
 
 
 def main():
@@ -124,8 +121,6 @@ def main():
                    help='Force device (mps/cuda/cpu). Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
                    help='MCTS workers (1=sequential, >1=GPU server mode)')
-    p.add_argument('--value-model', default=None,
-                   help='Separate ValueNet checkpoint (dual-model mode)')
     p.add_argument('--deterministic', action='store_true',
                    help='Per-request GPU processing (exact scores, slower)')
     p.add_argument('--policy-only', action='store_true')
@@ -187,24 +182,16 @@ def _run_mcts_local(args, task_seeds, total, device_str):
     from game.board import ColorLinesGame
 
     device = torch.device(device_str)
-    dual = hasattr(args, 'value_model') and args.value_model
 
     print(f"\n{'='*60}", flush=True)
     print(f"MCTS player ({total} games, local {device}, fp16+jit, "
-          f"{args.simulations} sims, bs={args.batch_size}"
-          f"{', dual-model' if dual else ''})", flush=True)
+          f"{args.simulations} sims, bs={args.batch_size})", flush=True)
     print(f"{'='*60}", flush=True)
 
-    if dual:
-        from alphatrain.evaluate import load_dual_model
-        net, max_score = load_dual_model(
-            args.model, args.value_model, device,
-            fp16=(device_str != 'cpu'), jit_trace=True)
-    else:
-        net, max_score = load_model(args.model, device,
-                                    fp16=(device_str != 'cpu'), jit_trace=True)
+    net, _ = load_model(args.model, device,
+                        fp16=(device_str != 'cpu'), jit_trace=True)
     player = make_mcts_player(
-        net, device, max_score=max_score,
+        net, device,
         num_simulations=args.simulations,
         c_puct=args.c_puct, top_k=args.top_k,
         batch_size=args.batch_size)
@@ -248,15 +235,9 @@ def _run_mcts_server(args, task_seeds, total, device_str):
           f"{args.simulations} sims, bs={args.batch_size})", flush=True)
     print(f"{'='*60}", flush=True)
 
-    ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
-    max_score = float(ckpt.get('max_score', 30000.0))
-    del ckpt
-
-    value_path = getattr(args, 'value_model', None)
     det = getattr(args, 'deterministic', False)
     server = InferenceServer(args.model, n_workers, device=device_str,
                              max_batch_per_worker=args.batch_size,
-                             value_model_path=value_path,
                              deterministic=det)
     server.start()
 
@@ -274,10 +255,9 @@ def _run_mcts_server(args, task_seeds, total, device_str):
             target=_eval_mcts_worker,
             args=(i, seed_queue, result_queue,
                   server._obs_shm.name, server._pol_shm.name,
-                  server._val_shm.name,
                   n_workers, args.batch_size,
                   server.request_queue, server.response_queues[i],
-                  args.simulations, args.c_puct, args.top_k, max_score))
+                  args.simulations, args.c_puct, args.top_k))
         proc.start()
         workers.append(proc)
 

@@ -1,7 +1,7 @@
 """Self-play data generation for AlphaZero training.
 
-Each game records (observation, MCTS visit policy, TD value target) per move.
-Games are saved as individual .pt files for easy distribution across machines.
+Each game records (observation, MCTS visit policy) per move.
+Games are saved as individual JSON files for easy distribution across machines.
 
 Usage:
     # Local (M5 Max, MPS):
@@ -51,7 +51,6 @@ def save_game_json(result, save_dir):
     }
     if result.get('capped', False):
         data['capped'] = True
-        data['bootstrap_value'] = result['bootstrap_value']
     with open(path, 'w') as f:
         json.dump(data, f)
     return path
@@ -73,10 +72,9 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         dirichlet_weight: weight for noise at root
         top_k_save: number of top moves to save from visit counts
         max_turns: cap game at this many turns (0=no cap).
-            Capped games get bootstrap_value instead of death.
 
     Returns:
-        dict with 'seed', 'score', 'moves', 'capped', 'bootstrap_value'
+        dict with 'seed', 'score', 'moves', 'capped'
     """
     game = ColorLinesGame(seed=seed)
     game.reset()
@@ -195,14 +193,6 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
 
     elapsed = time.time() - t0
 
-    # Bootstrap value for capped games: use the model's own value prediction
-    # of the final board instead of 0 (death). This teaches the model that
-    # turn 5000 boards are "still alive" with varying health levels.
-    bootstrap_value = 0.0
-    if capped:
-        _, bootstrap_value = mcts._nn_evaluate_single(game)
-        bootstrap_value = float(bootstrap_value)
-
     # Dynamic sims summary
     ds_total = ds_high + ds_mid + ds_low
     ds_stats = None
@@ -220,7 +210,6 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         'turns': turn,
         'moves': moves_data,
         'capped': capped,
-        'bootstrap_value': bootstrap_value,
         'time': elapsed,
         'dynamic_sims_stats': ds_stats,
     }
@@ -232,10 +221,10 @@ def _limit_threads():
 
 
 def _server_worker(slot_id, seed_queue, result_queue,
-                   obs_shm_name, pol_shm_name, val_shm_name,
+                   obs_shm_name, pol_shm_name,
                    num_workers, max_batch,
                    request_queue, response_queue,
-                   num_sims, batch_size, max_score,
+                   num_sims, batch_size,
                    temperature_moves, dirichlet_alpha, dirichlet_weight,
                    max_turns, dynamic_sims=False, static_turns=0):
     """Persistent worker for GPU server mode self-play."""
@@ -246,16 +235,14 @@ def _server_worker(slot_id, seed_queue, result_queue,
 
     obs_shm = SharedMemory(name=obs_shm_name)
     pol_shm = SharedMemory(name=pol_shm_name)
-    val_shm = SharedMemory(name=val_shm_name)
 
     N, B = num_workers, max_batch
     obs_buf = np.ndarray((N, B) + OBS_SHAPE, dtype=np.float32, buffer=obs_shm.buf)
     pol_buf = np.ndarray((N, B, POL_SIZE), dtype=np.float32, buffer=pol_shm.buf)
-    val_buf = np.ndarray((N, B), dtype=np.float32, buffer=val_shm.buf)
 
-    client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
+    client = InferenceClient(slot_id, obs_buf, pol_buf,
                              request_queue, response_queue)
-    mcts = MCTS(inference_client=client, max_score=max_score,
+    mcts = MCTS(inference_client=client,
                 num_simulations=num_sims, batch_size=batch_size,
                 top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims)
 
@@ -285,7 +272,6 @@ def _server_worker(slot_id, seed_queue, result_queue,
 
     obs_shm.close()
     pol_shm.close()
-    val_shm.close()
 
 
 def _worker_play(args):
@@ -297,11 +283,11 @@ def _worker_play(args):
     _limit_threads()
     device = torch.device(device_str)
 
-    net, max_score = load_model(model_path, device,
-                                fp16=(device_str != 'cpu'),
-                                jit_trace=True)
+    net, _ = load_model(model_path, device,
+                        fp16=(device_str != 'cpu'),
+                        jit_trace=True)
 
-    mcts = MCTS(net, device, max_score=max_score,
+    mcts = MCTS(net, device,
                 num_simulations=num_sims, batch_size=batch_size,
                 top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims)
 
@@ -333,8 +319,6 @@ def main():
                    help='Force device (mps/cuda/cpu). Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
                    help='Parallel workers (1=local MPS, >1=CPU multiprocessing)')
-    p.add_argument('--value-model', default=None,
-                   help='Separate ValueNet checkpoint (if None, use value head from --model)')
     p.add_argument('--deterministic', action='store_true',
                    help='Per-request GPU processing (exact scores, slower)')
     p.add_argument('--save-dir', default='data/selfplay')
@@ -342,8 +326,7 @@ def main():
     p.add_argument('--dirichlet-alpha', type=float, default=0.3)
     p.add_argument('--dirichlet-weight', type=float, default=0.25)
     p.add_argument('--max-turns', type=int, default=0,
-                   help='Cap games at this many turns (0=no cap). '
-                        'Capped games use bootstrap value instead of death.')
+                   help='Cap games at this many turns (0=no cap).')
     p.add_argument('--dynamic-sims', action='store_true',
                    help='Reduce sims for confident moves (P_max>0.5: sims/10, '
                         'P_max>0.3: sims/4). Saves ~2-3x compute.')
@@ -400,16 +383,10 @@ def main():
         # Local mode: single process
         if device_str == 'cpu':
             _limit_threads()
-        if args.value_model:
-            from alphatrain.evaluate import load_dual_model
-            net, max_score = load_dual_model(
-                args.model, args.value_model, torch.device(device_str),
-                fp16=(device_str != 'cpu'), jit_trace=True)
-        else:
-            net, max_score = load_model(args.model, torch.device(device_str),
-                                        fp16=(device_str != 'cpu'),
-                                        jit_trace=True)
-        mcts = MCTS(net, torch.device(device_str), max_score=max_score,
+        net, _ = load_model(args.model, torch.device(device_str),
+                            fp16=(device_str != 'cpu'),
+                            jit_trace=True)
+        mcts = MCTS(net, torch.device(device_str),
                      num_simulations=args.sims, batch_size=args.batch_size,
                      top_k=30, c_puct=2.5, dynamic_sims=args.dynamic_sims)
 
@@ -470,15 +447,9 @@ def main():
 
         _limit_threads()
 
-        # Get max_score from checkpoint
-        ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
-        max_score = float(ckpt.get('max_score', 30000.0))
-        del ckpt
-
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
                                  max_batch_per_worker=args.batch_size,
-                                 value_model_path=args.value_model,
                                  deterministic=args.deterministic)
         server.start()
 
@@ -496,10 +467,9 @@ def main():
                 target=_server_worker,
                 args=(i, seed_queue, result_queue,
                       server._obs_shm.name, server._pol_shm.name,
-                      server._val_shm.name,
                       args.workers, args.batch_size,
                       server.request_queue, server.response_queues[i],
-                      args.sims, args.batch_size, max_score,
+                      args.sims, args.batch_size,
                       args.temperature_moves, args.dirichlet_alpha,
                       args.dirichlet_weight, args.max_turns,
                       args.dynamic_sims, args.static_turns))
