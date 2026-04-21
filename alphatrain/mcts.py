@@ -192,13 +192,17 @@ def _flat_to_action(flat_idx):
     return ((src_flat // 9, src_flat % 9), (tgt_flat // 9, tgt_flat % 9))
 
 
+VIRTUAL_LOSS = 1.0
+
+
 class Node:
     """MCTS tree node."""
-    __slots__ = ('children', 'visit_count', 'prior')
+    __slots__ = ('children', 'visit_count', 'pending', 'prior')
 
     def __init__(self, prior=0.0):
         self.children = {}  # flat_action_int -> Node
         self.visit_count = 0
+        self.pending = 0  # virtual loss: in-flight simulations
         self.prior = prior
 
     def expanded(self):
@@ -420,20 +424,19 @@ class MCTS:
                 path = [node]
 
                 while node.children and not sim_game.game_over:
-                    # Inline PUCT selection (policy-only, no Q component)
+                    # PUCT with virtual loss penalty on in-flight branches
                     best_score = -1e30
                     best_action = 0
                     best_child = None
                     sqrt_parent = math.sqrt(node.visit_count)
                     for act_i, child in node.children.items():
-                        score = c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
+                        vc = child.visit_count + child.pending
+                        score = c_puct * child.prior * sqrt_parent / (1 + vc)
                         if score > best_score:
                             best_score = score
                             best_action = act_i
                             best_child = child
 
-                    # Decode flat action and execute trusted move
-                    # (move is guaranteed legal — from _legal_priors_jit)
                     src_flat = best_action // 81
                     tgt_flat = best_action % 81
                     sim_game.trusted_move(
@@ -442,8 +445,10 @@ class MCTS:
                     path.append(best_child)
                     node = best_child
 
+                # Virtual loss: inflate visit count for in-flight paths
                 for n in path:
                     n.visit_count += 1
+                    n.pending += 1
 
                 batch_paths.append(path)
                 batch_leaf_nodes.append(node)
@@ -473,12 +478,15 @@ class MCTS:
                         pol_logits = self.net(self._obs_buf[:obs_count])
                     pol_np = pol_logits.float().cpu().numpy()
 
-            # === EXPAND ===
+            # === EXPAND + CLEAR VIRTUAL LOSS ===
             nn_idx = 0
             for b in range(bs):
+                # Clear virtual loss for this path
+                for n in batch_paths[b]:
+                    n.pending -= 1
+
                 if not batch_game_over[b]:
                     node = batch_leaf_nodes[b]
-                    # Inline expand: JIT -> Nodes directly (no intermediate dict)
                     k, flat_idx, pri = _legal_priors_jit(
                         batch_games[b].board, pol_np[nn_idx], top_k)
                     ch = node.children
