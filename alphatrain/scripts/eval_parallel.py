@@ -38,7 +38,7 @@ def _init_policy_worker(model_path):
     global _net, _device
     from alphatrain.evaluate import load_model
     _device = torch.device('cpu')
-    _net, _ = load_model(model_path, _device)
+    _net = load_model(model_path, _device)
 
 
 def _play_policy(seed):
@@ -188,7 +188,7 @@ def _run_mcts_local(args, task_seeds, total, device_str):
           f"{args.simulations} sims, bs={args.batch_size})", flush=True)
     print(f"{'='*60}", flush=True)
 
-    net, _ = load_model(args.model, device,
+    net = load_model(args.model, device,
                         fp16=(device_str != 'cpu'), jit_trace=True)
     player = make_mcts_player(
         net, device,

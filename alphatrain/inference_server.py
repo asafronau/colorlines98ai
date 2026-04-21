@@ -168,7 +168,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
 
     device = torch.device(device_str)
     from alphatrain.evaluate import load_model
-    net, _ = load_model(model_path, device)
+    net = load_model(model_path, device)
     net = net.half()
     dummy = torch.randn(1, 18, 9, 9, device=device).half()
     net_traced = torch.jit.trace(net, dummy)
@@ -235,7 +235,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                     gpu_obs[:count] = torch.from_numpy(
                         obs_buf[slot_id, :count]).half()
 
-                    pol_logits, _ = net_traced(gpu_obs[:count])
+                    pol_logits = net_traced(gpu_obs[:count])
 
                     # Direct copy: .float().cpu().numpy() is fastest on MPS
                     # (pre-allocated copy_ is slower due to MPS sync overhead)
@@ -287,7 +287,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                 obs_staging[:total_count]).half()
 
             with torch.inference_mode():
-                pol_logits, _ = net_traced(gpu_obs[:total_count])
+                pol_logits = net_traced(gpu_obs[:total_count])
 
             # Transfer GPU results to CPU in one shot, then scatter to SHM.
             # .float().cpu() is faster than copy_() on MPS.

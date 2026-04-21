@@ -283,7 +283,7 @@ def _worker_play(args):
     _limit_threads()
     device = torch.device(device_str)
 
-    net, _ = load_model(model_path, device,
+    net = load_model(model_path, device,
                         fp16=(device_str != 'cpu'),
                         jit_trace=True)
 
@@ -383,7 +383,7 @@ def main():
         # Local mode: single process
         if device_str == 'cpu':
             _limit_threads()
-        net, _ = load_model(args.model, torch.device(device_str),
+        net = load_model(args.model, torch.device(device_str),
                             fp16=(device_str != 'cpu'),
                             jit_trace=True)
         mcts = MCTS(net, torch.device(device_str),

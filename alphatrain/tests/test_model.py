@@ -36,23 +36,21 @@ class TestModelForward:
 
     def test_output_shapes(self, model):
         x = torch.randn(4, 18, 9, 9)
-        policy, value = model(x)
+        policy = model(x)
         assert policy.shape == (4, NUM_MOVES)
-        assert value is None
 
     def test_single_sample(self, model):
         x = torch.randn(1, 18, 9, 9)
-        policy, value = model(x)
+        policy = model(x)
         assert policy.shape == (1, NUM_MOVES)
-        assert value is None
 
     def test_batch_independence(self, model):
         """Each sample in batch should be independently processed."""
         model.eval()
         x = torch.randn(2, 18, 9, 9)
-        p_batch, _ = model(x)
-        p1, _ = model(x[0:1])
-        p2, _ = model(x[1:2])
+        p_batch = model(x)
+        p1 = model(x[0:1])
+        p2 = model(x[1:2])
         assert torch.allclose(p_batch[0], p1[0], atol=1e-5)
         assert torch.allclose(p_batch[1], p2[0], atol=1e-5)
 
@@ -60,14 +58,14 @@ class TestModelForward:
         """Same input produces same output in eval mode."""
         model.eval()
         x = torch.randn(2, 18, 9, 9)
-        p1, _ = model(x)
-        p2, _ = model(x)
+        p1 = model(x)
+        p2 = model(x)
         assert torch.equal(p1, p2)
 
     def test_gradient_flow(self, model):
         """Gradients flow through all parameters."""
         x = torch.randn(2, 18, 9, 9)
-        policy, _ = model(x)
+        policy = model(x)
         loss = policy.sum()
         loss.backward()
         for name, param in model.named_parameters():
@@ -80,14 +78,14 @@ class TestFP16:
     def test_half_precision(self):
         model = AlphaTrainNet(num_blocks=2, channels=64).half()
         x = torch.randn(2, 18, 9, 9).half()
-        policy, _ = model(x)
+        policy = model(x)
         assert policy.dtype == torch.float16
 
     def test_channels_last(self):
         model = AlphaTrainNet(num_blocks=2, channels=64)
         model = model.to(memory_format=torch.channels_last)
         x = torch.randn(2, 18, 9, 9).to(memory_format=torch.channels_last)
-        policy, _ = model(x)
+        policy = model(x)
         assert policy.shape == (2, NUM_MOVES)
 
 
