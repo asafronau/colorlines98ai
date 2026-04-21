@@ -102,7 +102,7 @@ def make_policy_player(net, device):
         ).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            logits = net(obs)[0][0].cpu().numpy()
+            logits = net(obs)[0].cpu().numpy()
 
         source_mask = game.get_source_mask()
         best_score = -1e18
