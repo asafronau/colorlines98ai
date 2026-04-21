@@ -90,7 +90,7 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
     game.turns = snapshot['turn']
 
     mcts_replay = MCTS(
-        net=mcts.net, device=mcts.device, max_score=mcts.max_score,
+        net=mcts.net, device=mcts.device,
         num_simulations=num_sims, c_puct=mcts.c_puct,
         top_k=mcts.top_k, batch_size=mcts.batch_size,
         inference_client=mcts.inference_client)
@@ -153,11 +153,6 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
     if turn >= turns_limit and not game.game_over:
         capped = True
 
-    bootstrap_value = 0.0
-    if capped:
-        _, bootstrap_value = mcts_replay._nn_evaluate_single(game)
-        bootstrap_value = float(bootstrap_value)
-
     return {
         'seed': replay_seed,
         'original_seed': snapshot.get('original_seed', replay_seed),
@@ -167,16 +162,15 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
         'replay_sims': num_sims,
         'moves': moves_data,
         'capped': capped,
-        'bootstrap_value': bootstrap_value,
         'time': time.time() - t0,
     }
 
 
 def _replay_worker(slot_id, task_queue, result_queue,
-                    obs_shm_name, pol_shm_name, val_shm_name,
+                    obs_shm_name, pol_shm_name,
                     num_workers, max_batch,
                     request_queue, response_queue,
-                    batch_size, max_score, continue_turns, max_turns):
+                    batch_size, continue_turns, max_turns):
     """Persistent worker for GPU server mode replay."""
     torch.set_num_threads(1)
 
@@ -186,13 +180,11 @@ def _replay_worker(slot_id, task_queue, result_queue,
     N, B = num_workers, max_batch
     obs_shm = SharedMemory(name=obs_shm_name)
     pol_shm = SharedMemory(name=pol_shm_name)
-    val_shm = SharedMemory(name=val_shm_name)
 
     obs_buf = np.ndarray((N, B, 18, 9, 9), dtype=np.float32, buffer=obs_shm.buf)
     pol_buf = np.ndarray((N, B, 6561), dtype=np.float32, buffer=pol_shm.buf)
-    val_buf = np.ndarray((N, B), dtype=np.float32, buffer=val_shm.buf)
 
-    client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
+    client = InferenceClient(slot_id, obs_buf, pol_buf,
                              request_queue, response_queue)
 
     while True:
@@ -202,7 +194,7 @@ def _replay_worker(slot_id, task_queue, result_queue,
 
         snapshot, replay_seed, num_sims, label = task
 
-        mcts = MCTS(inference_client=client, max_score=max_score,
+        mcts = MCTS(inference_client=client,
                     num_simulations=num_sims, batch_size=batch_size,
                     top_k=30, c_puct=2.5)
 
@@ -222,7 +214,6 @@ def _replay_worker(slot_id, task_queue, result_queue,
 
     obs_shm.close()
     pol_shm.close()
-    val_shm.close()
 
 
 def main():
@@ -274,9 +265,9 @@ def main():
 
     # Load model on target device for fast policy probes.
     # Uses 'spawn' start method so CUDA works in both main and workers.
-    net, max_score = load_model(args.model, device,
-                                fp16=(device_str != 'cpu'),
-                                jit_trace=True)
+    net, _ = load_model(args.model, device,
+                        fp16=(device_str != 'cpu'),
+                        jit_trace=True)
     fp16 = False
     try:
         fp16 = next(net.parameters()).dtype == torch.float16
@@ -358,7 +349,7 @@ def main():
         net_gpu, _ = load_model(args.model, device,
                                 fp16=(device_str != 'cpu'),
                                 jit_trace=True)
-        mcts = MCTS(net_gpu, device, max_score=max_score,
+        mcts = MCTS(net_gpu, device,
                     num_simulations=args.recovery_sims,
                     batch_size=args.batch_size,
                     top_k=30, c_puct=2.5)
@@ -390,10 +381,6 @@ def main():
         MPQueue = mp.Queue
         Process = mp.Process
 
-        ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
-        srv_max_score = float(ckpt.get('max_score', 30000.0))
-        del ckpt
-
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
                                  max_batch_per_worker=args.batch_size)
@@ -413,10 +400,9 @@ def main():
                 target=_replay_worker,
                 args=(i, task_queue, result_queue,
                       server._obs_shm.name, server._pol_shm.name,
-                      server._val_shm.name,
                       args.workers, args.batch_size,
                       server.request_queue, server.response_queues[i],
-                      args.batch_size, srv_max_score,
+                      args.batch_size,
                       args.continue_turns, args.max_turns))
             p.start()
             workers.append(p)
