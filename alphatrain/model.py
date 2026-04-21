@@ -39,14 +39,14 @@ class ResBlock(nn.Module):
 
 
 class AlphaTrainNet(nn.Module):
-    """Policy ResNet for AlphaTrain.
+    """Dual-head ResNet for AlphaTrain.
 
     Args:
         in_channels: observation channels (default 18)
         num_blocks: residual blocks (default 10)
         channels: hidden width (default 256)
         policy_channels: intermediate policy conv channels (default 128)
-        num_value_bins: kept for checkpoint compatibility (ignored)
+        num_value_bins: categorical value bins (default 64)
     """
 
     def __init__(self, in_channels=18, num_blocks=10, channels=256,
@@ -73,17 +73,122 @@ class AlphaTrainNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_conv2 = nn.Conv2d(policy_channels, 81, 1)
 
+        # Value head: conv → fc → dropout → fc → output
+        self.value_conv = nn.Conv2d(channels, value_channels, 1, bias=False)
+        self.value_bn = nn.BatchNorm2d(value_channels)
+        self.value_fc1 = nn.Linear(value_channels * BOARD_SIZE * BOARD_SIZE, value_hidden)
+        self.value_dropout = nn.Dropout(value_dropout) if value_dropout > 0 else nn.Identity()
+        self.value_fc2 = nn.Linear(value_hidden, num_value_bins)
+
     def forward(self, x):
-        """Returns (policy_logits, None)."""
+        """Returns (policy_logits, value_logits)."""
         out = self.stem(x)
         out = self.blocks(out)
         out = F.relu(self.backbone_bn(out))
 
+        # Policy
         p = F.relu(self.policy_bn(self.policy_conv1(out)))
         p = self.policy_conv2(p)
         policy_logits = p.reshape(p.size(0), -1)
 
-        return policy_logits
+        # Value
+        v = F.relu(self.value_bn(self.value_conv(out)))
+        v = v.reshape(v.size(0), -1)
+        v = F.relu(self.value_fc1(v))
+        value_logits = self.value_fc2(v)
+
+        return policy_logits, value_logits
+
+    def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
+        """Decode value head output to scalar.
+
+        For scalar head (num_value_bins=1): sigmoid clamped to [0, max_val].
+        For categorical head (num_value_bins>1): softmax over bins.
+        """
+        if self.num_value_bins == 1:
+            return torch.sigmoid(value_logits.squeeze(-1)) * max_val
+        probs = F.softmax(value_logits, dim=-1)
+        bins = torch.linspace(min_val, max_val, self.num_value_bins,
+                              device=value_logits.device)
+        return (probs * bins).sum(dim=-1)
+
+
+class ValueNet(nn.Module):
+    """Standalone value network for position evaluation.
+
+    Same 18-channel input as AlphaTrainNet but outputs only value prediction.
+    Smaller architecture (fewer blocks/channels) since value is simpler than policy.
+    """
+
+    def __init__(self, in_channels=18, num_blocks=6, channels=128,
+                 num_value_bins=1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.channels = channels
+        self.num_value_bins = num_value_bins
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+        )
+        self.blocks = nn.Sequential(*[ResBlock(channels) for _ in range(num_blocks)])
+        self.backbone_bn = nn.BatchNorm2d(channels)
+
+        self.value_conv = nn.Conv2d(channels, 8, 1, bias=False)
+        self.value_bn = nn.BatchNorm2d(8)
+        self.value_fc1 = nn.Linear(8 * BOARD_SIZE * BOARD_SIZE, 256)
+        self.value_fc2 = nn.Linear(256, num_value_bins)
+
+    def forward(self, x):
+        """Returns value_logits: (batch, num_value_bins)."""
+        out = self.stem(x)
+        out = self.blocks(out)
+        out = F.relu(self.backbone_bn(out))
+
+        v = F.relu(self.value_bn(self.value_conv(out)))
+        v = v.reshape(v.size(0), -1)
+        v = F.relu(self.value_fc1(v))
+        return self.value_fc2(v)
+
+    def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
+        if self.num_value_bins == 1:
+            return torch.sigmoid(value_logits.squeeze(-1)) * max_val
+        probs = F.softmax(value_logits, dim=-1)
+        bins = torch.linspace(min_val, max_val, self.num_value_bins,
+                              device=value_logits.device)
+        return (probs * bins).sum(dim=-1)
+
+
+class DualNetWrapper:
+    """Wraps separate PolicyNet + ValueNet with unified dual-head interface.
+
+    MCTS and InferenceServer see the same (pol_logits, val_logits) API.
+    Two forward passes through two independent backbones.
+    """
+
+    def __init__(self, policy_net, value_net):
+        self.policy_net = policy_net
+        self.value_net = value_net
+        self.num_value_bins = value_net.num_value_bins
+
+    def __call__(self, x):
+        pol_logits, _ = self.policy_net(x)
+        val_logits = self.value_net(x)
+        return pol_logits, val_logits
+
+    def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
+        return self.value_net.predict_value(value_logits, min_val, max_val)
+
+    def parameters(self):
+        """Yield all parameters from both models."""
+        yield from self.policy_net.parameters()
+        yield from self.value_net.parameters()
+
+    def train(self, mode=True):
+        self.policy_net.train(mode)
+        self.value_net.train(mode)
+        return self
 
 
 def count_parameters(model):

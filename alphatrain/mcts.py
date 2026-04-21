@@ -2,9 +2,11 @@
 
 AlphaZero-style Monte Carlo Tree Search using the trained ResNet:
 - Policy head provides move priors (which moves to explore)
-- PUCT selection balances exploration vs exploitation (policy-only, no value)
+- Value head evaluates leaf positions (replaces heuristic rollouts)
+- PUCT selection balances exploration vs exploitation
 - Virtual loss batching: collect B leaves per batch, one NN forward pass
 - Determinized: each simulation samples independent ball spawns via game.clone()
+- MuZero-style Q normalization for score-based (not win/loss) values
 
 Performance optimizations:
 - Flat integer action keys (avoids tuple-of-tuples overhead)
@@ -28,6 +30,8 @@ from alphatrain.observation import build_observation
 
 BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4  # 6561
+
+VIRTUAL_LOSS = 1.0
 
 
 @njit(cache=True)
@@ -192,18 +196,21 @@ def _flat_to_action(flat_idx):
     return ((src_flat // 9, src_flat % 9), (tgt_flat // 9, tgt_flat % 9))
 
 
-VIRTUAL_LOSS = 1.0
-
-
 class Node:
     """MCTS tree node."""
-    __slots__ = ('children', 'visit_count', 'pending', 'prior')
+    __slots__ = ('children', 'visit_count', 'value_sum', 'prior')
 
     def __init__(self, prior=0.0):
         self.children = {}  # flat_action_int -> Node
         self.visit_count = 0
-        self.pending = 0  # virtual loss: in-flight simulations
+        self.value_sum = 0.0
         self.prior = prior
+
+    @property
+    def q_value(self):
+        if self.visit_count == 0:
+            return 0.0
+        return self.value_sum / self.visit_count
 
     def expanded(self):
         return len(self.children) > 0
@@ -279,9 +286,8 @@ def _get_legal_priors_flat(board, pol_logits_np, top_k):
 
 
 class MCTS:
-    """Neural MCTS with PUCT selection and virtual loss batching.
-
-    Policy-only: no value head. PUCT score = c_puct * prior * sqrt(N_parent) / (1 + N_child).
+    """Neural MCTS with PUCT selection, virtual loss batching, and value-head
+    leaf evaluation.
 
     Args:
         net: AlphaTrainNet model (eval mode, on device)
@@ -292,11 +298,12 @@ class MCTS:
         batch_size: leaves per batched NN eval (default 16)
     """
 
-    def __init__(self, net=None, device=None,
+    def __init__(self, net=None, device=None, max_score=30000.0,
                  num_simulations=400, c_puct=2.5, top_k=30, batch_size=16,
                  inference_client=None, dynamic_sims=False):
         self.net = net
         self.device = device
+        self.max_score = max_score
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.top_k = top_k
@@ -321,22 +328,48 @@ class MCTS:
                                         device=device, dtype=dtype)
 
     def _nn_evaluate_single(self, game):
-        """Single NN forward pass -> priors dict.
+        """Single NN forward pass -> (priors dict, value scalar).
 
         Uses inference_client if available, otherwise direct net call.
         Returns priors as {flat_int: prior}.
         """
         obs_np = _build_obs_for_game(game)
         if self.inference_client is not None:
-            pol_np = self.inference_client.evaluate(obs_np)
-            return _get_legal_priors_flat(game.board, pol_np, self.top_k)
+            pol_np, value = self.inference_client.evaluate(obs_np)
+            priors = _get_legal_priors_flat(game.board, pol_np, self.top_k)
+            return priors, value
         obs = torch.from_numpy(obs_np).unsqueeze(0).to(self.device)
         if self._fp16:
             obs = obs.half()
         with torch.inference_mode():
-            pol_logits = self.net(obs)
+            pol_logits, val_logits = self.net(obs)
+            value = self.net.predict_value(val_logits, max_val=self.max_score).item()
         pol_np = pol_logits[0].float().cpu().numpy()
-        return _get_legal_priors_flat(game.board, pol_np, self.top_k)
+        priors = _get_legal_priors_flat(game.board, pol_np, self.top_k)
+        return priors, value
+
+    def _select_child(self, node, min_q, max_q):
+        """PUCT selection with MuZero-style Q normalization."""
+        best_score = float('-inf')
+        best_action = None
+        best_child = None
+        sqrt_parent = math.sqrt(node.visit_count)
+        q_range = max_q - min_q
+
+        for action, child in node.children.items():
+            if child.visit_count > 0:
+                q = child.value_sum / child.visit_count
+                q_norm = (q - min_q) / q_range if q_range > 0 else 0.5
+            else:
+                q_norm = 0.5
+            u = self.c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
+            score = q_norm + u
+            if score > best_score:
+                best_score = score
+                best_action = action
+                best_child = child
+
+        return best_action, best_child
 
     def search(self, game, temperature=0.0, dirichlet_alpha=0.0,
                dirichlet_weight=0.0, return_policy=False,
@@ -368,12 +401,13 @@ class MCTS:
         self._sim_rng = SimpleRng(state_seed)
 
         # Expand root
-        priors = self._nn_evaluate_single(game)
+        priors, root_value = self._nn_evaluate_single(game)
         if not priors:
             return (None, None) if return_policy else None
         for action, prior in priors.items():
             root.children[action] = Node(prior=prior)
         root.visit_count = 1
+        root.value_sum = root_value
 
         # Measure policy confidence BEFORE Dirichlet noise
         # (Dirichlet reduces P_max by ~25%, masking true confidence)
@@ -386,6 +420,9 @@ class MCTS:
             for i, child in enumerate(root.children.values()):
                 child.prior = ((1 - dirichlet_weight) * child.prior
                                + dirichlet_weight * noise[i])
+
+        min_q = root_value
+        max_q = root_value
 
         # Localize frequently accessed attributes for speed
         c_puct = self.c_puct
@@ -424,19 +461,28 @@ class MCTS:
                 path = [node]
 
                 while node.children and not sim_game.game_over:
-                    # PUCT with virtual loss penalty on in-flight branches
+                    # Inline PUCT selection for speed
                     best_score = -1e30
                     best_action = 0
                     best_child = None
                     sqrt_parent = math.sqrt(node.visit_count)
+                    q_range = max_q - min_q
                     for act_i, child in node.children.items():
-                        vc = child.visit_count + child.pending
-                        score = c_puct * child.prior * sqrt_parent / (1 + vc)
+                        vc = child.visit_count
+                        if vc > 0:
+                            q = child.value_sum / vc
+                            q_norm = (q - min_q) / q_range if q_range > 0 else 0.5
+                        else:
+                            q_norm = 0.5
+                        u = c_puct * child.prior * sqrt_parent / (1 + vc)
+                        score = q_norm + u
                         if score > best_score:
                             best_score = score
                             best_action = act_i
                             best_child = child
 
+                    # Decode flat action and execute trusted move
+                    # (move is guaranteed legal — from _legal_priors_jit)
                     src_flat = best_action // 81
                     tgt_flat = best_action % 81
                     sim_game.trusted_move(
@@ -445,10 +491,9 @@ class MCTS:
                     path.append(best_child)
                     node = best_child
 
-                # Virtual loss: inflate visit count for in-flight paths
                 for n in path:
                     n.visit_count += 1
-                    n.pending += 1
+                    n.value_sum -= VIRTUAL_LOSS
 
                 batch_paths.append(path)
                 batch_leaf_nodes.append(node)
@@ -471,28 +516,42 @@ class MCTS:
             # === BATCH EVALUATE ===
             if obs_count > 0:
                 if use_server:
-                    pol_np = self.inference_client.evaluate_batch(
+                    pol_np, val_np = self.inference_client.evaluate_batch(
                         obs_np_buf, obs_count)
+                    # No copy needed — shared memory is safe until next
+                    # evaluate_batch call (worker is single-threaded)
                 else:
                     with torch.inference_mode():
-                        pol_logits = self.net(self._obs_buf[:obs_count])
-                    pol_np = pol_logits.float().cpu().numpy()
+                        pol_logits, val_logits = self.net(
+                            self._obs_buf[:obs_count])
+                        values_t = self.net.predict_value(
+                            val_logits, max_val=self.max_score)
+                    pol_np = pol_logits.float().cpu().numpy()  # fp32 for JIT
+                    val_np = values_t.cpu().numpy()
 
-            # === EXPAND + CLEAR VIRTUAL LOSS ===
+            # === EXPAND + BACKUP ===
             nn_idx = 0
             for b in range(bs):
-                # Clear virtual loss for this path
-                for n in batch_paths[b]:
-                    n.pending -= 1
+                path = batch_paths[b]
 
-                if not batch_game_over[b]:
+                if batch_game_over[b]:
+                    value = float(batch_games[b].score)
+                else:
+                    value = float(val_np[nn_idx])
                     node = batch_leaf_nodes[b]
+                    # Inline expand: JIT -> Nodes directly (no intermediate dict)
                     k, flat_idx, pri = _legal_priors_jit(
                         batch_games[b].board, pol_np[nn_idx], top_k)
                     ch = node.children
                     for i in range(k):
                         ch[int(flat_idx[i])] = Node(prior=float(pri[i]))
                     nn_idx += 1
+
+                min_q = min(min_q, value)
+                max_q = max(max_q, value)
+
+                for n in path:
+                    n.value_sum += VIRTUAL_LOSS + value
 
             sims_done += bs
 
@@ -539,10 +598,11 @@ class MCTS:
         return action
 
 
-def make_mcts_player(net, device, num_simulations=400, c_puct=2.5,
-                     top_k=30, batch_size=16):
+def make_mcts_player(net, device, max_score=30000.0,
+                     num_simulations=400, c_puct=2.5, top_k=30,
+                     batch_size=16):
     """Create MCTS player function for use with evaluate."""
-    mcts = MCTS(net, device,
+    mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_simulations,
                 c_puct=c_puct, top_k=top_k, batch_size=batch_size)
 
