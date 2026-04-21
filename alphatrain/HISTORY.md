@@ -1449,6 +1449,41 @@ a board where the policy gave up.
     disagree with the policy enough. Fix: static sims + crisis mining provides
     positions where search finds genuinely different moves than the policy predicts.
 
+### Pillar 2V: Static 1600 + Crisis Mining (BREAKTHROUGH)
+
+**Data:** 892 static 1600 games (3.7M states) + 5,956 crisis replays (2.8M states)
+= 6.5M total states. 57% full-game, 43% crisis (recovery rw20/25 + prevention rw35/50).
+
+**Training:** Pure policy (val_weight=0), warm start from 2U ep8, 8 epochs on H100.
+Policy loss dropped from 1.858 to 1.843 — the static data broke the plateau.
+
+**Results (300-seed policy-only eval):**
+| Epoch | Mean  | Median | Min | Max    |
+| 3     | 2,452 | 1,786  | 271 | 12,986 |
+| 4     | 2,318 | 1,651  | 248 | 11,096 |
+| 5     | 2,489 | 1,854  | 223 | 25,411 |
+| **6** | **2,680** | **2,088** | 219 | 13,582 |
+| 7     | 2,441 | 1,788  | 47  | 12,163 |
+
+**Best epoch: 6.** Policy mean 2,680 (+52% over 2U's 1,763), median 2,088 (+77%).
+
+**MCTS@400 (epoch 6, 50 seeds):** mean=6,016, median=4,018, max=27,607.
++11% over 2U's 5,436. MCTS improvement is smaller because value head is still
+garbage — the boost comes purely from stronger policy prior.
+
+79. **Static sims + crisis mining breaks the self-play plateau.** The combination of
+    full-depth search (every move gets 1600 sims) and targeted crisis replays
+    (positions where the model fails) provides enough "correction signal" to keep
+    the policy improving. Dynamic sims failed because it confirmed wrong priors.
+
+80. **Crisis data is first-class training data.** Per-state, crisis replays are as
+    valuable as full static games — both use 1600+ sims. Crisis data directly
+    targets the model's failure modes, providing correction signal that full games
+    (90% cruise control) cannot.
+
+81. **Epoch 6 sweet spot for 6.5M states.** Epoch 7 overfits (min drops to 47).
+    More data volume → more useful epochs before saturation.
+
 ### Surrogate Model for Fast Self-Play (planned for V8)
 
 5b × 128ch model (2.9M params, 4x faster inference on MPS: 45K vs 11K evals/s).
