@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import pytest
 from alphatrain.dataset import (
-    make_flat_policy_target, score_to_twohot,
+    make_flat_policy_target,
     precompute_tensors, TensorDatasetGPU,
     NUM_MOVES, BOARD_SIZE
 )
@@ -43,36 +43,12 @@ class TestPolicyTarget:
         moves = [{'sr': 0, 'sc': 0, 'tr': 0, 'tc': 1},
                  {'sr': 0, 'sc': 0, 'tr': 0, 'tc': 2}]
         scores = [20.0, 10.0]
-        # High temperature → more uniform
+        # High temperature -> more uniform
         t_high = make_flat_policy_target(moves, scores, temperature=10.0)
-        # Low temperature → more peaked
+        # Low temperature -> more peaked
         t_low = make_flat_policy_target(moves, scores, temperature=0.1)
         idx1 = 0 * 81 + 0 * 9 + 1
         assert t_low[idx1] > t_high[idx1]
-
-
-class TestScoreToTwohot:
-    def test_output_shape(self):
-        t = score_to_twohot(5000, num_bins=64)
-        assert t.shape == (64,)
-
-    def test_sums_to_one(self):
-        t = score_to_twohot(5000, num_bins=64)
-        assert t.sum() == pytest.approx(1.0)
-
-    def test_min_value(self):
-        t = score_to_twohot(0, num_bins=64)
-        assert t[0] == pytest.approx(1.0)
-
-    def test_max_value(self):
-        t = score_to_twohot(30000, num_bins=64)
-        assert t[63] == pytest.approx(1.0)
-
-    def test_clamping(self):
-        t = score_to_twohot(-100, num_bins=64)
-        assert t[0] == pytest.approx(1.0)
-        t = score_to_twohot(99999, num_bins=64)
-        assert t[63] == pytest.approx(1.0)
 
 
 class TestPrecompute:
@@ -120,7 +96,8 @@ class TestPrecompute:
         data = torch.load(out_path, weights_only=True)
         assert data['boards'].shape == (2, 9, 9)
         assert data['pol_indices'].shape == (2, 10)
-        assert data['val_targets'].shape == (2, 64)
+        # No value targets in policy-only mode
+        assert 'val_targets' not in data
 
 
 class TestDihedralAugmentation:
@@ -225,16 +202,12 @@ class TestTDValues:
         for i in range(len(remaining) - 1):
             assert remaining[i] >= remaining[i+1]
 
-    def test_precompute_td_mode(self, tmp_path):
-        """Precompute with value_mode='td' produces different targets per state."""
+    def test_precompute_policy_only(self, tmp_path):
+        """Precompute produces policy-only tensors (no value targets)."""
         game_data, game_dir = self._make_synthetic_game(tmp_path)
-        out_path = str(tmp_path / "td_tensors.pt")
-        precompute_tensors(game_dir, out_path, value_mode='td', gamma=1.0)
+        out_path = str(tmp_path / "policy_tensors.pt")
+        precompute_tensors(game_dir, out_path)
         data = torch.load(out_path, weights_only=True)
-        assert data['val_targets'].shape[0] == len(game_data['moves'])
-        assert data.get('value_mode') == 'td'
-        # Decode two-hot back to scalar
-        bins = torch.linspace(0, data['max_score'], data['num_value_bins'])
-        vals = (data['val_targets'] * bins).sum(dim=-1)
-        # First state should have higher value than last
-        assert vals[0] >= vals[-1]
+        assert data['boards'].shape[0] == len(game_data['moves'])
+        assert 'val_targets' not in data
+        assert 'num_value_bins' not in data
