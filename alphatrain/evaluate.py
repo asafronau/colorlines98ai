@@ -13,16 +13,18 @@ import torch
 from typing import Callable, Optional
 
 from game.board import ColorLinesGame
-from alphatrain.model import AlphaTrainNet
+from alphatrain.model import AlphaTrainNet, ValueNet, DualNetWrapper
 from alphatrain.observation import build_observation
 
 BOARD_SIZE = 9
 
 
 class _JitWrapper:
-    """Wraps a JIT-traced model."""
+    """Wraps a JIT-traced model, keeping predict_value from the original."""
 
     def __init__(self, net, dummy_input):
+        self.predict_value = net.predict_value
+        self.num_value_bins = net.num_value_bins
         self._traced = torch.jit.trace(net, dummy_input)
 
     def __call__(self, x):
@@ -44,7 +46,7 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
         fp16: convert to half precision (2x faster on MPS/CUDA)
         jit_trace: apply torch.jit.trace (10-15% faster forward pass)
 
-    Returns net.
+    Returns (net, max_score) where max_score is the value head's bin range.
     """
     if not os.path.exists(model_path):
         raise FileNotFoundError(
@@ -59,14 +61,17 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
     nb = sum(1 for k in state if k.endswith('.conv1.weight')
              and k.startswith('blocks.'))
     ch = state['stem.0.weight'].shape[0]
-    # Filter out value head keys from old checkpoints
-    VALUE_PREFIXES = ('value_conv.', 'value_bn.', 'value_fc1.', 'value_fc2.')
-    state = {k: v for k, v in state.items()
-             if not any(k.startswith(p) for p in VALUE_PREFIXES)}
-    net = AlphaTrainNet(in_channels=in_ch, num_blocks=nb, channels=ch).to(device)
+    bins = state['value_fc2.weight'].shape[0]
+    vch = state['value_conv.weight'].shape[0]
+    vhid = state['value_fc1.weight'].shape[0]
+    net = AlphaTrainNet(in_channels=in_ch, num_blocks=nb, channels=ch,
+                        num_value_bins=bins, value_channels=vch,
+                        value_hidden=vhid).to(device)
     net.load_state_dict(state)
     net.train(False)
+    max_score = float(ckpt.get('max_score', 30000.0))
     epoch = ckpt.get('epoch', '?')
+    val_loss = ckpt.get('val_loss', None)
 
     opts = []
     if fp16 and device.type in ('mps', 'cuda'):
@@ -79,9 +84,55 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
         opts.append('jit')
 
     opt_str = f" [{'+'.join(opts)}]" if opts else ""
-    print(f"Loaded {model_path}: {nb}b x {ch}ch, epoch={epoch}"
+    print(f"Loaded {model_path}: {nb}b x {ch}ch, epoch={epoch}, "
+          f"max_score={max_score:.0f}"
+          + (f", val_loss={val_loss:.4f}" if val_loss else "")
           + opt_str, flush=True)
-    return net
+    return net, max_score
+
+
+def load_value_model(model_path, device, fp16=False, jit_trace=False):
+    """Load a standalone ValueNet checkpoint."""
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    state = ckpt['model']
+    if any(k.startswith('_orig_mod.') for k in state):
+        state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
+
+    nb = sum(1 for k in state if k.endswith('.conv1.weight')
+             and k.startswith('blocks.'))
+    ch = state['stem.0.weight'].shape[0]
+    bins = state['value_fc2.weight'].shape[0]
+    in_ch = state['stem.0.weight'].shape[1]
+
+    net = ValueNet(in_channels=in_ch, num_blocks=nb, channels=ch,
+                   num_value_bins=bins).to(device)
+    net.load_state_dict(state)
+    net.train(False)
+    max_score = float(ckpt.get('max_score', 30000.0))
+
+    opts = []
+    if fp16 and device.type in ('mps', 'cuda'):
+        net = net.half()
+        opts.append('fp16')
+    if jit_trace:
+        dtype = torch.float16 if fp16 and device.type in ('mps', 'cuda') else torch.float32
+        dummy = torch.randn(1, in_ch, 9, 9, device=device, dtype=dtype)
+        net = _JitWrapper(net, dummy)
+        opts.append('jit')
+
+    opt_str = f" [{'+'.join(opts)}]" if opts else ""
+    print(f"Loaded ValueNet {model_path}: {nb}b x {ch}ch, "
+          f"max_score={max_score:.0f}{opt_str}", flush=True)
+    return net, max_score
+
+
+def load_dual_model(policy_path, value_path, device, fp16=False, jit_trace=False):
+    """Load separate PolicyNet + ValueNet, return DualNetWrapper."""
+    policy_net, _ = load_model(policy_path, device, fp16=fp16, jit_trace=jit_trace)
+    value_net, max_score = load_value_model(value_path, device,
+                                            fp16=fp16, jit_trace=jit_trace)
+    wrapper = DualNetWrapper(policy_net, value_net)
+    return wrapper, max_score
 
 
 def make_policy_player(net, device):
@@ -102,7 +153,7 @@ def make_policy_player(net, device):
         ).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            logits = net(obs)[0].cpu().numpy()
+            logits = net(obs)[0][0].cpu().numpy()
 
         source_mask = game.get_source_mask()
         best_score = -1e18
@@ -120,6 +171,90 @@ def make_policy_player(net, device):
                                 best_score = logits[idx]
                                 best_move = ((sr, sc), (tr, tc))
         return best_move
+
+    return player
+
+
+def make_value_player(net, device, max_score=30000.0, top_k=30, num_samples=1):
+    """Value-based move ranking: policy picks top-K, value head scores them.
+
+    For each top-K candidate move:
+    1. Clone game, execute move (ball spawns + line clears happen)
+    2. Evaluate resulting position with value head
+    3. Pick move with highest predicted final score
+
+    num_samples > 1: average over multiple random spawn outcomes per move.
+    """
+    from alphatrain.mcts import _build_obs_for_game
+
+    def player(game: ColorLinesGame):
+        board = game.board
+        nr = np.zeros(3, dtype=np.intp)
+        nc = np.zeros(3, dtype=np.intp)
+        ncol = np.zeros(3, dtype=np.intp)
+        nn = min(len(game.next_balls), 3)
+        for i, ((r, c), col) in enumerate(game.next_balls):
+            if i >= 3:
+                break
+            nr[i], nc[i], ncol[i] = r, c, col
+
+        # Get policy logits to rank candidates
+        obs = torch.from_numpy(
+            build_observation(board, nr, nc, ncol, nn)
+        ).unsqueeze(0).to(device)
+        with torch.no_grad():
+            pol_logits = net(obs)[0][0].cpu().numpy()
+
+        # Collect legal moves with policy scores
+        source_mask = game.get_source_mask()
+        moves = []
+        scores = []
+        for sr in range(BOARD_SIZE):
+            for sc in range(BOARD_SIZE):
+                if source_mask[sr, sc] == 0:
+                    continue
+                target_mask = game.get_target_mask((sr, sc))
+                for tr in range(BOARD_SIZE):
+                    for tc in range(BOARD_SIZE):
+                        if target_mask[tr, tc] > 0:
+                            idx = (sr * 9 + sc) * 81 + tr * 9 + tc
+                            moves.append(((sr, sc), (tr, tc)))
+                            scores.append(pol_logits[idx])
+
+        if not moves:
+            return None
+
+        # Pick top-K by policy prior
+        scores = np.array(scores)
+        k = min(top_k, len(moves))
+        top_idx = np.argpartition(scores, -k)[-k:]
+        candidates = [moves[i] for i in top_idx]
+
+        # Evaluate each candidate with value head
+        obs_list = []
+        for move in candidates:
+            for _ in range(num_samples):
+                g = game.clone()
+                g.move(move[0], move[1])
+                if not g.game_over:
+                    obs_list.append(_build_obs_for_game(g))
+                else:
+                    obs_list.append(np.zeros((18, 9, 9), dtype=np.float32))
+
+        if not obs_list:
+            return candidates[0]
+
+        obs_batch = torch.from_numpy(
+            np.stack(obs_list)
+        ).to(device)
+        with torch.no_grad():
+            _, val_logits = net(obs_batch)
+            values = net.predict_value(val_logits, max_val=max_score).cpu().numpy()
+
+        # Average over samples per candidate
+        values = values.reshape(len(candidates), num_samples).mean(axis=1)
+        best_idx = int(np.argmax(values))
+        return candidates[best_idx]
 
     return player
 
@@ -214,7 +349,7 @@ def play_game_verbose(player, seed=None, report_every=500):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--player', choices=['policy', 'mcts'], default='policy')
+    p.add_argument('--player', choices=['policy', 'mcts', 'value'], default='policy')
     p.add_argument('--model', default='alphatrain/data/alphatrain_best.pt')
     p.add_argument('--games', type=int, default=20)
     p.add_argument('--seed', type=int, default=42)
@@ -231,14 +366,18 @@ def main():
     else:
         device = torch.device('cpu')
 
-    net = load_model(args.model, device)
+    net, max_score = load_model(args.model, device)
 
     if args.player == 'policy':
         player = make_policy_player(net, device)
+    elif args.player == 'value':
+        player = make_value_player(
+            net, device, max_score=max_score,
+            top_k=args.top_k, num_samples=args.simulations)
     elif args.player == 'mcts':
         from alphatrain.mcts import make_mcts_player
         player = make_mcts_player(
-            net, device,
+            net, device, max_score=max_score,
             num_simulations=args.simulations,
             c_puct=args.c_puct, top_k=args.top_k)
 
