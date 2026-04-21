@@ -342,11 +342,10 @@ class MCTS:
         if self._fp16:
             obs = obs.half()
         with torch.inference_mode():
-            pol_logits, val_logits = self.net(obs)
-            value = self.net.predict_value(val_logits, max_val=self.max_score).item()
+            pol_logits, _ = self.net(obs)
         pol_np = pol_logits[0].float().cpu().numpy()
         priors = _get_legal_priors_flat(game.board, pol_np, self.top_k)
-        return priors, value
+        return priors, 0.0
 
     def _select_child(self, node, min_q, max_q):
         """PUCT selection with MuZero-style Q normalization."""
@@ -518,16 +517,11 @@ class MCTS:
                 if use_server:
                     pol_np, val_np = self.inference_client.evaluate_batch(
                         obs_np_buf, obs_count)
-                    # No copy needed — shared memory is safe until next
-                    # evaluate_batch call (worker is single-threaded)
                 else:
                     with torch.inference_mode():
-                        pol_logits, val_logits = self.net(
-                            self._obs_buf[:obs_count])
-                        values_t = self.net.predict_value(
-                            val_logits, max_val=self.max_score)
-                    pol_np = pol_logits.float().cpu().numpy()  # fp32 for JIT
-                    val_np = values_t.cpu().numpy()
+                        pol_logits, _ = self.net(self._obs_buf[:obs_count])
+                    pol_np = pol_logits.float().cpu().numpy()
+                    val_np = np.zeros(obs_count, dtype=np.float32)
 
             # === EXPAND + BACKUP ===
             nn_idx = 0

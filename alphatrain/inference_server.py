@@ -259,8 +259,8 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                         val_logits = value_net_traced(gpu_obs[:count])
                         values = value_predict(val_logits, max_val=max_score)
                     else:
-                        pol_logits, val_logits = net_traced(gpu_obs[:count])
-                        values = net.predict_value(val_logits, max_val=max_score)
+                        pol_logits, _ = net_traced(gpu_obs[:count])
+                        values = torch.zeros(count, device=gpu_obs.device)
 
                     # Direct copy: .float().cpu().numpy() is fastest on MPS
                     # (pre-allocated copy_ is slower due to MPS sync overhead)
@@ -315,11 +315,10 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
             with torch.inference_mode():
                 if value_net_traced is not None:
                     pol_logits, _ = net_traced(gpu_obs[:total_count])
-                    val_logits = value_net_traced(gpu_obs[:total_count])
-                    values = value_predict(val_logits, max_val=max_score)
+                    values = torch.zeros(total_count, device=gpu_obs.device)
                 else:
-                    pol_logits, val_logits = net_traced(gpu_obs[:total_count])
-                    values = net.predict_value(val_logits, max_val=max_score)
+                    pol_logits, _ = net_traced(gpu_obs[:total_count])
+                    values = torch.zeros(total_count, device=gpu_obs.device)
 
             # Transfer GPU results to CPU in one shot, then scatter to SHM.
             # .float().cpu() is faster than copy_() on MPS.
