@@ -61,7 +61,7 @@ def play_policy_only(net, device, seed, fp16=False, max_turns=5000):
         if fp16:
             obs = obs.half()
         with torch.inference_mode():
-            pol_logits, _ = net(obs)
+            pol_logits = net(obs)
         pol_np = pol_logits[0].float().cpu().numpy()
         priors = _get_legal_priors_flat(game.board, pol_np, 30)
 
@@ -265,7 +265,7 @@ def main():
 
     # Load model on target device for fast policy probes.
     # Uses 'spawn' start method so CUDA works in both main and workers.
-    net, _ = load_model(args.model, device,
+    net = load_model(args.model, device,
                         fp16=(device_str != 'cpu'),
                         jit_trace=True)
     fp16 = False
@@ -346,7 +346,7 @@ def main():
 
     if args.workers <= 1:
         # Serial mode — reload model on target device (safe, no fork)
-        net_gpu, _ = load_model(args.model, device,
+        net_gpu = load_model(args.model, device,
                                 fp16=(device_str != 'cpu'),
                                 jit_trace=True)
         mcts = MCTS(net_gpu, device,

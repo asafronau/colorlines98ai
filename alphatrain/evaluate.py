@@ -44,7 +44,7 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
         fp16: convert to half precision (2x faster on MPS/CUDA)
         jit_trace: apply torch.jit.trace (10-15% faster forward pass)
 
-    Returns (net, None). Second element kept for API compatibility.
+    Returns net.
     """
     if not os.path.exists(model_path):
         raise FileNotFoundError(
@@ -81,7 +81,7 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
     opt_str = f" [{'+'.join(opts)}]" if opts else ""
     print(f"Loaded {model_path}: {nb}b x {ch}ch, epoch={epoch}"
           + opt_str, flush=True)
-    return net, None
+    return net
 
 
 def make_policy_player(net, device):
@@ -231,7 +231,7 @@ def main():
     else:
         device = torch.device('cpu')
 
-    net, _ = load_model(args.model, device)
+    net = load_model(args.model, device)
 
     if args.player == 'policy':
         player = make_policy_player(net, device)

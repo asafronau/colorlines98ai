@@ -330,7 +330,7 @@ class MCTS:
         if self._fp16:
             obs = obs.half()
         with torch.inference_mode():
-            pol_logits, _ = self.net(obs)
+            pol_logits = self.net(obs)
         pol_np = pol_logits[0].float().cpu().numpy()
         return _get_legal_priors_flat(game.board, pol_np, self.top_k)
 
@@ -470,7 +470,7 @@ class MCTS:
                         obs_np_buf, obs_count)
                 else:
                     with torch.inference_mode():
-                        pol_logits, _ = self.net(self._obs_buf[:obs_count])
+                        pol_logits = self.net(self._obs_buf[:obs_count])
                     pol_np = pol_logits.float().cpu().numpy()
 
             # === EXPAND ===
