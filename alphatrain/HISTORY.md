@@ -1484,9 +1484,66 @@ garbage — the boost comes purely from stronger policy prior.
 81. **Epoch 6 sweet spot for 6.5M states.** Epoch 7 overfits (min drops to 47).
     More data volume → more useful epochs before saturation.
 
-### Surrogate Model for Fast Self-Play (planned for V8)
+### The Value Head Removal Disaster
+
+Attempted to remove the value head entirely from the model architecture — deleted
+ValueNet, DualNetWrapper, value_sum, Q-tracking, virtual loss through value_sum.
+886 lines deleted. Clean code.
+
+**MCTS broke completely.** MCTS@400 went from +50% boost to -49% (actively worse
+than policy-only). Games scoring 8,000+ dropped to 176-517.
+
+**Root cause:** Virtual loss through value_sum is load-bearing for batched MCTS.
+Without it, multiple leaves in a batch of 64 all go down the same branch, wasting
+90%+ of search budget on redundant simulations. Even the "garbage" value head
+(trained with val_weight=0) provided essential Q-diversity for exploration.
+
+**Fix:** Reverted MCTS stack to last known-good commit (87e2d5f). The value head
+stays in the model for MCTS inference (provides Q-diversity) but gets zero training
+gradient (val_weight=0 in training).
+
+82. **Virtual loss through value_sum is load-bearing.** Even a garbage value head
+    provides Q-diversity that guides MCTS exploration. Without it, PUCT with only
+    policy priors flattens the visit distribution — MCTS becomes worse than
+    policy-only. The value head is dead for training but essential for search.
+
+83. **Don't remove infrastructure you don't understand.** The value_sum virtual loss
+    mechanism looked like dead code (value always ~0) but was providing critical
+    exploration diversity. Test MCTS after any refactor, not just training.
+
+### Pillar 2W: Openings + Crisis + Mid-game
+
+**Data (V8):** 500 full s1600 (1.8M) + 3K openings at 2000+ sims (650K) +
+8K crisis replays (456K) = 2.9M states. Targeted: 62% mid-game, 22% openings,
+16% crisis.
+
+**Training:** Pure policy, warm start from 2V ep6, 8 epochs on G4.
+Policy loss: 1.809 → 1.792. Val loss improved every epoch — no overfitting.
+The diverse data mix (openings + crisis) provided enough signal for 8 full epochs.
+
+**Results (1000-seed policy-only eval, GPU fp16):**
+| Model | Mean | Median | Min | Max |
+| 2V ep6 | 2,584 | 1,899 | 121 | 16,410 |
+| 2W ep5 | **2,972** | 2,163 | 209 | 17,354 |
+| 2W ep8 | 2,935 | **2,203** | 110 | 18,913 |
+
+**+14% mean, +16% median over 2V.** Steady improvement from the self-play loop.
+The floor remains low (min ~110-209) — needs more work.
+
+84. **Diverse data prevents overfitting.** 2.9M states with 22% openings + 16% crisis
+    supported 8 epochs without overfitting. Previous iterations (6.5M homogeneous
+    mid-game states) overfit by epoch 6-7. Quality × diversity > volume.
+
+85. **GPU policy eval via InferenceServer.** Route policy-only games through the
+    shared-memory GPU server for 2x speedup. fp16 gives different per-seed results
+    than fp32 CPU (MPS non-determinism) but means converge at 1000+ seeds.
+
+86. **Opening data at 2200 sims improves mean but not floor.** The first 200 turns
+    at deeper search teach better board setup. But catastrophic games (min ~150)
+    still occur — structural blind spots in the policy persist.
+
+### Surrogate Model for Fast Self-Play (planned)
 
 5b × 128ch model (2.9M params, 4x faster inference on MPS: 45K vs 11K evals/s).
-Trained on V6 data via pure policy distillation. Enables static 1600 sims at the
-speed of current dynamic. Training started but paused to focus on static 1600
-data generation for 2V.
+Enables static 1600 sims at the speed of current dynamic. Training started but
+paused to focus on data generation.
