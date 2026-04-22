@@ -48,6 +48,57 @@ def _play_policy(seed):
     return seed, result['score'], result['turns']
 
 
+def _eval_policy_gpu_worker(slot_id, seed_queue, result_queue,
+                             obs_shm_name, pol_shm_name, val_shm_name,
+                             num_workers, max_batch,
+                             request_queue, response_queue):
+    """Play policy-only games using GPU inference server."""
+    torch.set_num_threads(1)
+
+    from multiprocessing.shared_memory import SharedMemory
+    from alphatrain.inference_server import InferenceClient, OBS_SHAPE, POL_SIZE
+    from alphatrain.mcts import _build_obs_for_game, _get_legal_priors_flat
+    from game.board import ColorLinesGame
+
+    obs_shm = SharedMemory(name=obs_shm_name)
+    pol_shm = SharedMemory(name=pol_shm_name)
+    val_shm = SharedMemory(name=val_shm_name)
+
+    N, B = num_workers, max_batch
+    obs_buf = np.ndarray((N, B) + OBS_SHAPE, dtype=np.float32, buffer=obs_shm.buf)
+    pol_buf = np.ndarray((N, B, POL_SIZE), dtype=np.float32, buffer=pol_shm.buf)
+    val_buf = np.ndarray((N, B), dtype=np.float32, buffer=val_shm.buf)
+
+    client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
+                             request_queue, response_queue)
+
+    while True:
+        seed = seed_queue.get()
+        if seed is None:
+            break
+
+        game = ColorLinesGame(seed=seed)
+        game.reset()
+
+        while not game.game_over:
+            obs_np = _build_obs_for_game(game)
+            pol_np, _ = client.evaluate(obs_np)
+            priors = _get_legal_priors_flat(game.board, pol_np, 30)
+            if not priors:
+                break
+            best_action = max(priors.items(), key=lambda x: x[1])[0]
+            src_flat = best_action // 81
+            tgt_flat = best_action % 81
+            game.move((src_flat // 9, src_flat % 9),
+                      (tgt_flat // 9, tgt_flat % 9))
+
+        result_queue.put((seed, game.score, game.turns))
+
+    obs_shm.close()
+    pol_shm.close()
+    val_shm.close()
+
+
 # ── MCTS eval worker (persistent, shared-memory GPU inference) ──────
 
 def _eval_mcts_worker(slot_id, seed_queue, result_queue,
@@ -157,14 +208,18 @@ def main():
     # ── Policy evaluation ──
     pol_results = []
     if not args.mcts_only:
-        print(f"\n{'='*60}", flush=True)
-        print(f"Policy player ({total} games, {n_cpu} CPU workers)", flush=True)
-        print(f"{'='*60}", flush=True)
-        t0 = time.time()
-        with Pool(n_cpu, initializer=_init_policy_worker,
-                  initargs=(args.model,)) as pool:
-            pol_results = pool.map(_play_policy, task_seeds)
-        print(f"Policy done: {time.time()-t0:.1f}s", flush=True)
+        use_gpu = args.workers > 1 and device_str != 'cpu'
+        if use_gpu:
+            pol_results = _run_policy_server(args, task_seeds, total, device_str)
+        else:
+            print(f"\n{'='*60}", flush=True)
+            print(f"Policy player ({total} games, {n_cpu} CPU workers)", flush=True)
+            print(f"{'='*60}", flush=True)
+            t0 = time.time()
+            with Pool(n_cpu, initializer=_init_policy_worker,
+                      initargs=(args.model,)) as pool:
+                pol_results = pool.map(_play_policy, task_seeds)
+            print(f"Policy done: {time.time()-t0:.1f}s", flush=True)
 
     # ── MCTS evaluation ──
     mcts_results = []
@@ -178,6 +233,59 @@ def main():
     _print_results_table(seeds, n_per, pol_results, mcts_results,
                    show_pol=not args.mcts_only,
                    show_mcts=not args.policy_only)
+
+
+def _run_policy_server(args, task_seeds, total, device_str):
+    """Run policy-only games using GPU inference server."""
+    from alphatrain.inference_server import InferenceServer
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"Policy player ({total} games, {args.workers} GPU workers)", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    server = InferenceServer(args.model, args.workers,
+                             device=device_str,
+                             max_batch_per_worker=args.batch_size)
+    server.start()
+
+    seed_queue = MPQueue()
+    for s in task_seeds:
+        seed_queue.put(s)
+    for _ in range(args.workers):
+        seed_queue.put(None)
+
+    result_queue = MPQueue()
+
+    workers = []
+    for i in range(args.workers):
+        p = Process(
+            target=_eval_policy_gpu_worker,
+            args=(i, seed_queue, result_queue,
+                  server._obs_shm.name, server._pol_shm.name,
+                  server._val_shm.name,
+                  args.workers, args.batch_size,
+                  server.request_queue, server.response_queues[i]))
+        p.start()
+        workers.append(p)
+
+    t0 = time.time()
+    results = []
+    try:
+        for i in range(total):
+            r = result_queue.get(timeout=3600)
+            results.append(r)
+            if (i + 1) % 100 == 0:
+                elapsed = time.time() - t0
+                eta = elapsed / (i + 1) * (total - i - 1)
+                print(f"  [{i+1}/{total}] {elapsed:.0f}s (ETA {eta:.0f}s)",
+                      flush=True)
+    finally:
+        for p in workers:
+            p.join(timeout=5)
+        server.shutdown()
+
+    print(f"Policy done: {time.time()-t0:.1f}s", flush=True)
+    return results
 
 
 def _run_mcts_local(args, task_seeds, total, device_str):
