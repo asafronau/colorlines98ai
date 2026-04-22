@@ -34,7 +34,7 @@ def train_epoch(model, loader, optimizer, device, scaler=None, log_interval=100)
         pol_tgt = pol_tgt.to(device)
 
         with torch.amp.autocast('cuda', enabled=use_amp):
-            pol_logits = model(obs)
+            pol_logits, _ = model(obs)
             loss = cross_entropy_soft(pol_logits, pol_tgt)
 
         optimizer.zero_grad(set_to_none=True)
@@ -74,7 +74,7 @@ def validate(model, loader, device, use_amp=False):
         pol_tgt = pol_tgt.to(device)
 
         with torch.amp.autocast('cuda', enabled=use_amp):
-            pol_logits = model(obs)
+            pol_logits, _ = model(obs)
             loss = cross_entropy_soft(pol_logits, pol_tgt)
 
         total_loss += loss.item()
