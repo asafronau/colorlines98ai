@@ -37,7 +37,12 @@ def _init_policy_worker(model_path):
     torch.set_num_threads(1)
     global _net, _device
     from alphatrain.evaluate import load_model
-    _device = torch.device('cpu')
+    if torch.cuda.is_available():
+        _device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        _device = torch.device('mps')
+    else:
+        _device = torch.device('cpu')
     _net, _ = load_model(model_path, _device)
 
 
@@ -144,7 +149,9 @@ def main():
     seeds = args.seeds
     n_per = args.games_per_seed
     total = len(seeds) * n_per
-    n_cpu = min(cpu_count(), total)
+    # Policy workers: 1 on GPU (multiple workers fight for GPU), N on CPU
+    gpu_avail = torch.cuda.is_available() or torch.backends.mps.is_available()
+    n_cpu = 1 if gpu_avail else min(args.workers, cpu_count(), total)
 
     print(f"Evaluation: {len(seeds)} seeds x {n_per} games = {total} games",
           flush=True)
