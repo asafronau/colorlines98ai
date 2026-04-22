@@ -468,6 +468,26 @@ def _print_results_table(seeds, n_per, pol_results, mcts_results,
         pct = (np.mean(mcts_all) / np.mean(pol_all) - 1) * 100 if np.mean(pol_all) > 0 else 0
         row += f" | {pct:>+4.0f}%"
     print(row, flush=True)
+
+    # Percentile breakdown
+    for label, all_scores in [("Pol", pol_all), ("MCTS", mcts_all)]:
+        if not all_scores:
+            continue
+        if label == "Pol" and not show_pol:
+            continue
+        if label == "MCTS" and not show_mcts:
+            continue
+        a = np.array(all_scores)
+        n = len(a)
+        print(f"\n  {label} percentiles ({n} games):", flush=True)
+        print(f"    P1={np.percentile(a,1):.0f}  P5={np.percentile(a,5):.0f}  "
+              f"P10={np.percentile(a,10):.0f}  P25={np.percentile(a,25):.0f}  "
+              f"P50={np.percentile(a,50):.0f}  P75={np.percentile(a,75):.0f}  "
+              f"P90={np.percentile(a,90):.0f}  P95={np.percentile(a,95):.0f}", flush=True)
+        print(f"    <500: {(a<500).sum()} ({100*(a<500).mean():.1f}%)  "
+              f"<1000: {(a<1000).sum()} ({100*(a<1000).mean():.1f}%)  "
+              f">5000: {(a>5000).sum()} ({100*(a>5000).mean():.0f}%)  "
+              f">10000: {(a>10000).sum()} ({100*(a>10000).mean():.0f}%)", flush=True)
     print(flush=True)
 
 
