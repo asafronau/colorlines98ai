@@ -1570,8 +1570,21 @@ Floor (P1~300, <500~4.4%) stubbornly flat — needs new teacher for V9.
     full 5.8M outperformed warm-starting from 2W ep8 (which had already trained on
     half the data). The stale half provided zero gradient in the warm-start run.
 
-### Surrogate Model for Fast Self-Play (planned)
+### Surrogate Model: FAILED
 
-5b × 128ch model (2.9M params, 4x faster inference on MPS: 45K vs 11K evals/s).
-Enables static 1600 sims at the speed of current dynamic. Training started but
-paused to focus on data generation.
+5b × 128ch model (2.9M params, 4x faster inference). Trained 15 epochs on V8
+data (5.8M states). Policy-only scored 390 mean (vs 10-block's 3,200). The model
+is too small to learn the policy — 128ch width can't represent the move patterns.
+
+CoreML ANE backend also attempted (4.4x faster at bs=1). Queue overhead between
+workers and inference server ate the advantage. Direct worker mode caused ANE
+contention with multiple models. Net speedup: only 28%. Abandoned.
+
+89. **Surrogate model needs sufficient width.** 5b×128ch (2.9M params) scored
+    390 standalone — 8x worse than 10b×256ch. The 128-channel bottleneck
+    loses too much feature capacity. Width matters more than depth for policy.
+
+90. **CoreML ANE: fast inference, slow system.** 4.4x faster per-eval but
+    queue overhead (0.3ms) between workers and server dominates. The speedup
+    only helps when inference is the bottleneck; in our architecture,
+    communication is.
