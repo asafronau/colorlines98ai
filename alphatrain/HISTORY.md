@@ -1542,6 +1542,34 @@ The floor remains low (min ~110-209) — needs more work.
     at deeper search teach better board setup. But catastrophic games (min ~150)
     still occur — structural blind spots in the policy persist.
 
+### Pillar 2W2: Double Data from Same Teacher
+
+Doubled V8 data from 2.9M to 5.8M states (6K openings at 2000+ sims, 21K crisis
+replays, 500 full s1600 games). Trained from 2V ep6 (fresh start on full data).
+
+**Training:** Loss 1.810 → 1.784 over 10 epochs. Lower than 2W's 1.792.
+No overfitting through all 10 epochs on 5.8M diverse states.
+
+**Results (1000-seed policy-only eval, GPU fp16):**
+| Model | Mean | Median | <500 | <1000 | >5000 |
+| 2V ep6 | 2,584 | 1,899 | 6.2% | 22.5% | 11% |
+| 2W ep8 (2.9M) | 2,935 | 2,203 | 4.4% | 19.2% | 16% |
+| **2W2 ep7 (5.8M)** | **3,175** | **2,458** | 4.4% | 18.7% | **18%** |
+| 2W2 ep10 | 3,140 | 2,340 | **4.2%** | **16.7%** | 18% |
+
+**Total progression from single teacher (2V ep6):**
+Mean +22%, median +29%, <1000 dropped 22.5%→16.7%, >5000 grew 11%→18%.
+Floor (P1~300, <500~4.4%) stubbornly flat — needs new teacher for V9.
+
+87. **More diverse data from same teacher still helps.** Doubling data from 2.9M to
+    5.8M with more openings (2200 sims) and crisis replays gave +8% mean over 2W.
+    The model hadn't exhausted the teacher's signal — it needed more DIVERSITY of
+    positions, not just volume.
+
+88. **Fresh start beats warm start when data doubles.** Starting from 2V ep6 on the
+    full 5.8M outperformed warm-starting from 2W ep8 (which had already trained on
+    half the data). The stale half provided zero gradient in the warm-start run.
+
 ### Surrogate Model for Fast Self-Play (planned)
 
 5b × 128ch model (2.9M params, 4x faster inference on MPS: 45K vs 11K evals/s).
