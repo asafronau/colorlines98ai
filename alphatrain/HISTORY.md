@@ -1588,3 +1588,25 @@ contention with multiple models. Net speedup: only 28%. Abandoned.
     queue overhead (0.3ms) between workers and server dominates. The speedup
     only helps when inference is the bottleneck; in our architecture,
     communication is.
+
+91. **fp16 vs fp32 policy eval gives different scores.** GPU fp16
+    (InferenceServer) inflates policy-only scores ~31% vs CPU fp32 (Pool
+    workers). 2W2 ep10: GPU fp16 policy mean=4,489, CPU fp32 policy
+    mean=3,425. Same model, same seeds — the difference is purely numerical
+    precision in softmax tails. Always compare policy baselines and MCTS
+    scores using the same precision path.
+
+92. **MCTS boost declines naturally with stronger policy.** The apparent
+    "MCTS collapse" from +124% (2U) to +26% (2W2) is not regression — it's
+    policy convergence. A stronger standalone policy already makes good
+    moves, so search has less room to improve. 2U: policy 1,763 → MCTS
+    3,953 (+124%). 2W2: policy 3,425 → MCTS 4,310 (+26%). The MCTS
+    absolute score still improved.
+
+93. **Random Q-values > systematically wrong Q-values for MCTS.** Calibrating
+    the value head to predict empty_squares/81 (frozen backbone, 2 epochs)
+    produced systematic bias that hurt exploration. The calibrated model's
+    MCTS boost dropped to -2% vs +26% with the untrained (random) value
+    head. Random noise provides unbiased Q-diversity for virtual loss;
+    a weakly-trained value head introduces correlated errors that
+    consistently mislead the search.
