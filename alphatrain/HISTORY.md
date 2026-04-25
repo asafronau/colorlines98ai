@@ -1610,3 +1610,66 @@ contention with multiple models. Net speedup: only 28%. Abandoned.
     head. Random noise provides unbiased Q-diversity for virtual loss;
     a weakly-trained value head introduces correlated errors that
     consistently mislead the search.
+
+### The V9 Selfplay Collapse and Value Head Investigation
+
+V9 selfplay (2W2, 1600 sims) collapsed to mean=4,299 (9% capped) from V8's
+7,709 (50% capped) despite 2W2 having a stronger standalone policy. Extensive
+diagnosis revealed the root cause: the untrained value head provides garbage
+Q-values that override the policy on 12% of moves, and this is net-harmful
+for strong policies.
+
+94. **Ghost moves in MCTS simulations.** The shared RNG (`sim_rng`) across
+    batched simulations caused board state divergence at depth 2+. Cached
+    children at a tree node could be illegal on a different simulation's
+    board (different ball spawns). `trusted_move()` executed these invalid
+    moves, corrupting simulation boards. Fixed with open-loop MCTS: filter
+    children to those legal on each simulation's actual board during PUCT
+    selection. The saved game data was always valid (real game uses `move()`
+    with BFS pathfinding), only MCTS simulations were affected.
+
+95. **Open-loop MCTS for stochastic games.** Standard AlphaZero MCTS assumes
+    deterministic games (same action = same outcome). Color Lines has random
+    ball spawns, so the same tree node can represent different board states
+    across simulations. Open-loop MCTS fixes this: during PUCT selection,
+    check each cached child's legality against the current simulation's
+    board (`board[src] != 0 and board[tgt] == 0`). Skip illegal children.
+    Break if no children are legal. Nodes represent action sequences, not
+    specific board states.
+
+96. **Prior peakedness is NOT the cause of MCTS degradation.** Diagnosis
+    across models showed nearly identical prior distributions:
+    2U P_max mean=0.411, 2W2 P_max mean=0.435. Both have P_max > 0.9 on
+    only 1% of turns. Gemini's theory of "violently peaked priors (0.99)"
+    was empirically disproven.
+
+97. **The garbage value head is the Goldilocks zone — accidentally.**
+    Comprehensive testing of value alternatives on seed 36, 2W2 @400 sims:
+    - Garbage neural value (c_puct=2.5): 3,782 (12% disagreement) — best
+    - Zero value (amputated): 2,788 (0% disagreement) — pure policy
+    - High c_puct=25.0: 2,247 (2% disagreement) — suppressed exploration
+    - Heuristic board eval: 742 (30% disagreement) — confidently wrong
+    The garbage value head provides just enough random exploration (12%
+    override rate) without being confident enough to consistently mislead.
+    Removing it or replacing it with a "real" signal both made things worse.
+
+98. **MCTS batch_size critically affects value network quality.** With a
+    trained value net, batch_size=64 gives MCTS mean=1,830 (-39% vs policy),
+    while batch_size=8 gives MCTS mean=7,294 (+218%). The first batch runs
+    blind (q_range=0, Q-values invisible). batch_size=64 wastes 16% of sims
+    blindly; batch_size=8 wastes only 2%. With a real value signal, more
+    informed iterations = dramatically better search. With garbage values,
+    batch_size doesn't matter (more iterations of noise doesn't help).
+
+99. **Separate value network: the breakthrough.** A small independent ValueNet
+    (5b×128ch, 1.7M params) trained on survival targets from V7/V8/crisis
+    data (1.9M positions, horizon=50 turns, 96.3% accuracy) transforms MCTS:
+    - 2W2 + garbage value @400 sims: mean=3,500, boost=+28%
+    - 2W2 + trained ValueNet @400 sims, bs=8: mean=7,294, boost=+218%
+    - Minimum score: 4,797 (was ~200 with garbage value)
+    - Every seed improved (4 seeds tested: +688%, +41%, +726%, +344%)
+    The value network predicts survival probability [0,1] for each leaf
+    position. MCTS gets real signal about board health, enabling informed
+    exploration instead of random overrides. The key was training a SEPARATE
+    network (no shared backbone conflict with policy) on a REAL target
+    (survival from game outcomes, not heuristic features).

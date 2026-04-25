@@ -104,7 +104,8 @@ def _eval_policy_gpu_worker(slot_id, seed_queue, result_queue,
 def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                       obs_shm_name, pol_shm_name, val_shm_name,
                       num_workers, max_batch, request_queue, response_queue,
-                      num_sims, c_puct, top_k, max_score):
+                      num_sims, c_puct, top_k, max_score,
+                      value_net_path=None, device_str='cpu'):
     """Persistent worker: pull seeds, play greedy MCTS games, push results."""
     torch.set_num_threads(1)
 
@@ -124,9 +125,26 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
 
     client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
                              request_queue, response_queue)
+
+    # Load separate value network in worker process
+    vnet = None
+    if value_net_path:
+        from alphatrain.model import ValueNet
+        device = torch.device(device_str)
+        ckpt = torch.load(value_net_path, map_location='cpu', weights_only=False)
+        vnet = ValueNet(in_channels=18,
+                        num_blocks=ckpt['num_blocks'],
+                        channels=ckpt['channels'],
+                        num_value_bins=1)
+        vnet.load_state_dict(ckpt['model'])
+        vnet = vnet.to(device)
+        vnet.requires_grad_(False)
+        print(f"  [w{slot_id}] ValueNet loaded: {ckpt['num_blocks']}b x "
+              f"{ckpt['channels']}ch on {device_str}", flush=True)
+
     mcts = MCTS(inference_client=client, max_score=max_score,
                 num_simulations=num_sims, c_puct=c_puct, top_k=top_k,
-                batch_size=max_batch)
+                batch_size=max_batch, value_net=vnet)
 
     while True:
         seed = seed_queue.get()
@@ -181,6 +199,8 @@ def main():
                    help='Per-request GPU processing (exact scores, slower)')
     p.add_argument('--policy-only', action='store_true')
     p.add_argument('--mcts-only', action='store_true')
+    p.add_argument('--value-net', default=None,
+                   help='Separate ValueNet checkpoint for MCTS leaf eval')
     args = p.parse_args()
 
     if args.device:
@@ -311,11 +331,28 @@ def _run_mcts_local(args, task_seeds, total, device_str):
     else:
         net, max_score = load_model(args.model, device,
                                     fp16=(device_str != 'cpu'), jit_trace=True)
+
+    # Load separate value network if provided
+    vnet = None
+    if getattr(args, 'value_net', None):
+        from alphatrain.model import ValueNet
+        ckpt = torch.load(args.value_net, map_location='cpu', weights_only=False)
+        vnet = ValueNet(in_channels=18,
+                        num_blocks=ckpt['num_blocks'],
+                        channels=ckpt['channels'],
+                        num_value_bins=1)
+        vnet.load_state_dict(ckpt['model'])
+        vnet = vnet.to(device)
+        vnet.requires_grad_(False)
+        print(f"ValueNet: {ckpt['num_blocks']}b x {ckpt['channels']}ch, "
+              f"acc={ckpt['accuracy']:.1f}%", flush=True)
+
     player = make_mcts_player(
         net, device, max_score=max_score,
         num_simulations=args.simulations,
         c_puct=args.c_puct, top_k=args.top_k,
-        batch_size=args.batch_size)
+        batch_size=args.batch_size,
+        value_net=vnet)
 
     results = []
     t0 = time.time()
@@ -376,6 +413,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
 
     result_queue = MPQueue()
 
+    vnet_path = getattr(args, 'value_net', None)
+
     workers = []
     for i in range(n_workers):
         proc = Process(
@@ -385,7 +424,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                   server._val_shm.name,
                   n_workers, args.batch_size,
                   server.request_queue, server.response_queues[i],
-                  args.simulations, args.c_puct, args.top_k, max_score))
+                  args.simulations, args.c_puct, args.top_k, max_score,
+                  vnet_path, device_str))
         proc.start()
         workers.append(proc)
 
