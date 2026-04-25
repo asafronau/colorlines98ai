@@ -35,6 +35,79 @@ VIRTUAL_LOSS = 1.0
 
 
 @njit(cache=True)
+def _evaluate_board(board):
+    """Fast board evaluation for MCTS leaf nodes.
+
+    Returns a score where higher = healthier board.
+    Captures: empty count, largest connected region, line potential,
+    and partition penalty.
+    """
+    empty = 0
+    max_region = 0
+    n_regions = 0
+    visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
+    queue_r = np.empty(81, dtype=np.int8)
+    queue_c = np.empty(81, dtype=np.int8)
+
+    # BFS to find connected empty regions
+    for sr in range(BOARD_SIZE):
+        for sc in range(BOARD_SIZE):
+            if board[sr, sc] == 0:
+                empty += 1
+                if visited[sr, sc] == 0:
+                    # Flood fill this region
+                    n_regions += 1
+                    region_size = 0
+                    visited[sr, sc] = 1
+                    queue_r[0] = sr
+                    queue_c[0] = sc
+                    head, tail = 0, 1
+                    while head < tail:
+                        r, c = queue_r[head], queue_c[head]
+                        head += 1
+                        region_size += 1
+                        for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                                if board[nr, nc] == 0 and visited[nr, nc] == 0:
+                                    visited[nr, nc] = 1
+                                    queue_r[tail] = nr
+                                    queue_c[tail] = nc
+                                    tail += 1
+                    if region_size > max_region:
+                        max_region = region_size
+
+    # Line potential: count balls in partial lines (3-4 in a row)
+    line_potential = 0
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            color = board[r, c]
+            if color == 0:
+                continue
+            # Check horizontal and vertical only (avoid double-counting)
+            for dr, dc in ((0, 1), (1, 0)):
+                length = 1
+                cr, cc = r + dr, c + dc
+                while 0 <= cr < BOARD_SIZE and 0 <= cc < BOARD_SIZE and board[cr, cc] == color:
+                    length += 1
+                    cr += dr
+                    cc += dc
+                if 3 <= length <= 4:
+                    line_potential += length
+
+    # Score: empty space + connectivity bonus + line potential - partition penalty
+    # Partition: if the board has multiple disconnected empty regions,
+    # balls can't move freely between them
+    partition_penalty = 0
+    if n_regions > 1:
+        # Penalty proportional to how fragmented the board is
+        # (empty - max_region) = cells in non-largest regions
+        partition_penalty = (empty - max_region) * 2
+
+    return float(empty + max_region + line_potential - partition_penalty)
+
+
+@njit(cache=True)
 def _legal_priors_jit(board, pol_logits, top_k):
     """Compute top-K legal move priors entirely in JIT.
 
@@ -300,7 +373,8 @@ class MCTS:
 
     def __init__(self, net=None, device=None, max_score=30000.0,
                  num_simulations=400, c_puct=2.5, top_k=30, batch_size=16,
-                 inference_client=None, dynamic_sims=False):
+                 inference_client=None, dynamic_sims=False,
+                 heuristic_value=False, value_net=None):
         self.net = net
         self.device = device
         self.max_score = max_score
@@ -310,6 +384,8 @@ class MCTS:
         self.batch_size = batch_size
         self.inference_client = inference_client
         self.dynamic_sims = dynamic_sims
+        self.heuristic_value = heuristic_value
+        self.value_net = value_net
         self._fp16 = False
         self._sim_rng = None  # SimpleRng, set per search
         # Pre-allocate obs buffer for server mode (reused across searches)
@@ -461,13 +537,22 @@ class MCTS:
                 path = [node]
 
                 while node.children and not sim_game.game_over:
-                    # Inline PUCT selection for speed
+                    # Open-loop PUCT: filter to moves legal on
+                    # this sim's actual board (stochastic spawns
+                    # may differ from the sim that expanded this node)
                     best_score = -1e30
                     best_action = 0
                     best_child = None
                     sqrt_parent = math.sqrt(node.visit_count)
                     q_range = max_q - min_q
+                    board = sim_game.board
                     for act_i, child in node.children.items():
+                        src_f = act_i // 81
+                        tgt_f = act_i % 81
+                        if board[src_f // 9, src_f % 9] == 0:
+                            continue
+                        if board[tgt_f // 9, tgt_f % 9] != 0:
+                            continue
                         vc = child.visit_count
                         if vc > 0:
                             q = child.value_sum / vc
@@ -481,8 +566,9 @@ class MCTS:
                             best_action = act_i
                             best_child = child
 
-                    # Decode flat action and execute trusted move
-                    # (move is guaranteed legal — from _legal_priors_jit)
+                    if best_child is None:
+                        break  # no legal children on this board
+
                     src_flat = best_action // 81
                     tgt_flat = best_action % 81
                     sim_game.trusted_move(
@@ -529,6 +615,20 @@ class MCTS:
                     pol_np = pol_logits.float().cpu().numpy()  # fp32 for JIT
                     val_np = values_t.cpu().numpy()
 
+            # === VALUE NET BATCH EVAL (if separate value network) ===
+            vnet_values = None
+            if self.value_net is not None and obs_count > 0:
+                vnet_device = next(self.value_net.parameters()).device
+                if use_server:
+                    vnet_obs = torch.from_numpy(
+                        obs_np_buf[:obs_count].copy()).to(vnet_device).float()
+                else:
+                    vnet_obs = self._obs_buf[:obs_count].float().to(vnet_device)
+                with torch.inference_mode():
+                    vnet_logits = self.value_net(vnet_obs)
+                    vnet_values = torch.sigmoid(
+                        vnet_logits.squeeze(-1)).float().cpu().numpy()
+
             # === EXPAND + BACKUP ===
             nn_idx = 0
             for b in range(bs):
@@ -536,15 +636,21 @@ class MCTS:
 
                 if batch_game_over[b]:
                     value = float(batch_games[b].score)
+                elif self.heuristic_value:
+                    value = _evaluate_board(batch_games[b].board)
                 else:
-                    value = float(val_np[nn_idx])
+                    # Expand with policy priors
                     node = batch_leaf_nodes[b]
-                    # Inline expand: JIT -> Nodes directly (no intermediate dict)
                     k, flat_idx, pri = _legal_priors_jit(
                         batch_games[b].board, pol_np[nn_idx], top_k)
                     ch = node.children
                     for i in range(k):
                         ch[int(flat_idx[i])] = Node(prior=float(pri[i]))
+                    # Value: use separate value_net if available
+                    if vnet_values is not None:
+                        value = float(vnet_values[nn_idx])
+                    else:
+                        value = float(val_np[nn_idx])
                     nn_idx += 1
 
                 min_q = min(min_q, value)
@@ -600,11 +706,12 @@ class MCTS:
 
 def make_mcts_player(net, device, max_score=30000.0,
                      num_simulations=400, c_puct=2.5, top_k=30,
-                     batch_size=16):
+                     batch_size=16, value_net=None):
     """Create MCTS player function for use with evaluate."""
     mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_simulations,
-                c_puct=c_puct, top_k=top_k, batch_size=batch_size)
+                c_puct=c_puct, top_k=top_k, batch_size=batch_size,
+                value_net=value_net)
 
     def player(game):
         return mcts.search(game)
