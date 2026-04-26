@@ -1661,15 +1661,52 @@ for strong policies.
     informed iterations = dramatically better search. With garbage values,
     batch_size doesn't matter (more iterations of noise doesn't help).
 
-99. **Separate value network: the breakthrough.** A small independent ValueNet
-    (5b×128ch, 1.7M params) trained on survival targets from V7/V8/crisis
-    data (1.9M positions, horizon=50 turns, 96.3% accuracy) transforms MCTS:
-    - 2W2 + garbage value @400 sims: mean=3,500, boost=+28%
-    - 2W2 + trained ValueNet @400 sims, bs=8: mean=7,294, boost=+218%
-    - Minimum score: 4,797 (was ~200 with garbage value)
-    - Every seed improved (4 seeds tested: +688%, +41%, +726%, +344%)
-    The value network predicts survival probability [0,1] for each leaf
-    position. MCTS gets real signal about board health, enabling informed
-    exploration instead of random overrides. The key was training a SEPARATE
-    network (no shared backbone conflict with policy) on a REAL target
-    (survival from game outcomes, not heuristic features).
+99. **Separate value network: premature victory.** The initial 4-seed test
+    (+218%) was misleading. At 50 seeds, the trained ValueNet HURT both
+    models: 2U -27%, 2W2 +2%. The "breakthrough" was a fluke from small
+    sample size + multiple confounding bugs discovered later (see 100-103).
+
+100. **fp16/fp32 policy eval mismatch invalidated per-seed comparisons.**
+     Policy eval used CPU fp32 pool, MCTS eval used GPU fp16. Same seed
+     produced different games → per-seed "MCTS destroyed this game" was
+     comparing completely different games. Diagnosis of seed 19 confirmed:
+     0% disagreement between policy and MCTS, same score (388). The
+     "6,243 → 388 (-94%)" was entirely a precision artifact. Fixed by
+     routing policy eval through GPU InferenceServer (fp16) to match MCTS.
+
+101. **Root value bug: value_net never got a fair test.** `_nn_evaluate_single`
+     always uses the policy model's garbage value head, even when value_net
+     is set. The root gets garbage value (~100 for 2W2), which anchors
+     min_q = max_q = 100. First value_net leaf returns ~0.95 → q_range = 99.
+     All subsequent value_net Q-values (0.95-1.0) compress to q_norm ≈ 0.0.
+     The garbage root value poisons Q-normalization for the entire search.
+     Discovered by ChatGPT code review.
+
+102. **Garbage value head outperforms trained value net.** With valid fp16
+     comparison and 50 seeds at 400 sims:
+     - 2U + garbage head: MCTS mean=5,257 (+130% over policy 2,282)
+     - 2U + trained ValueNet: MCTS mean=1,666 (-27%)
+     - 2W2 + garbage head: MCTS mean=4,188 (+21% over policy 3,465)
+     - 2W2 + trained ValueNet: MCTS mean=3,530 (+2%)
+     But: the ValueNet comparison is invalidated by bug #101. The garbage
+     head's Q-diversity (2U: std=14, 2W2: std=7) drives exploration.
+     2U's wider spread explains its bigger MCTS boost.
+
+103. **2W2 MCTS is worse than 2U MCTS despite stronger policy.** 2W2 MCTS
+     absolute score (4,188) is LOWER than 2U MCTS (5,257) even though
+     2W2 policy (3,465) is higher than 2U policy (2,282). The garbage
+     value head produces less Q-diversity for 2W2 (std=7 vs std=14),
+     giving MCTS less exploration signal. This needs further investigation.
+
+### Known Bugs To Fix (discovered via ChatGPT + Gemini code review)
+
+- **Root value bug**: `_nn_evaluate_single` ignores `self.value_net`.
+  Root always gets garbage value, poisoning Q-normalization for value_net.
+- **ValueNet accuracy inflated**: 96.3% from position-level split (not
+  game-level), adjacent states leak between train/val. Binary threshold
+  on saturated target is easy to pass without learning move ranking.
+- **Diagnosis q_range wrong**: `mcts_deep_diagnosis.py` recomputes min/max
+  from root children only, but MCTS uses global running min/max from all
+  backed-up leaves.
+- **ValueNet fp32 in workers**: per-worker value_net loaded without .half(),
+  runs fp32 while policy runs fp16.
