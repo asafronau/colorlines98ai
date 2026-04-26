@@ -228,9 +228,12 @@ def main():
     # ── Policy evaluation ──
     pol_results = []
     if not args.mcts_only:
-        use_gpu = args.workers > 1 and device_str != 'cpu'
-        if use_gpu:
-            pol_results = _run_policy_server(args, task_seeds, total, device_str)
+        if device_str != 'cpu':
+            # Always use GPU server for policy eval (fp16, matches MCTS precision)
+            pol_workers = max(args.workers, 4)
+            pol_results = _run_policy_server(
+                args, task_seeds, total, device_str,
+                n_workers_override=pol_workers)
         else:
             print(f"\n{'='*60}", flush=True)
             print(f"Policy player ({total} games, {n_cpu} CPU workers)", flush=True)
@@ -255,15 +258,18 @@ def main():
                    show_mcts=not args.policy_only)
 
 
-def _run_policy_server(args, task_seeds, total, device_str):
+def _run_policy_server(args, task_seeds, total, device_str,
+                       n_workers_override=None):
     """Run policy-only games using GPU inference server."""
     from alphatrain.inference_server import InferenceServer
 
+    n_workers = n_workers_override or args.workers
+
     print(f"\n{'='*60}", flush=True)
-    print(f"Policy player ({total} games, {args.workers} GPU workers)", flush=True)
+    print(f"Policy player ({total} games, {n_workers} GPU workers)", flush=True)
     print(f"{'='*60}", flush=True)
 
-    server = InferenceServer(args.model, args.workers,
+    server = InferenceServer(args.model, n_workers,
                              device=device_str,
                              max_batch_per_worker=args.batch_size)
     server.start()
@@ -271,19 +277,19 @@ def _run_policy_server(args, task_seeds, total, device_str):
     seed_queue = MPQueue()
     for s in task_seeds:
         seed_queue.put(s)
-    for _ in range(args.workers):
+    for _ in range(n_workers):
         seed_queue.put(None)
 
     result_queue = MPQueue()
 
     workers = []
-    for i in range(args.workers):
+    for i in range(n_workers):
         p = Process(
             target=_eval_policy_gpu_worker,
             args=(i, seed_queue, result_queue,
                   server._obs_shm.name, server._pol_shm.name,
                   server._val_shm.name,
-                  args.workers, args.batch_size,
+                  n_workers, args.batch_size,
                   server.request_queue, server.response_queues[i]))
         p.start()
         workers.append(p)

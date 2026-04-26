@@ -635,7 +635,11 @@ class MCTS:
                 path = batch_paths[b]
 
                 if batch_game_over[b]:
-                    value = float(batch_games[b].score)
+                    # When using value_net, terminal values must be on
+                    # the same [0,1] scale (dead board = 0.0).
+                    # Without value_net, use raw game score.
+                    value = 0.0 if self.value_net is not None \
+                        else float(batch_games[b].score)
                 elif self.heuristic_value:
                     value = _evaluate_board(batch_games[b].board)
                 else:
@@ -698,6 +702,8 @@ class MCTS:
 
         # Decode flat action to tuple format for callers
         action = _flat_to_action(flat_action)
+
+        self._last_root = root
 
         if return_policy:
             return action, policy_target
