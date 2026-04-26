@@ -105,7 +105,8 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                       obs_shm_name, pol_shm_name, val_shm_name,
                       num_workers, max_batch, request_queue, response_queue,
                       num_sims, c_puct, top_k, max_score,
-                      value_net_path=None, device_str='cpu'):
+                      value_net_path=None, device_str='cpu',
+                      terminal_value=None):
     """Persistent worker: pull seeds, play greedy MCTS games, push results."""
     torch.set_num_threads(1)
 
@@ -144,7 +145,8 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
 
     mcts = MCTS(inference_client=client, max_score=max_score,
                 num_simulations=num_sims, c_puct=c_puct, top_k=top_k,
-                batch_size=max_batch, value_net=vnet)
+                batch_size=max_batch, value_net=vnet,
+                terminal_value=terminal_value)
 
     while True:
         seed = seed_queue.get()
@@ -201,6 +203,9 @@ def main():
     p.add_argument('--mcts-only', action='store_true')
     p.add_argument('--value-net', default=None,
                    help='Separate ValueNet checkpoint for MCTS leaf eval')
+    p.add_argument('--value-mode', default=None,
+                   help='Value mode: zero, hash, iid:<std>, or None (model head). '
+                        'E.g. --value-mode hash or --value-mode iid:14')
     args = p.parse_args()
 
     if args.device:
@@ -353,12 +358,36 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         print(f"ValueNet: {ckpt['num_blocks']}b x {ckpt['channels']}ch, "
               f"acc={ckpt['accuracy']:.1f}% [fp16]", flush=True)
 
+    # Value mode for local MCTS (zero, hash, iid:<std>)
+    vmode = getattr(args, 'value_mode', None)
+    if vmode == 'zero':
+        print("*** VALUE MODE: zero ***", flush=True)
+        net.predict_value = lambda val_logits, max_val=None: \
+            torch.zeros(val_logits.shape[0], device=val_logits.device)
+    elif vmode and vmode.startswith('iid:'):
+        std = float(vmode.split(':')[1])
+        print(f"*** VALUE MODE: iid N(100, {std}) ***", flush=True)
+        net.predict_value = lambda val_logits, max_val=None, _s=std: \
+            torch.randn(val_logits.shape[0], device=val_logits.device) * _s + 100
+    elif vmode == 'hash':
+        import hashlib
+        print("*** VALUE MODE: deterministic hash ***", flush=True)
+        def _hash_value(val_logits, max_val=None):
+            # Not used in local mode — hash is in the server
+            return torch.zeros(val_logits.shape[0], device=val_logits.device) + 100
+        net.predict_value = _hash_value
+    elif vmode:
+        print(f"*** VALUE MODE: {vmode} (unknown, using default) ***", flush=True)
+
+    # Terminal value: 0.0 for synthetic modes and value_net
+    tv = 0.0 if (vmode or vnet) else None
+
     player = make_mcts_player(
         net, device, max_score=max_score,
         num_simulations=args.simulations,
         c_puct=args.c_puct, top_k=args.top_k,
         batch_size=args.batch_size,
-        value_net=vnet)
+        value_net=vnet, terminal_value=tv)
 
     results = []
     t0 = time.time()
@@ -403,12 +432,15 @@ def _run_mcts_server(args, task_seeds, total, device_str):
     max_score = float(ckpt.get('max_score', 30000.0))
     del ckpt
 
-    value_path = getattr(args, 'value_model', None)
+    vnet_path = getattr(args, 'value_net', None) or \
+                getattr(args, 'value_model', None)
     det = getattr(args, 'deterministic', False)
+    vmode = getattr(args, 'value_mode', None)
     server = InferenceServer(args.model, n_workers, device=device_str,
                              max_batch_per_worker=args.batch_size,
-                             value_model_path=value_path,
-                             deterministic=det)
+                             value_model_path=vnet_path,
+                             deterministic=det,
+                             value_mode=vmode)
     server.start()
 
     seed_queue = MPQueue()
@@ -431,7 +463,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                   n_workers, args.batch_size,
                   server.request_queue, server.response_queues[i],
                   args.simulations, args.c_puct, args.top_k, max_score,
-                  vnet_path, device_str))
+                  vnet_path, device_str,
+                  0.0 if (vmode or vnet_path) else None))
         proc.start()
         workers.append(proc)
 

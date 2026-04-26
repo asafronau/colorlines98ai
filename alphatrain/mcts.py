@@ -374,7 +374,8 @@ class MCTS:
     def __init__(self, net=None, device=None, max_score=30000.0,
                  num_simulations=400, c_puct=2.5, top_k=30, batch_size=16,
                  inference_client=None, dynamic_sims=False,
-                 heuristic_value=False, value_net=None):
+                 heuristic_value=False, value_net=None,
+                 terminal_value=None):
         self.net = net
         self.device = device
         self.max_score = max_score
@@ -386,6 +387,7 @@ class MCTS:
         self.dynamic_sims = dynamic_sims
         self.heuristic_value = heuristic_value
         self.value_net = value_net
+        self.terminal_value = terminal_value
         self._fp16 = False
         self._sim_rng = None  # SimpleRng, set per search
         # Pre-allocate obs buffer for server mode (reused across searches)
@@ -656,11 +658,12 @@ class MCTS:
                 path = batch_paths[b]
 
                 if batch_game_over[b]:
-                    # When using value_net, terminal values must be on
-                    # the same [0,1] scale (dead board = 0.0).
-                    # Without value_net, use raw game score.
-                    value = 0.0 if self.value_net is not None \
-                        else float(batch_games[b].score)
+                    if self.terminal_value is not None:
+                        value = self.terminal_value
+                    elif self.value_net is not None:
+                        value = 0.0
+                    else:
+                        value = float(batch_games[b].score)
                 elif self.heuristic_value:
                     value = _evaluate_board(batch_games[b].board)
                 else:
@@ -735,12 +738,12 @@ class MCTS:
 
 def make_mcts_player(net, device, max_score=30000.0,
                      num_simulations=400, c_puct=2.5, top_k=30,
-                     batch_size=16, value_net=None):
+                     batch_size=16, value_net=None, terminal_value=None):
     """Create MCTS player function for use with evaluate."""
     mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_simulations,
                 c_puct=c_puct, top_k=top_k, batch_size=batch_size,
-                value_net=value_net)
+                value_net=value_net, terminal_value=terminal_value)
 
     def player(game):
         return mcts.search(game)
