@@ -209,8 +209,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     print(f"GPU inference server ready ({device_str}, fp16+jit, "
           f"{num_workers} slots, max_batch={max_batch}, {mode})", flush=True)
 
-    # Cap GPU batch -- too large hurts per-eval latency on MPS
-    GPU_BATCH_CAP = 128
+    GPU_BATCH_CAP = num_workers * max_batch  # no artificial cap
 
     # Adaptive gather: in batched mode with multiple workers, busy-poll
     # briefly after first request to accumulate a larger GPU batch.
