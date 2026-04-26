@@ -32,23 +32,13 @@ def fmt_action(flat):
     return f"({s//9},{s%9})->({t//9},{t%9})"
 
 
-def inspect_root(root, c_puct):
-    """Extract PUCT components for all root children."""
+def inspect_root(root, c_puct, min_q, max_q):
+    """Extract PUCT components for all root children.
+
+    Uses the actual global min_q/max_q from the search (not recomputed).
+    """
     children = []
     sqrt_parent = math.sqrt(root.visit_count)
-
-    # Compute q_range from children
-    q_values = []
-    for child in root.children.values():
-        if child.visit_count > 0:
-            q_values.append(child.value_sum / child.visit_count)
-    if len(q_values) >= 2:
-        min_q = min(q_values)
-        max_q = max(q_values)
-    elif len(q_values) == 1:
-        min_q = max_q = q_values[0]
-    else:
-        min_q = max_q = 0.5
     q_range = max_q - min_q
 
     for action, child in root.children.items():
@@ -156,7 +146,8 @@ def main():
 
         # Inspect root
         root = mcts._last_root
-        children_info, q_range, min_q, max_q = inspect_root(root, args.c_puct)
+        children_info, q_range, min_q, max_q = inspect_root(
+            root, args.c_puct, mcts._last_min_q, mcts._last_max_q)
         q_ranges.append(q_range)
 
         # Value spread: std of Q across visited children
