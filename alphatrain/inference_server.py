@@ -78,10 +78,11 @@ class InferenceServer:
 
     def __init__(self, model_path, num_workers, device=None,
                  max_batch_per_worker=MAX_BATCH, value_model_path=None,
-                 deterministic=False):
+                 deterministic=False, value_mode=None):
         self.model_path = model_path
         self.value_model_path = value_model_path
         self.deterministic = deterministic
+        self.value_mode = value_mode
         self.num_workers = num_workers
         self.max_batch = max_batch_per_worker
 
@@ -125,7 +126,8 @@ class InferenceServer:
                   self.num_workers, self.max_batch,
                   self._obs_shm.name, self._pol_shm.name, self._val_shm.name,
                   self.request_queue, self.response_queues,
-                  self.value_model_path, self.deterministic),
+                  self.value_model_path, self.deterministic,
+                  self.value_mode),
             daemon=True)
         self._process.start()
 
@@ -153,7 +155,7 @@ class InferenceServer:
 def _gpu_loop(model_path, device_str, num_workers, max_batch,
               obs_shm_name, pol_shm_name, val_shm_name,
               request_queue, response_queues, value_model_path=None,
-              deterministic=False):
+              deterministic=False, value_mode=None):
     """GPU inference process main loop.
 
     Two modes:
@@ -183,13 +185,22 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
 
     # Separate ValueNet (if provided)
     value_net_traced = None
-    value_predict = None
     if value_model_path:
-        from alphatrain.evaluate import load_value_model
-        vnet, max_score = load_value_model(value_model_path, device)
-        vnet = vnet.half()
+        from alphatrain.model import ValueNet
+        ckpt = torch.load(value_model_path, map_location='cpu', weights_only=False)
+        vnet = ValueNet(in_channels=18,
+                        num_blocks=ckpt['num_blocks'],
+                        channels=ckpt['channels'],
+                        num_value_bins=1)
+        vnet.load_state_dict(ckpt['model'])
+        vnet = vnet.to(device).half()
         value_net_traced = torch.jit.trace(vnet, dummy)
-        value_predict = vnet.predict_value
+        print(f"  ValueNet: {ckpt['num_blocks']}b x {ckpt['channels']}ch, "
+              f"acc={ckpt.get('accuracy', 0):.1f}%", flush=True)
+
+    # Value mode: 'zero', 'hash', 'iid:<std>', or None (use model head)
+    if value_mode:
+        print(f"  Value mode: {value_mode}", flush=True)
 
     # Pre-allocate GPU-side batch buffer in fp16
     max_total = num_workers * max_batch
@@ -205,9 +216,29 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     total_gpu_batches = 0
     t_start = time.time()
 
-    mode = "dual-model" if value_model_path else "single-model"
+    mode = "value_net" if value_model_path else \
+           f"value_mode={value_mode}" if value_mode else "single-model"
     print(f"GPU inference server ready ({device_str}, fp16+jit, "
           f"{num_workers} slots, max_batch={max_batch}, {mode})", flush=True)
+
+    def _compute_values(obs_half, count, pol_logits, val_logits):
+        """Compute values based on value_mode setting."""
+        if value_net_traced is not None:
+            vnet_logits = value_net_traced(obs_half[:count])
+            return torch.sigmoid(vnet_logits.squeeze(-1))
+        if value_mode == 'zero':
+            return torch.zeros(count, device=device)
+        if value_mode and value_mode.startswith('iid:'):
+            std = float(value_mode.split(':')[1])
+            return torch.randn(count, device=device) * std + 100
+        if value_mode == 'hash':
+            # Deterministic per-state: hash the observation bytes
+            obs_np = obs_half[:count].float().cpu().numpy()
+            hashes = np.array([
+                hash(obs_np[i].tobytes()) % (2**31) / (2**31)
+                for i in range(count)], dtype=np.float32)
+            return torch.from_numpy(hashes).to(device) * 200
+        return net.predict_value(val_logits, max_val=max_score)
 
     GPU_BATCH_CAP = num_workers * max_batch  # no artificial cap
 
@@ -253,16 +284,9 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                     gpu_obs[:count] = torch.from_numpy(
                         obs_buf[slot_id, :count]).half()
 
-                    if value_net_traced is not None:
-                        pol_logits, _ = net_traced(gpu_obs[:count])
-                        val_logits = value_net_traced(gpu_obs[:count])
-                        values = value_predict(val_logits, max_val=max_score)
-                    else:
-                        pol_logits, val_logits = net_traced(gpu_obs[:count])
-                        values = net.predict_value(val_logits, max_val=max_score)
+                    pol_logits, val_logits = net_traced(gpu_obs[:count])
+                    values = _compute_values(gpu_obs, count, pol_logits, val_logits)
 
-                    # Direct copy: .float().cpu().numpy() is fastest on MPS
-                    # (pre-allocated copy_ is slower due to MPS sync overhead)
                     pol_buf[slot_id, :count] = pol_logits.float().cpu().numpy()
                     val_buf[slot_id, :count] = values.float().cpu().numpy()
                     response_queues[slot_id].put(1)
@@ -312,13 +336,9 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                 obs_staging[:total_count]).half()
 
             with torch.inference_mode():
-                if value_net_traced is not None:
-                    pol_logits, _ = net_traced(gpu_obs[:total_count])
-                    val_logits = value_net_traced(gpu_obs[:total_count])
-                    values = value_predict(val_logits, max_val=max_score)
-                else:
-                    pol_logits, val_logits = net_traced(gpu_obs[:total_count])
-                    values = net.predict_value(val_logits, max_val=max_score)
+                pol_logits, val_logits = net_traced(gpu_obs[:total_count])
+                values = _compute_values(
+                    gpu_obs, total_count, pol_logits, val_logits)
 
             # Transfer GPU results to CPU in one shot, then scatter to SHM.
             # .float().cpu() is faster than copy_() on MPS.
