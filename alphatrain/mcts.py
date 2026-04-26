@@ -407,19 +407,37 @@ class MCTS:
         """Single NN forward pass -> (priors dict, value scalar).
 
         Uses inference_client if available, otherwise direct net call.
+        When value_net is set, uses it for value instead of the policy
+        model's value head.
         Returns priors as {flat_int: prior}.
         """
         obs_np = _build_obs_for_game(game)
         if self.inference_client is not None:
             pol_np, value = self.inference_client.evaluate(obs_np)
             priors = _get_legal_priors_flat(game.board, pol_np, self.top_k)
+            # If value_net is loaded in-process, override server's value
+            if self.value_net is not None:
+                obs_t = torch.from_numpy(obs_np).unsqueeze(0)
+                vnet_device = next(self.value_net.parameters()).device
+                vnet_dtype = next(self.value_net.parameters()).dtype
+                obs_t = obs_t.to(device=vnet_device, dtype=vnet_dtype)
+                with torch.inference_mode():
+                    vnet_logits = self.value_net(obs_t)
+                    value = torch.sigmoid(vnet_logits.squeeze(-1)).item()
             return priors, value
         obs = torch.from_numpy(obs_np).unsqueeze(0).to(self.device)
         if self._fp16:
             obs = obs.half()
         with torch.inference_mode():
             pol_logits, val_logits = self.net(obs)
-            value = self.net.predict_value(val_logits, max_val=self.max_score).item()
+            if self.value_net is not None:
+                vnet_dtype = next(self.value_net.parameters()).dtype
+                vnet_obs = obs.to(dtype=vnet_dtype)
+                vnet_logits = self.value_net(vnet_obs)
+                value = torch.sigmoid(vnet_logits.squeeze(-1)).item()
+            else:
+                value = self.net.predict_value(
+                    val_logits, max_val=self.max_score).item()
         pol_np = pol_logits[0].float().cpu().numpy()
         priors = _get_legal_priors_flat(game.board, pol_np, self.top_k)
         return priors, value
@@ -619,11 +637,14 @@ class MCTS:
             vnet_values = None
             if self.value_net is not None and obs_count > 0:
                 vnet_device = next(self.value_net.parameters()).device
+                vnet_dtype = next(self.value_net.parameters()).dtype
                 if use_server:
                     vnet_obs = torch.from_numpy(
-                        obs_np_buf[:obs_count].copy()).to(vnet_device).float()
+                        obs_np_buf[:obs_count].copy()).to(
+                        device=vnet_device, dtype=vnet_dtype)
                 else:
-                    vnet_obs = self._obs_buf[:obs_count].float().to(vnet_device)
+                    vnet_obs = self._obs_buf[:obs_count].to(
+                        device=vnet_device, dtype=vnet_dtype)
                 with torch.inference_mode():
                     vnet_logits = self.value_net(vnet_obs)
                     vnet_values = torch.sigmoid(
@@ -704,6 +725,8 @@ class MCTS:
         action = _flat_to_action(flat_action)
 
         self._last_root = root
+        self._last_min_q = min_q
+        self._last_max_q = max_q
 
         if return_policy:
             return action, policy_target

@@ -137,10 +137,10 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                         channels=ckpt['channels'],
                         num_value_bins=1)
         vnet.load_state_dict(ckpt['model'])
-        vnet = vnet.to(device)
+        vnet = vnet.to(device).half()
         vnet.requires_grad_(False)
         print(f"  [w{slot_id}] ValueNet loaded: {ckpt['num_blocks']}b x "
-              f"{ckpt['channels']}ch on {device_str}", flush=True)
+              f"{ckpt['channels']}ch on {device_str} [fp16]", flush=True)
 
     mcts = MCTS(inference_client=client, max_score=max_score,
                 num_simulations=num_sims, c_puct=c_puct, top_k=top_k,
@@ -348,10 +348,10 @@ def _run_mcts_local(args, task_seeds, total, device_str):
                         channels=ckpt['channels'],
                         num_value_bins=1)
         vnet.load_state_dict(ckpt['model'])
-        vnet = vnet.to(device)
+        vnet = vnet.to(device).half()
         vnet.requires_grad_(False)
         print(f"ValueNet: {ckpt['num_blocks']}b x {ckpt['channels']}ch, "
-              f"acc={ckpt['accuracy']:.1f}%", flush=True)
+              f"acc={ckpt['accuracy']:.1f}% [fp16]", flush=True)
 
     player = make_mcts_player(
         net, device, max_score=max_score,
