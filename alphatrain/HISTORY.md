@@ -1740,3 +1740,26 @@ synthetic modes. Policy mean=3,465 on these seeds.
      (0-200 or 0-1) broke Q-normalization. Previous IID results (+130%
      for 2U) were inflated by terminal leakage. Fixed via terminal_value
      parameter that normalizes terminals to 0.0 for synthetic modes.
+
+107. **A frozen policy backbone contains search-useful latent structure.**
+     Testing 5 freshly randomized value heads (different random seeds,
+     same frozen 2W2 backbone) on 20 seeds, terminal=0.0:
+     - Original garbage head: mean=4,407
+     - Random head seed=0: mean=3,534
+     - Random head seed=1: mean=3,835
+     - Random head seed=2: mean=3,896
+     - Random head seed=3: mean=4,084
+     - IID noise std=14: mean=3,217
+     All random projections of the backbone work (3,534-4,084).
+     The original head isn't special — it's one sample from a family
+     of useful readouts. The backbone features encode information
+     valuable for search, and many random readouts can expose it.
+
+108. **Value head only matters on ~30% of seeds.** 14 out of 20 seeds
+     produced identical MCTS scores regardless of which value head was
+     used (original, 5 random heads). On these seeds, the policy
+     dominates search completely. The value head only influences the
+     6 seeds where MCTS faces genuine decision uncertainty. This means
+     value head improvements have a bounded ceiling: even a perfect
+     value function can only help on the minority of positions where
+     the policy is uncertain.
