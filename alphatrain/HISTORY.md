@@ -1710,3 +1710,33 @@ for strong policies.
   backed-up leaves.
 - **ValueNet fp32 in workers**: per-worker value_net loaded without .half(),
   runs fp32 while policy runs fp16.
+
+### Value Ablation Study (clean terminal handling)
+
+All tests: 2W2, 400 sims, 20 seeds (0-19), terminal_value=0.0 for all
+synthetic modes. Policy mean=3,465 on these seeds.
+
+104. **The garbage value head provides structured state-dependent signal.**
+     Clean ablation with normalized terminals:
+     - Garbage head (terminal=0): mean=4,407 (+27%)
+     - IID noise std=7: mean=3,335 (-4%)
+     - IID noise std=14: mean=3,217 (-7%)
+     - IID noise std=50: mean=2,756 (-20%)
+     - Deterministic hash: mean=2,069 (-40%)
+     - Zero value: ≈ policy (no search benefit)
+     The garbage head beats all forms of random noise. It's not random —
+     it's a frozen random projection of trained backbone features that
+     accidentally provides useful state-dependent value ordering.
+
+105. **IID noise helps via visit-dependent uncertainty, but it's weak.**
+     Fresh IID noise per evaluation means less-visited nodes keep more
+     Q-variance, creating an exploration bonus similar to Thompson sampling.
+     But it lacks state consistency (same board → different values each
+     time), so the signal is much weaker than structured projections.
+     Smaller std is better (7 > 14 > 50) — less noise = more policy trust.
+
+106. **Terminal value contamination was a confound.** Raw game.score on
+     terminal leaves (hundreds/thousands) mixed with synthetic values
+     (0-200 or 0-1) broke Q-normalization. Previous IID results (+130%
+     for 2U) were inflated by terminal leakage. Fixed via terminal_value
+     parameter that normalizes terminals to 0.0 for synthetic modes.
