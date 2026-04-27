@@ -206,6 +206,9 @@ def main():
     p.add_argument('--value-mode', default=None,
                    help='Value mode: zero, hash, iid:<std>, or None (model head). '
                         'E.g. --value-mode hash or --value-mode iid:14')
+    p.add_argument('--terminal-value', type=float, default=None,
+                   help='Force terminal (game-over) value. '
+                        'E.g. --terminal-value 0 for normalized terminals.')
     args = p.parse_args()
 
     if args.device:
@@ -379,8 +382,9 @@ def _run_mcts_local(args, task_seeds, total, device_str):
     elif vmode:
         print(f"*** VALUE MODE: {vmode} (unknown, using default) ***", flush=True)
 
-    # Terminal value: 0.0 for synthetic modes and value_net
-    tv = 0.0 if (vmode or vnet) else None
+    # Terminal value: explicit flag > auto (0.0 for synthetic/value_net) > None
+    tv = args.terminal_value if args.terminal_value is not None \
+        else (0.0 if (vmode or vnet) else None)
 
     player = make_mcts_player(
         net, device, max_score=max_score,
@@ -464,7 +468,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                   server.request_queue, server.response_queues[i],
                   args.simulations, args.c_puct, args.top_k, max_score,
                   vnet_path, device_str,
-                  0.0 if (vmode or vnet_path) else None))
+                  args.terminal_value if args.terminal_value is not None
+                  else (0.0 if (vmode or vnet_path) else None)))
         proc.start()
         workers.append(proc)
 
