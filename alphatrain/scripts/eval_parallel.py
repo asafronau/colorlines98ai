@@ -28,6 +28,7 @@ import time
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 from multiprocessing import Process, Pool, Queue as MPQueue, cpu_count
 
 
@@ -203,6 +204,8 @@ def main():
     p.add_argument('--mcts-only', action='store_true')
     p.add_argument('--value-net', default=None,
                    help='Separate ValueNet checkpoint for MCTS leaf eval')
+    p.add_argument('--ranking-head', default=None,
+                   help='Ranking head checkpoint (trained on frozen backbone)')
     p.add_argument('--value-mode', default=None,
                    help='Value mode: zero, hash, iid:<std>, or None (model head). '
                         'E.g. --value-mode hash or --value-mode iid:14')
@@ -255,7 +258,8 @@ def main():
     # ── MCTS evaluation ──
     mcts_results = []
     if not args.policy_only:
-        if args.workers > 1 and device_str != 'cpu':
+        use_server = args.workers > 1 and device_str != 'cpu'
+        if use_server:
             mcts_results = _run_mcts_server(args, task_seeds, total, device_str)
         else:
             mcts_results = _run_mcts_local(args, task_seeds, total, device_str)
@@ -337,14 +341,17 @@ def _run_mcts_local(args, task_seeds, total, device_str):
           f"{', dual-model' if dual else ''})", flush=True)
     print(f"{'='*60}", flush=True)
 
+    # When using ranking head, we need raw backbone access (no JIT)
+    use_jit = not getattr(args, 'ranking_head', None)
     if dual:
         from alphatrain.evaluate import load_dual_model
         net, max_score = load_dual_model(
             args.model, args.value_model, device,
-            fp16=(device_str != 'cpu'), jit_trace=True)
+            fp16=(device_str != 'cpu'), jit_trace=use_jit)
     else:
         net, max_score = load_model(args.model, device,
-                                    fp16=(device_str != 'cpu'), jit_trace=True)
+                                    fp16=(device_str != 'cpu'),
+                                    jit_trace=use_jit)
 
     # Load separate value network if provided
     vnet = None
@@ -360,6 +367,58 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         vnet.requires_grad_(False)
         print(f"ValueNet: {ckpt['num_blocks']}b x {ckpt['channels']}ch, "
               f"acc={ckpt['accuracy']:.1f}% [fp16]", flush=True)
+
+    # Load ranking head if provided (overrides value_net)
+    if getattr(args, 'ranking_head', None):
+        from alphatrain.scripts.train_ranking_head import (
+            RankingHead, SpatialRankingHead)
+        ckpt = torch.load(args.ranking_head, map_location='cpu',
+                          weights_only=False)
+        if ckpt.get('spatial', False):
+            rhead = SpatialRankingHead(
+                channels=256,
+                value_channels=ckpt.get('value_channels', 32),
+                value_hidden=ckpt.get('value_hidden', 256))
+        else:
+            rhead = RankingHead(in_features=ckpt.get('in_features', 256),
+                                hidden=ckpt.get('hidden', 0))
+        rhead.load_state_dict(ckpt['head'])
+        if device_str != 'cpu':
+            rhead = rhead.to(device).half()
+        else:
+            rhead = rhead.to(device)
+        rhead.requires_grad_(False)
+        print(f"RankingHead: hidden={ckpt.get('hidden', 0)}, "
+              f"val_acc={100*ckpt.get('val_acc', 0):.1f}%", flush=True)
+
+        # Wrap as a "value_net" that MCTS can use:
+        # backbone features → global avg pool → ranking head → scalar
+        import torch.nn.functional as _F
+
+        is_spatial = ckpt.get('spatial', False)
+
+        class RankingWrapper(nn.Module):
+            def __init__(self, backbone, head, spatial):
+                super().__init__()
+                self.backbone = backbone
+                self.head = head
+                self.spatial = spatial
+            def forward(self, x):
+                # Zero fake next_balls channels to match training data
+                x = x.clone()
+                x[:, 8:12] = 0
+                with torch.inference_mode():
+                    out = self.backbone.stem(x)
+                    out = self.backbone.blocks(out)
+                    out = _F.relu(self.backbone.backbone_bn(out))
+                if not self.spatial:
+                    out = out.mean(dim=(2, 3))
+                return self.head(out)  # (batch, 1)
+
+        # Build wrapper using the policy net's frozen backbone
+        vnet = RankingWrapper(net, rhead, is_spatial)
+        vnet = vnet.to(device)
+        print(f"  Wrapped as value_net on backbone", flush=True)
 
     # Value mode for local MCTS (zero, hash, iid:<std>)
     vmode = getattr(args, 'value_mode', None)
@@ -383,8 +442,9 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         print(f"*** VALUE MODE: {vmode} (unknown, using default) ***", flush=True)
 
     # Terminal value: explicit flag > auto (0.0 for synthetic/value_net) > None
+    has_custom_value = vmode or vnet or getattr(args, 'ranking_head', None)
     tv = args.terminal_value if args.terminal_value is not None \
-        else (0.0 if (vmode or vnet) else None)
+        else (0.0 if has_custom_value else None)
 
     player = make_mcts_player(
         net, device, max_score=max_score,
@@ -438,13 +498,15 @@ def _run_mcts_server(args, task_seeds, total, device_str):
 
     vnet_path = getattr(args, 'value_net', None) or \
                 getattr(args, 'value_model', None)
+    rhead_path = getattr(args, 'ranking_head', None)
     det = getattr(args, 'deterministic', False)
     vmode = getattr(args, 'value_mode', None)
     server = InferenceServer(args.model, n_workers, device=device_str,
                              max_batch_per_worker=args.batch_size,
                              value_model_path=vnet_path,
                              deterministic=det,
-                             value_mode=vmode)
+                             value_mode=vmode,
+                             ranking_head_path=rhead_path)
     server.start()
 
     seed_queue = MPQueue()
@@ -469,7 +531,7 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                   args.simulations, args.c_puct, args.top_k, max_score,
                   vnet_path, device_str,
                   args.terminal_value if args.terminal_value is not None
-                  else (0.0 if (vmode or vnet_path) else None)))
+                  else (0.0 if (vmode or vnet_path or rhead_path) else None)))
         proc.start()
         workers.append(proc)
 
