@@ -78,11 +78,13 @@ class InferenceServer:
 
     def __init__(self, model_path, num_workers, device=None,
                  max_batch_per_worker=MAX_BATCH, value_model_path=None,
-                 deterministic=False, value_mode=None):
+                 deterministic=False, value_mode=None,
+                 ranking_head_path=None):
         self.model_path = model_path
         self.value_model_path = value_model_path
         self.deterministic = deterministic
         self.value_mode = value_mode
+        self.ranking_head_path = ranking_head_path
         self.num_workers = num_workers
         self.max_batch = max_batch_per_worker
 
@@ -127,7 +129,7 @@ class InferenceServer:
                   self._obs_shm.name, self._pol_shm.name, self._val_shm.name,
                   self.request_queue, self.response_queues,
                   self.value_model_path, self.deterministic,
-                  self.value_mode),
+                  self.value_mode, self.ranking_head_path),
             daemon=True)
         self._process.start()
 
@@ -155,7 +157,8 @@ class InferenceServer:
 def _gpu_loop(model_path, device_str, num_workers, max_batch,
               obs_shm_name, pol_shm_name, val_shm_name,
               request_queue, response_queues, value_model_path=None,
-              deterministic=False, value_mode=None):
+              deterministic=False, value_mode=None,
+              ranking_head_path=None):
     """GPU inference process main loop.
 
     Two modes:
@@ -198,6 +201,45 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
         print(f"  ValueNet: {ckpt['num_blocks']}b x {ckpt['channels']}ch, "
               f"acc={ckpt.get('accuracy', 0):.1f}%", flush=True)
 
+    # Ranking head: loads backbone (non-JIT) + small ranking readout
+    ranking_fn = None
+    if ranking_head_path:
+        from alphatrain.scripts.train_ranking_head import (
+            RankingHead, SpatialRankingHead)
+        rckpt = torch.load(ranking_head_path, map_location='cpu',
+                           weights_only=False)
+        if rckpt.get('spatial', False):
+            rhead = SpatialRankingHead(
+                channels=256,
+                value_channels=rckpt.get('value_channels', 32),
+                value_hidden=rckpt.get('value_hidden', 256))
+        else:
+            rhead = RankingHead(in_features=rckpt.get('in_features', 256),
+                                hidden=rckpt.get('hidden', 0))
+        rhead.load_state_dict(rckpt['head'])
+        rhead = rhead.to(device).half()
+        is_spatial = rckpt.get('spatial', False)
+        # Load a non-JIT copy of backbone for feature extraction
+        backbone_net, _ = load_model(model_path, device)
+        backbone_net = backbone_net.half()
+        backbone_net.eval()
+        import torch.nn.functional as _F
+
+        def _ranking_eval(obs_half, count):
+            obs = obs_half[:count].clone()
+            obs[:, 8:12] = 0  # zero fake next_balls to match training
+            with torch.inference_mode():
+                out = backbone_net.stem(obs)
+                out = backbone_net.blocks(out)
+                out = _F.relu(backbone_net.backbone_bn(out))
+                if not is_spatial:
+                    out = out.mean(dim=(2, 3))
+                return torch.sigmoid(rhead(out).squeeze(-1))
+
+        ranking_fn = _ranking_eval
+        print(f"  RankingHead: hidden={rckpt.get('hidden', 0)}, "
+              f"val_acc={100*rckpt.get('val_acc', 0):.1f}%", flush=True)
+
     # Value mode: 'zero', 'hash', 'iid:<std>', or None (use model head)
     if value_mode:
         print(f"  Value mode: {value_mode}", flush=True)
@@ -223,6 +265,8 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
 
     def _compute_values(obs_half, count, pol_logits, val_logits):
         """Compute values based on value_mode setting."""
+        if ranking_fn is not None:
+            return ranking_fn(obs_half, count)
         if value_net_traced is not None:
             vnet_logits = value_net_traced(obs_half[:count])
             return torch.sigmoid(vnet_logits.squeeze(-1))

@@ -1698,6 +1698,31 @@ for strong policies.
      value head produces less Q-diversity for 2W2 (std=7 vs std=14),
      giving MCTS less exploration signal. This needs further investigation.
 
+109. **Frozen spatial head: 62.5% offline → +24% MCTS.** A frozen random
+     spatial mixer (conv+BN+FC, kaiming_normal_ init, only fc2 trainable
+     with 513 params) gave 62.5% offline accuracy but +24% MCTS boost.
+     Compared to the linear GAP head (74.4% offline, +3% MCTS). Spatial
+     structure matters for search even when it hurts offline ranking.
+
+110. **Decomposing the garbage head: no special part.** Swapped projector
+     and fc2 independently across original and fresh random weights:
+     - Original garbage head: mean=4,084
+     - orig_proj + rand_fc2: 3,241 / 4,389 / 3,782 (3 seeds)
+     - rand_proj + orig_fc2: 5,208 / 4,234 / 3,933 (3 seeds)
+     - rand_proj + rand_fc2: 4,098
+     Neither the projector nor fc2 is special. A random projector with
+     original fc2 (5,208) beat the original (4,084). All combinations
+     land in ~3,500-5,000. The median (2,936) is invariant across all
+     variants — 14/20 seeds are unaffected by the value head entirely.
+     The mechanism is ANY random nonlinear spatial projection of backbone
+     features, not specific learned weights.
+
+111. **Offline accuracy is anti-correlated with MCTS performance.**
+     Survival ValueNet (96.3% acc) → -17% MCTS. Linear exact (74.4%)
+     → +3%. Frozen spatial (62.5%) → +24%. Garbage head (untrained)
+     → +27%. Training on MCTS visit preferences makes things worse
+     because the objective is misaligned with what search actually needs.
+
 ### Known Bugs To Fix (discovered via ChatGPT + Gemini code review)
 
 - **Root value bug**: `_nn_evaluate_single` ignores `self.value_net`.

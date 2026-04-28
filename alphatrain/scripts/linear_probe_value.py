@@ -36,10 +36,12 @@ def extract_backbone_features(net, obs_tensor):
 
 
 def make_afterstate(board, sr, sc, tr, tc):
-    """Create afterstate board: move ball from src to tgt (no spawn)."""
+    """Create afterstate: move ball + clear any lines formed."""
+    from game.board import _clear_lines_at
     b = board.copy()
     b[tr, tc] = b[sr, sc]
     b[sr, sc] = 0
+    _clear_lines_at(b, tr, tc)
     return b
 
 
