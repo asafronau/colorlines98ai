@@ -375,7 +375,7 @@ class MCTS:
                  num_simulations=400, c_puct=2.5, top_k=30, batch_size=16,
                  inference_client=None, dynamic_sims=False,
                  heuristic_value=False, value_net=None,
-                 terminal_value=None):
+                 terminal_value=None, override_threshold=0.0):
         self.net = net
         self.device = device
         self.max_score = max_score
@@ -388,6 +388,7 @@ class MCTS:
         self.heuristic_value = heuristic_value
         self.value_net = value_net
         self.terminal_value = terminal_value
+        self.override_threshold = override_threshold
         self._fp16 = False
         self._sim_rng = None  # SimpleRng, set per search
         # Pre-allocate obs buffer for server mode (reused across searches)
@@ -724,6 +725,21 @@ class MCTS:
             flat_action = max(root.children.items(),
                               key=lambda x: x[1].visit_count)[0]
 
+        # Override threshold: only override policy's top move if MCTS
+        # has significantly more visits on a different move.
+        # Prevents destructive coin-flip overrides on near-ties.
+        if self.override_threshold > 0 and temperature == 0:
+            # Find policy's preferred move (highest prior)
+            policy_action = max(root.children.items(),
+                                key=lambda x: x[1].prior)[0]
+            mcts_action = max(root.children.items(),
+                              key=lambda x: x[1].visit_count)[0]
+            if mcts_action != policy_action:
+                pol_visits = root.children[policy_action].visit_count
+                mcts_visits = root.children[mcts_action].visit_count
+                if mcts_visits <= pol_visits * (1 + self.override_threshold):
+                    flat_action = policy_action  # trust policy on near-ties
+
         # Decode flat action to tuple format for callers
         action = _flat_to_action(flat_action)
 
@@ -738,12 +754,14 @@ class MCTS:
 
 def make_mcts_player(net, device, max_score=30000.0,
                      num_simulations=400, c_puct=2.5, top_k=30,
-                     batch_size=16, value_net=None, terminal_value=None):
+                     batch_size=16, value_net=None, terminal_value=None,
+                     override_threshold=0.0):
     """Create MCTS player function for use with evaluate."""
     mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_simulations,
                 c_puct=c_puct, top_k=top_k, batch_size=batch_size,
-                value_net=value_net, terminal_value=terminal_value)
+                value_net=value_net, terminal_value=terminal_value,
+                override_threshold=override_threshold)
 
     def player(game):
         return mcts.search(game)
