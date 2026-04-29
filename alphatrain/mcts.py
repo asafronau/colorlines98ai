@@ -559,29 +559,34 @@ class MCTS:
                 sim_game = game.clone(rng=sim_rng)
                 path = [node]
 
+                depth = 0
                 while node.children and not sim_game.game_over:
                     # Open-loop PUCT: filter to moves legal on
                     # this sim's actual board (stochastic spawns
                     # may differ from the sim that expanded this node).
-                    # Check: src occupied, tgt empty, path reachable.
+                    # Depth 0 (root): board is shared, skip filtering.
+                    # Depth 1+: check src occupied, tgt empty, path reachable.
                     best_score = -1e30
                     best_action = 0
                     best_child = None
                     sqrt_parent = math.sqrt(node.visit_count)
                     q_range = max_q - min_q
                     board = sim_game.board
-                    cc_labels = _label_empty_components(board)
+                    need_filter = depth > 0
+                    cc_labels = _label_empty_components(board) \
+                        if need_filter else None
                     for act_i, child in node.children.items():
-                        src_f = act_i // 81
-                        tgt_f = act_i % 81
-                        sr, sc = src_f // 9, src_f % 9
-                        tr, tc = tgt_f // 9, tgt_f % 9
-                        if board[sr, sc] == 0:
-                            continue
-                        if board[tr, tc] != 0:
-                            continue
-                        if not _is_reachable(cc_labels, sr, sc, tr, tc):
-                            continue
+                        if need_filter:
+                            src_f = act_i // 81
+                            tgt_f = act_i % 81
+                            sr, sc = src_f // 9, src_f % 9
+                            tr, tc = tgt_f // 9, tgt_f % 9
+                            if board[sr, sc] == 0:
+                                continue
+                            if board[tr, tc] != 0:
+                                continue
+                            if not _is_reachable(cc_labels, sr, sc, tr, tc):
+                                continue
                         vc = child.visit_count
                         if vc > 0:
                             q = child.value_sum / vc
@@ -605,6 +610,7 @@ class MCTS:
                         tgt_flat // 9, tgt_flat % 9)
                     path.append(best_child)
                     node = best_child
+                    depth += 1
 
                 for n in path:
                     n.visit_count += 1
