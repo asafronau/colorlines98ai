@@ -107,7 +107,7 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                       num_workers, max_batch, request_queue, response_queue,
                       num_sims, c_puct, top_k, max_score,
                       value_net_path=None, device_str='cpu',
-                      terminal_value=None):
+                      terminal_value=None, override_threshold=0.0):
     """Persistent worker: pull seeds, play greedy MCTS games, push results."""
     torch.set_num_threads(1)
 
@@ -147,7 +147,8 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
     mcts = MCTS(inference_client=client, max_score=max_score,
                 num_simulations=num_sims, c_puct=c_puct, top_k=top_k,
                 batch_size=max_batch, value_net=vnet,
-                terminal_value=terminal_value)
+                terminal_value=terminal_value,
+                override_threshold=override_threshold)
 
     while True:
         seed = seed_queue.get()
@@ -192,6 +193,9 @@ def main():
     p.add_argument('--c-puct', type=float, default=2.5)
     p.add_argument('--top-k', type=int, default=30)
     p.add_argument('--batch-size', type=int, default=8)
+    p.add_argument('--override-threshold', type=float, default=0.0,
+                   help='Only override policy if MCTS has >X%% more visits '
+                        '(0.2 = 20%%). 0 = always use MCTS top move.')
     p.add_argument('--device', default=None,
                    help='Force device (mps/cuda/cpu). Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
@@ -451,7 +455,8 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         num_simulations=args.simulations,
         c_puct=args.c_puct, top_k=args.top_k,
         batch_size=args.batch_size,
-        value_net=vnet, terminal_value=tv)
+        value_net=vnet, terminal_value=tv,
+        override_threshold=getattr(args, 'override_threshold', 0.0))
 
     results = []
     t0 = time.time()
@@ -531,7 +536,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                   args.simulations, args.c_puct, args.top_k, max_score,
                   vnet_path, device_str,
                   args.terminal_value if args.terminal_value is not None
-                  else (0.0 if (vmode or vnet_path or rhead_path) else None)))
+                  else (0.0 if (vmode or vnet_path or rhead_path) else None),
+                  getattr(args, 'override_threshold', 0.0)))
         proc.start()
         workers.append(proc)
 
