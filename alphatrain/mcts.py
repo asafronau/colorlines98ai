@@ -561,44 +561,66 @@ class MCTS:
 
                 depth = 0
                 while node.children and not sim_game.game_over:
-                    # Open-loop PUCT: filter to moves legal on
-                    # this sim's actual board (stochastic spawns
-                    # may differ from the sim that expanded this node).
-                    # Depth 0 (root): board is shared, skip filtering.
-                    # Depth 1+: check src occupied, tgt empty, path reachable.
-                    best_score = -1e30
-                    best_action = 0
-                    best_child = None
+                    # Open-loop PUCT with lazy reachability validation.
+                    # Depth 0 (root): board is shared, all children valid.
+                    # Depth 1+: cheap occupancy filter on all children,
+                    # then reachability check only on the chosen move.
                     sqrt_parent = math.sqrt(node.visit_count)
                     q_range = max_q - min_q
                     board = sim_game.board
                     need_filter = depth > 0
-                    cc_labels = _label_empty_components(board) \
-                        if need_filter else None
-                    for act_i, child in node.children.items():
-                        if need_filter:
-                            src_f = act_i // 81
-                            tgt_f = act_i % 81
-                            sr, sc = src_f // 9, src_f % 9
-                            tr, tc = tgt_f // 9, tgt_f % 9
-                            if board[sr, sc] == 0:
+                    banned = None
+                    cc_labels = None
+
+                    while True:
+                        best_score = -1e30
+                        best_action = 0
+                        best_child = None
+
+                        for act_i, child in node.children.items():
+                            if banned and act_i in banned:
                                 continue
-                            if board[tr, tc] != 0:
-                                continue
-                            if not _is_reachable(cc_labels, sr, sc, tr, tc):
-                                continue
-                        vc = child.visit_count
-                        if vc > 0:
-                            q = child.value_sum / vc
-                            q_norm = (q - min_q) / q_range if q_range > 0 else 0.5
-                        else:
-                            q_norm = 0.5
-                        u = c_puct * child.prior * sqrt_parent / (1 + vc)
-                        score = q_norm + u
-                        if score > best_score:
-                            best_score = score
-                            best_action = act_i
-                            best_child = child
+                            if need_filter:
+                                src_f = act_i // 81
+                                tgt_f = act_i % 81
+                                if board[src_f // 9, src_f % 9] == 0:
+                                    continue
+                                if board[tgt_f // 9, tgt_f % 9] != 0:
+                                    continue
+                            vc = child.visit_count
+                            if vc > 0:
+                                q = child.value_sum / vc
+                                q_norm = (q - min_q) / q_range \
+                                    if q_range > 0 else 0.5
+                            else:
+                                q_norm = 0.5
+                            u = c_puct * child.prior * sqrt_parent / (1 + vc)
+                            score = q_norm + u
+                            if score > best_score:
+                                best_score = score
+                                best_action = act_i
+                                best_child = child
+
+                        if best_child is None:
+                            break
+
+                        if not need_filter:
+                            break  # root: always valid
+
+                        # Lazy reachability: check only the chosen move
+                        if cc_labels is None:
+                            cc_labels = _label_empty_components(board)
+                        src_f = best_action // 81
+                        tgt_f = best_action % 81
+                        if _is_reachable(cc_labels,
+                                         src_f // 9, src_f % 9,
+                                         tgt_f // 9, tgt_f % 9):
+                            break  # valid move
+
+                        # Unreachable: ban and retry
+                        if banned is None:
+                            banned = set()
+                        banned.add(best_action)
 
                     if best_child is None:
                         break  # no legal children on this board
