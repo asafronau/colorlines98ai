@@ -101,17 +101,38 @@ def main():
                 mcts_action_flat = (action[0][0] * 9 + action[0][1]) * 81 + \
                                    (action[1][0] * 9 + action[1][1])
 
-        # Check for divergence (only meaningful before games diverge)
-        if not diverged and not pol_over and not mcts_over:
-            if pol_action != mcts_action_flat and pol_action is not None \
-                    and mcts_action_flat is not None:
+        # Check for divergence
+        # Before first divergence: compare on shared board (identical games)
+        # After first divergence: compare MCTS move vs what policy would
+        # play on the MCTS board (games have split, different boards)
+        if not pol_over and not mcts_over and \
+                pol_action is not None and mcts_action_flat is not None:
+            if not diverged:
+                is_diff = (pol_action != mcts_action_flat)
+            else:
+                # After split: get policy move on MCTS's board
+                obs_mcts = _build_obs_for_game(game_mcts)
+                obs_t = torch.from_numpy(obs_mcts).unsqueeze(0).to(device)
+                with torch.inference_mode():
+                    pl, _ = net(obs_t)
+                pn = pl[0].float().cpu().numpy()
+                pr = _get_legal_priors_flat(game_mcts.board, pn, 30)
+                if pr:
+                    pol_on_mcts = max(pr.items(), key=lambda x: x[1])[0]
+                    is_diff = (pol_on_mcts != mcts_action_flat)
+                else:
+                    is_diff = False
+
+            if is_diff:
                 divergences += 1
                 empty, n_comp, largest = board_stats(game_mcts.board)
 
-                print(f"\n  DIVERGENCE #{divergences} at turn {turn}",
+                label = "FIRST DIVERGENCE" if not diverged else "DIVERGENCE"
+                print(f"\n  {label} #{divergences} at turn {turn}",
                       flush=True)
                 print(f"  Board: empty={empty} components={n_comp} "
-                      f"largest={largest} score={game_mcts.score}", flush=True)
+                      f"largest={largest} score={game_mcts.score}",
+                      flush=True)
                 print(f"  Policy:  {fmt_action(pol_action)}", flush=True)
                 print(f"  MCTS:    {fmt_action(mcts_action_flat)}", flush=True)
 
@@ -154,13 +175,13 @@ def main():
                           f"{q_raw:>8.2f} {q_norm:>6.3f} {u:>6.3f} "
                           f"{score:>7.3f}{marker}", flush=True)
 
+                if not diverged:
+                    diverged = True
+
                 if divergences >= args.max_divergences:
                     print(f"\n  (stopping after {args.max_divergences} "
                           f"divergences)", flush=True)
                     break
-
-                # After first divergence, games will have different boards
-                diverged = True
 
         # Execute moves
         if not pol_over and pol_action is not None:

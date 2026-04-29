@@ -166,10 +166,12 @@ def main():
 
     mcts_prev = MCTS(net, device, max_score=max_score,
                      num_simulations=args.prevention_sims,
-                     batch_size=args.batch_size, top_k=30, c_puct=2.5)
+                     batch_size=args.batch_size, top_k=30, c_puct=2.5,
+                     terminal_value=0.0)
     mcts_emerg = MCTS(net, device, max_score=max_score,
                       num_simulations=args.emergency_sims,
-                      batch_size=args.batch_size, top_k=30, c_puct=2.5)
+                      batch_size=args.batch_size, top_k=30, c_puct=2.5,
+                      terminal_value=0.0)
 
     print(f"Crisis player: prevention={args.prevention_sims} sims, "
           f"emergency={args.emergency_sims} sims", flush=True)
