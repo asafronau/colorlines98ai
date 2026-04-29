@@ -682,7 +682,9 @@ class MCTS:
                         batch_games[b].board, pol_np[nn_idx], top_k)
                     ch = node.children
                     for i in range(k):
-                        ch[int(flat_idx[i])] = Node(prior=float(pri[i]))
+                        action_key = int(flat_idx[i])
+                        if action_key not in ch:
+                            ch[action_key] = Node(prior=float(pri[i]))
                     # Value: use separate value_net if available
                     if vnet_values is not None:
                         value = float(vnet_values[nn_idx])
