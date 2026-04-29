@@ -107,7 +107,8 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                       num_workers, max_batch, request_queue, response_queue,
                       num_sims, c_puct, top_k, max_score,
                       value_net_path=None, device_str='cpu',
-                      terminal_value=None, override_threshold=0.0):
+                      terminal_value=None, override_threshold=0.0,
+                      max_turns=5000):
     """Persistent worker: pull seeds, play greedy MCTS games, push results."""
     torch.set_num_threads(1)
 
@@ -159,7 +160,7 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
         game.reset()
         t0 = time.time()
 
-        while not game.game_over:
+        while not game.game_over and game.turns < max_turns:
             move = mcts.search(game)
             if move is None:
                 break
@@ -196,6 +197,8 @@ def main():
     p.add_argument('--override-threshold', type=float, default=0.0,
                    help='Only override policy if MCTS has >X%% more visits '
                         '(0.2 = 20%%). 0 = always use MCTS top move.')
+    p.add_argument('--max-turns', type=int, default=5000,
+                   help='Cap games at this many turns')
     p.add_argument('--device', default=None,
                    help='Force device (mps/cuda/cpu). Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
@@ -464,7 +467,8 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         gt = time.time()
         game = ColorLinesGame(seed=seed)
         game.reset()
-        while not game.game_over:
+        max_t = getattr(args, 'max_turns', 5000)
+        while not game.game_over and game.turns < max_t:
             move = player(game)
             if move is None:
                 break
@@ -537,7 +541,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                   vnet_path, device_str,
                   args.terminal_value if args.terminal_value is not None
                   else (0.0 if (vmode or vnet_path or rhead_path) else None),
-                  getattr(args, 'override_threshold', 0.0)))
+                  getattr(args, 'override_threshold', 0.0),
+                  getattr(args, 'max_turns', 5000)))
         proc.start()
         workers.append(proc)
 
