@@ -27,6 +27,7 @@ import torch
 from numba import njit
 
 from alphatrain.observation import build_observation
+from game.board import _label_empty_components, _is_reachable
 
 BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4  # 6561
@@ -561,19 +562,25 @@ class MCTS:
                 while node.children and not sim_game.game_over:
                     # Open-loop PUCT: filter to moves legal on
                     # this sim's actual board (stochastic spawns
-                    # may differ from the sim that expanded this node)
+                    # may differ from the sim that expanded this node).
+                    # Check: src occupied, tgt empty, path reachable.
                     best_score = -1e30
                     best_action = 0
                     best_child = None
                     sqrt_parent = math.sqrt(node.visit_count)
                     q_range = max_q - min_q
                     board = sim_game.board
+                    cc_labels = _label_empty_components(board)
                     for act_i, child in node.children.items():
                         src_f = act_i // 81
                         tgt_f = act_i % 81
-                        if board[src_f // 9, src_f % 9] == 0:
+                        sr, sc = src_f // 9, src_f % 9
+                        tr, tc = tgt_f // 9, tgt_f % 9
+                        if board[sr, sc] == 0:
                             continue
-                        if board[tgt_f // 9, tgt_f % 9] != 0:
+                        if board[tr, tc] != 0:
+                            continue
+                        if not _is_reachable(cc_labels, sr, sc, tr, tc):
                             continue
                         vc = child.visit_count
                         if vc > 0:
