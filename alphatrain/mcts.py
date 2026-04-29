@@ -486,14 +486,15 @@ class MCTS:
         """
         root = Node()
 
-        # Seed sim_rng from game state for reproducibility across modes.
-        # Same board position → same MCTS simulation spawns → identical trees
-        # regardless of local vs server execution.
-        # NOTE: Python hash() is randomized per-process (PYTHONHASHSEED),
-        # so we use a deterministic hash from raw board bytes instead.
-        board_bytes = game.board.tobytes()
-        state_seed = int.from_bytes(board_bytes[:8], 'little')
-        state_seed = (state_seed ^ (game.score * 31) ^ (game.turns * 7)) & 0xFFFFFFFF
+        # Seed sim_rng deterministically from full game state.
+        # Hash full board + next_balls + score + turns for unique seed.
+        import hashlib
+        h = hashlib.md5(game.board.tobytes())
+        for pos, color in game.next_balls:
+            h.update(bytes([pos[0], pos[1], color]))
+        h.update(game.score.to_bytes(4, 'little', signed=False))
+        h.update(game.turns.to_bytes(4, 'little', signed=False))
+        state_seed = int.from_bytes(h.digest()[:8], 'little')
         from game.rng import SimpleRng
         self._sim_rng = SimpleRng(state_seed)
 
