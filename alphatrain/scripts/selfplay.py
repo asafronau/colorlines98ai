@@ -35,7 +35,7 @@ import torch
 import json
 
 from game.board import ColorLinesGame
-from alphatrain.mcts import MCTS, _build_obs_for_game, _evaluate_features_linear
+from alphatrain.mcts import MCTS, _build_obs_for_game
 from alphatrain.evaluate import load_model
 
 
@@ -195,19 +195,14 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
 
     elapsed = time.time() - t0
 
-    # Bootstrap value for capped games: predict survival of the final board
-    # so training treats turn-5000 boards as "still alive". Prefer the
-    # feature evaluator when set — the NN value head is untrained when
-    # val_weight=0 and would inject noise.
+    # Bootstrap value for capped games: write 0.0.
+    # The previous NN-based bootstrap was on the value-head scale (~99 for
+    # pillar2w2 with max_score=200) and the feature-based bootstrap is on a
+    # log(1+remaining_turns) scale (~4-5) — neither matches the per-turn
+    # reward scale that build_expert_v2_tensor.py uses for TD returns.
+    # V10 is policy-distillation (val_weight=0) so bootstrap_value is
+    # unused; explicitly zero avoids accidental misuse downstream.
     bootstrap_value = 0.0
-    if capped:
-        if mcts.feature_coefs is not None:
-            bootstrap_value = float(_evaluate_features_linear(
-                game.board, mcts.feature_coefs, mcts.feature_means,
-                mcts.feature_stds, mcts.feature_bias))
-        else:
-            _, bootstrap_value = mcts._nn_evaluate_single(game)
-            bootstrap_value = float(bootstrap_value)
 
     # Dynamic sims summary
     ds_total = ds_high + ds_mid + ds_low
