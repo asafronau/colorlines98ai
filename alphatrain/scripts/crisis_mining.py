@@ -80,7 +80,8 @@ def play_policy_only(net, device, seed, fp16=False, max_turns=5000):
 
 
 def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
-                         continue_turns, max_turns=5000):
+                         continue_turns, max_turns=5000,
+                         feature_weights_path=None):
     """Replay from a saved board position with MCTS search."""
     game = ColorLinesGame(seed=replay_seed)
     game.reset(
@@ -93,7 +94,8 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
         net=mcts.net, device=mcts.device, max_score=mcts.max_score,
         num_simulations=num_sims, c_puct=mcts.c_puct,
         top_k=mcts.top_k, batch_size=mcts.batch_size,
-        inference_client=mcts.inference_client)
+        inference_client=mcts.inference_client,
+        feature_weights_path=feature_weights_path)
 
     moves_data = []
     t0 = time.time()
@@ -170,7 +172,8 @@ def _replay_worker(slot_id, task_queue, result_queue,
                     obs_shm_name, pol_shm_name, val_shm_name,
                     num_workers, max_batch,
                     request_queue, response_queue,
-                    batch_size, max_score, continue_turns, max_turns):
+                    batch_size, max_score, continue_turns, max_turns,
+                    feature_weights_path=None):
     """Persistent worker for GPU server mode replay."""
     torch.set_num_threads(1)
 
@@ -196,13 +199,15 @@ def _replay_worker(slot_id, task_queue, result_queue,
 
         snapshot, replay_seed, num_sims, label = task
 
-        mcts = MCTS(inference_client=client, max_score=30000.0,
+        mcts = MCTS(inference_client=client, max_score=max_score,
                     num_simulations=num_sims, batch_size=batch_size,
-                    top_k=30, c_puct=2.5)
+                    top_k=30, c_puct=2.5,
+                    feature_weights_path=feature_weights_path)
 
         result = replay_from_snapshot(
             mcts, snapshot, replay_seed, num_sims,
-            continue_turns, max_turns)
+            continue_turns, max_turns,
+            feature_weights_path=feature_weights_path)
         result['label'] = label
         result['original_seed'] = snapshot.get('original_seed', replay_seed)
 
@@ -241,6 +246,10 @@ def main():
                    help='Parallel workers (1=serial, >1=GPU server)')
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--save-dir', default='data/crisis_v1')
+    p.add_argument('--feature-value-weights', default=None,
+                   help='Path to feature_value_weights.npz. When set, MCTS '
+                        'replaces the NN value head with the linear feature '
+                        'evaluator. Required for value-quality crisis mining.')
     args = p.parse_args()
 
     if args.device:
@@ -349,18 +358,20 @@ def main():
 
     if args.workers <= 1:
         # Serial mode — reload model on target device (safe, no fork)
-        net_gpu, _ = load_model(args.model, device,
-                                fp16=(device_str != 'cpu'),
-                                jit_trace=True)
-        mcts = MCTS(net_gpu, device, max_score=30000.0,
+        net_gpu, ser_max_score = load_model(args.model, device,
+                                            fp16=(device_str != 'cpu'),
+                                            jit_trace=True)
+        mcts = MCTS(net_gpu, device, max_score=ser_max_score,
                     num_simulations=args.recovery_sims,
                     batch_size=args.batch_size,
-                    top_k=30, c_puct=2.5)
+                    top_k=30, c_puct=2.5,
+                    feature_weights_path=args.feature_value_weights)
 
         for ti, (snapshot, replay_seed, sims, label) in enumerate(replay_tasks):
             result = replay_from_snapshot(
                 mcts, snapshot, replay_seed, sims,
-                args.continue_turns, args.max_turns)
+                args.continue_turns, args.max_turns,
+                feature_weights_path=args.feature_value_weights)
 
             orig_seed = snapshot.get('original_seed', replay_seed)
             fname = f"game_seed{orig_seed}_{label}_score{result['score']}.json"
@@ -411,7 +422,8 @@ def main():
                       args.workers, args.batch_size,
                       server.request_queue, server.response_queues[i],
                       args.batch_size, srv_max_score,
-                      args.continue_turns, args.max_turns))
+                      args.continue_turns, args.max_turns,
+                      args.feature_value_weights))
             p.start()
             workers.append(p)
 
