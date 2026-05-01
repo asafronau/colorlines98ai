@@ -108,7 +108,7 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                       num_sims, c_puct, top_k, max_score,
                       value_net_path=None, device_str='cpu',
                       terminal_value=None, override_threshold=0.0,
-                      max_turns=5000):
+                      max_turns=5000, feature_weights_path=None):
     """Persistent worker: pull seeds, play greedy MCTS games, push results."""
     torch.set_num_threads(1)
 
@@ -149,7 +149,8 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                 num_simulations=num_sims, c_puct=c_puct, top_k=top_k,
                 batch_size=max_batch, value_net=vnet,
                 terminal_value=terminal_value,
-                override_threshold=override_threshold)
+                override_threshold=override_threshold,
+                feature_weights_path=feature_weights_path)
 
     while True:
         seed = seed_queue.get()
@@ -219,6 +220,10 @@ def main():
     p.add_argument('--terminal-value', type=float, default=None,
                    help='Force terminal (game-over) value. '
                         'E.g. --terminal-value 0 for normalized terminals.')
+    p.add_argument('--feature-value-weights', default=None,
+                   help='Path to feature_value_weights.npz. When set, MCTS '
+                        'replaces the NN value head with a linear evaluator '
+                        'over the 18 board features.')
     args = p.parse_args()
 
     if args.device:
@@ -449,7 +454,10 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         print(f"*** VALUE MODE: {vmode} (unknown, using default) ***", flush=True)
 
     # Terminal value: explicit flag > auto (0.0 for synthetic/value_net) > None
-    has_custom_value = vmode or vnet or getattr(args, 'ranking_head', None)
+    # Feature-value mode handles terminals naturally via the feature function,
+    # so no auto-zero needed.
+    has_custom_value = (vmode or vnet
+                        or getattr(args, 'ranking_head', None))
     tv = args.terminal_value if args.terminal_value is not None \
         else (0.0 if has_custom_value else None)
 
@@ -459,7 +467,8 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         c_puct=args.c_puct, top_k=args.top_k,
         batch_size=args.batch_size,
         value_net=vnet, terminal_value=tv,
-        override_threshold=getattr(args, 'override_threshold', 0.0))
+        override_threshold=getattr(args, 'override_threshold', 0.0),
+        feature_weights_path=getattr(args, 'feature_value_weights', None))
 
     results = []
     t0 = time.time()
@@ -542,7 +551,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                   args.terminal_value if args.terminal_value is not None
                   else (0.0 if (vmode or vnet_path or rhead_path) else None),
                   getattr(args, 'override_threshold', 0.0),
-                  getattr(args, 'max_turns', 5000)))
+                  getattr(args, 'max_turns', 5000),
+                  args.feature_value_weights))
         proc.start()
         workers.append(proc)
 
