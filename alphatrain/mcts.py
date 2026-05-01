@@ -425,7 +425,7 @@ class MCTS:
                  inference_client=None, dynamic_sims=False,
                  heuristic_value=False, value_net=None,
                  terminal_value=None, override_threshold=0.0,
-                 feature_weights_path=None):
+                 feature_weights_path=None, early_stop=False):
         self.net = net
         self.device = device
         self.max_score = max_score
@@ -439,6 +439,7 @@ class MCTS:
         self.value_net = value_net
         self.terminal_value = terminal_value
         self.override_threshold = override_threshold
+        self.early_stop = early_stop
         self._fp16 = False
         self._sim_rng = None  # SimpleRng, set per search
 
@@ -726,6 +727,10 @@ class MCTS:
                     obs_count += 1
 
             # === BATCH EVALUATE ===
+            # In feature-value mode the value head is unused; skip the value
+            # transfer (~half of total .cpu() cost) and predict_value compute.
+            skip_nn_value = self.feature_coefs is not None
+            val_np = None
             if obs_count > 0:
                 if use_server:
                     pol_np, val_np = self.inference_client.evaluate_batch(
@@ -736,10 +741,12 @@ class MCTS:
                     with torch.inference_mode():
                         pol_logits, val_logits = self.net(
                             self._obs_buf[:obs_count])
-                        values_t = self.net.predict_value(
-                            val_logits, max_val=self.max_score)
+                        if not skip_nn_value:
+                            values_t = self.net.predict_value(
+                                val_logits, max_val=self.max_score)
                     pol_np = pol_logits.float().cpu().numpy()  # fp32 for JIT
-                    val_np = values_t.cpu().numpy()
+                    if not skip_nn_value:
+                        val_np = values_t.cpu().numpy()
 
             # === VALUE NET BATCH EVAL (if separate value network) ===
             vnet_values = None
@@ -807,6 +814,25 @@ class MCTS:
 
             sims_done += bs
 
+            # Exact greedy-action early stop. If the most-visited root child
+            # cannot be overtaken even if every remaining sim went to the
+            # runner-up, the final argmax is fixed. Eval-only — self-play
+            # policy targets need the full visit distribution.
+            if self.early_stop and not return_policy and temperature == 0:
+                remaining = num_sims - sims_done
+                if remaining > 0 and len(root.children) > 1:
+                    top_1 = 0
+                    top_2 = 0
+                    for child in root.children.values():
+                        vc = child.visit_count
+                        if vc >= top_1:
+                            top_2 = top_1
+                            top_1 = vc
+                        elif vc > top_2:
+                            top_2 = vc
+                    if top_1 > top_2 + remaining:
+                        break
+
         # Build policy target from visit counts
         if return_policy or temperature > 0:
             actions = list(root.children.keys())
@@ -872,14 +898,16 @@ class MCTS:
 def make_mcts_player(net, device, max_score=30000.0,
                      num_simulations=400, c_puct=2.5, top_k=30,
                      batch_size=16, value_net=None, terminal_value=None,
-                     override_threshold=0.0, feature_weights_path=None):
+                     override_threshold=0.0, feature_weights_path=None,
+                     early_stop=False):
     """Create MCTS player function for use with evaluate."""
     mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_simulations,
                 c_puct=c_puct, top_k=top_k, batch_size=batch_size,
                 value_net=value_net, terminal_value=terminal_value,
                 override_threshold=override_threshold,
-                feature_weights_path=feature_weights_path)
+                feature_weights_path=feature_weights_path,
+                early_stop=early_stop)
 
     def player(game):
         return mcts.search(game)
