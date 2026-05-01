@@ -229,6 +229,9 @@ def main():
     p.add_argument('--early-stop', action='store_true',
                    help='Exit MCTS early when the greedy root child is '
                         'mathematically locked in. Eval-only.')
+    p.add_argument('--compile', action='store_true',
+                   help='Use torch.compile(mode=reduce-overhead) in the GPU '
+                        'inference server. CUDA only; ignored elsewhere.')
     args = p.parse_args()
 
     if args.device:
@@ -300,7 +303,8 @@ def _run_policy_server(args, task_seeds, total, device_str,
 
     server = InferenceServer(args.model, n_workers,
                              device=device_str,
-                             max_batch_per_worker=args.batch_size)
+                             max_batch_per_worker=args.batch_size,
+                             use_compile=getattr(args, 'compile', False))
     server.start()
 
     seed_queue = MPQueue()
@@ -530,7 +534,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                              value_model_path=vnet_path,
                              deterministic=det,
                              value_mode=vmode,
-                             ranking_head_path=rhead_path)
+                             ranking_head_path=rhead_path,
+                             use_compile=getattr(args, 'compile', False))
     server.start()
 
     seed_queue = MPQueue()

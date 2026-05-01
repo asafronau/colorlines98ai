@@ -79,12 +79,13 @@ class InferenceServer:
     def __init__(self, model_path, num_workers, device=None,
                  max_batch_per_worker=MAX_BATCH, value_model_path=None,
                  deterministic=False, value_mode=None,
-                 ranking_head_path=None):
+                 ranking_head_path=None, use_compile=False):
         self.model_path = model_path
         self.value_model_path = value_model_path
         self.deterministic = deterministic
         self.value_mode = value_mode
         self.ranking_head_path = ranking_head_path
+        self.use_compile = use_compile
         self.num_workers = num_workers
         self.max_batch = max_batch_per_worker
 
@@ -129,7 +130,8 @@ class InferenceServer:
                   self._obs_shm.name, self._pol_shm.name, self._val_shm.name,
                   self.request_queue, self.response_queues,
                   self.value_model_path, self.deterministic,
-                  self.value_mode, self.ranking_head_path),
+                  self.value_mode, self.ranking_head_path,
+                  self.use_compile),
             daemon=True)
         self._process.start()
 
@@ -158,7 +160,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
               obs_shm_name, pol_shm_name, val_shm_name,
               request_queue, response_queues, value_model_path=None,
               deterministic=False, value_mode=None,
-              ranking_head_path=None):
+              ranking_head_path=None, use_compile=False):
     """GPU inference process main loop.
 
     Two modes:
@@ -184,7 +186,24 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     net, max_score = load_model(model_path, device)
     net = net.half()
     dummy = torch.randn(1, 18, 9, 9, device=device).half()
-    net_traced = torch.jit.trace(net, dummy)
+    if use_compile and device_str == 'cuda':
+        # torch.compile with reduce-overhead is the right mode for the
+        # repeated small batches the inference server feeds (bs=8 per worker,
+        # batched up to gpu_batch_cap across workers). First call is slow
+        # (1-2 min warm-up), subsequent calls are faster than jit.trace.
+        # CUDA-only: MPS support for torch.compile is incomplete.
+        print("  Compiling model with torch.compile(mode='reduce-overhead')...",
+              flush=True)
+        import time as _t
+        _t0 = _t.time()
+        net_traced = torch.compile(net, mode='reduce-overhead', fullgraph=False)
+        # Warm up so the first real inference doesn't pay compile cost
+        with torch.inference_mode():
+            for _ in range(3):
+                net_traced(dummy)
+        print(f"  Compile + warmup: {_t.time()-_t0:.1f}s", flush=True)
+    else:
+        net_traced = torch.jit.trace(net, dummy)
 
     # Separate ValueNet (if provided)
     value_net_traced = None

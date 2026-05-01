@@ -358,6 +358,11 @@ def main():
                    help='Path to feature_value_weights.npz. When set, MCTS '
                         'replaces the NN value head with the linear feature '
                         'evaluator. Required for value-quality self-play.')
+    p.add_argument('--compile', action='store_true',
+                   help='Use torch.compile(mode=reduce-overhead) instead of '
+                        'torch.jit.trace in the inference server. CUDA only; '
+                        'ignored on MPS/CPU. Pays a 1-2 min warm-up upfront '
+                        'for ~10-30% faster forward passes after.')
     args = p.parse_args()
 
     if args.device:
@@ -488,7 +493,8 @@ def main():
                                  device=device_str,
                                  max_batch_per_worker=args.batch_size,
                                  value_model_path=args.value_model,
-                                 deterministic=args.deterministic)
+                                 deterministic=args.deterministic,
+                                 use_compile=args.compile)
         server.start()
 
         seed_queue = MPQueue()
