@@ -1788,3 +1788,87 @@ synthetic modes. Policy mean=3,465 on these seeds.
      value head improvements have a bounded ceiling: even a perfect
      value function can only help on the minority of positions where
      the policy is uncertain.
+
+### Phase 19 — Feature-Based Value Evaluator (the breakthrough)
+
+112. **The pillar2w2 NN value head has near-zero predictive power for
+     survival.** Trained val_weight=0, so the head is an untrained
+     linear projection of backbone features. Tested on 27,900 sampled
+     positions from selfplay_v8_combined + crisis_v2 against label
+     log(1+remaining_turns):
+     - NN value head: Pearson r=+0.086, val R²=0.0043
+     - Output range: [54.3, 122.0] on max_score=200 (mean=99.1)
+     The head is essentially constant + tiny noise. It carries effectively
+     no causal signal for position quality. MCTS@1600 (mean=4,550) was
+     achieving its lift from policy priors alone, in *spite* of the
+     value head, not because of it.
+
+113. **Linear regression on 18 board features beats NN value 29×.**
+     Same dataset, same label. Features = mine_death_features.board_features
+     (16 raw: empty, components, largest, tiny_comp, mobility, avg_reach,
+     min_reach, low_mob_balls, balls, colors_present, same_adj, diff_adj,
+     line3, line4, center_balls, center_colors) + 2 derived (ratio,
+     frag_score). Ridge regression with standardization:
+     - Features alone: val R²=0.1259
+     - NN value alone: val R²=0.0043
+     - Combined: val R²=0.1260 (NN coef collapses to -0.003)
+     The combined model gives features all the weight and ignores the
+     NN value entirely — the head has zero unique information beyond
+     what the cheap features provide. R² ratio: 29×.
+
+114. **Feature-value MCTS lifts mean from 3,465 → 8,625 (+149%).**
+     pillar2w2_epoch_10 + 18-feature linear evaluator as MCTS leaf
+     value, replacing the NN value head:
+     - Policy-only (50 seeds, 0-49): mean=3,465
+     - NN-value MCTS@400 bs=8: 4,115 (+19%)
+     - NN-value MCTS@1600 bs=8: 4,550 (+31%)
+     - Feature-value MCTS@400 bs=8: **6,312 (+82%)**
+     - Feature-value MCTS@1600 bs=8: **8,625 (+149%), median=10,456**
+     The catastrophe seeds where MCTS *destroyed* good policy games
+     largely recovered: seed 41 (policy 8,850 → NN-MCTS 916 → feat-MCTS
+     10,629), seed 14 (2,112 → 622 → 7,316), seed 12 (2,061 → 408 →
+     6,824). Feature-value@400 bs=8 already beats NN-value@1600 bs=8 by
+     39% with 4× less compute. At 1600 sims, ~62% of games hit the
+     5K turn cap (V7-territory survival rate). Confirmed policy-agnostic
+     by testing on pillar2u_epoch_9: policy 2,282 → feature-MCTS 4,295
+     (+88%) — same proportional lift. ChatGPT's framing was exact:
+     "MCTS becomes a policy improvement operator only when the value
+     signal is better than the policy's own implicit judgment." R²=0.13
+     features clear that bar; R²=0.004 NN value doesn't.
+
+115. **Batch size > 8 destroys MCTS quality (virtual-loss starvation).**
+     Same model, same value source, same sim count, only batch_size
+     changed:
+     - 400 sims, bs=8: mean=6,312 (+82% vs policy)
+     - 400 sims, bs=64: mean=2,889 (-17% vs policy)
+     Mechanism: virtual loss is a *placeholder* applied to a path while
+     a leaf is queued for batched NN eval. It pushes sibling sims to
+     different parts of the tree before the real Q values arrive. With
+     bs=8/400 sims, MCTS gets 50 batches of real feedback; with bs=64,
+     only 6. The tree never converges on Q-good paths because most sims
+     descend with stale virtual losses dominating real Q. Don't trade
+     batch size for throughput — scale workers (parallel games) instead.
+
+### Implementation (mcts.py + eval_parallel.py)
+
+- `_evaluate_features_linear(board, coefs, means, stds, bias)` JIT
+  function in `alphatrain/mcts.py`. Calls board_features() (already
+  @njit), adds the 2 derived features, applies standardization and
+  linear combination. ~0.65us per call — zero MCTS slowdown.
+- `MCTS(feature_weights_path=...)` loads weights from .npz and uses
+  `_evaluate_features_linear` for every leaf value (including game-over
+  terminals; the feature function naturally returns low values for
+  jammed boards). Root value is also overridden to keep min_q/max_q
+  consistent with subsequent leaves.
+- `eval_parallel.py --feature-value-weights PATH` wires through both
+  server-mode (`_eval_mcts_worker`) and local-mode (`make_mcts_player`).
+- Weights produced by `alphatrain/scripts/fit_feature_value.py` from
+  ~28K positions sampled across V8+crisis_v2. Output: 18-element
+  ridge regression with feature standardization stats.
+
+### Diagnostic scripts (used to discover this)
+
+- `alphatrain/scripts/feature_value_ceiling.py` — Pearson r per feature
+  + linear R² ceiling on remaining_turns. Found R²=0.13 ceiling.
+- `alphatrain/scripts/feature_vs_nn_value.py` — head-to-head: NN value
+  vs features on identical boards. Found 29× R² advantage for features.
