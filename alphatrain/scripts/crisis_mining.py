@@ -250,6 +250,9 @@ def main():
                    help='Path to feature_value_weights.npz. When set, MCTS '
                         'replaces the NN value head with the linear feature '
                         'evaluator. Required for value-quality crisis mining.')
+    p.add_argument('--compile', action='store_true',
+                   help='Use torch.compile(mode=reduce-overhead) in the GPU '
+                        'inference server. CUDA only; ignored elsewhere.')
     args = p.parse_args()
 
     if args.device:
@@ -401,7 +404,8 @@ def main():
 
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
-                                 max_batch_per_worker=args.batch_size)
+                                 max_batch_per_worker=args.batch_size,
+                                 use_compile=args.compile)
         server.start()
 
         task_queue = MPQueue()
