@@ -35,7 +35,7 @@ import torch
 import json
 
 from game.board import ColorLinesGame
-from alphatrain.mcts import MCTS, _build_obs_for_game
+from alphatrain.mcts import MCTS, _build_obs_for_game, _evaluate_features_linear
 from alphatrain.evaluate import load_model
 
 
@@ -195,13 +195,19 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
 
     elapsed = time.time() - t0
 
-    # Bootstrap value for capped games: use the model's own value prediction
-    # of the final board instead of 0 (death). This teaches the model that
-    # turn 5000 boards are "still alive" with varying health levels.
+    # Bootstrap value for capped games: predict survival of the final board
+    # so training treats turn-5000 boards as "still alive". Prefer the
+    # feature evaluator when set — the NN value head is untrained when
+    # val_weight=0 and would inject noise.
     bootstrap_value = 0.0
     if capped:
-        _, bootstrap_value = mcts._nn_evaluate_single(game)
-        bootstrap_value = float(bootstrap_value)
+        if mcts.feature_coefs is not None:
+            bootstrap_value = float(_evaluate_features_linear(
+                game.board, mcts.feature_coefs, mcts.feature_means,
+                mcts.feature_stds, mcts.feature_bias))
+        else:
+            _, bootstrap_value = mcts._nn_evaluate_single(game)
+            bootstrap_value = float(bootstrap_value)
 
     # Dynamic sims summary
     ds_total = ds_high + ds_mid + ds_low
@@ -237,7 +243,8 @@ def _server_worker(slot_id, seed_queue, result_queue,
                    request_queue, response_queue,
                    num_sims, batch_size, max_score,
                    temperature_moves, dirichlet_alpha, dirichlet_weight,
-                   max_turns, dynamic_sims=False, static_turns=0):
+                   max_turns, dynamic_sims=False, static_turns=0,
+                   feature_weights_path=None):
     """Persistent worker for GPU server mode self-play."""
     torch.set_num_threads(1)
 
@@ -257,7 +264,8 @@ def _server_worker(slot_id, seed_queue, result_queue,
                              request_queue, response_queue)
     mcts = MCTS(inference_client=client, max_score=max_score,
                 num_simulations=num_sims, batch_size=batch_size,
-                top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims)
+                top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims,
+                feature_weights_path=feature_weights_path)
 
     while True:
         seed = seed_queue.get()
@@ -292,7 +300,7 @@ def _worker_play(args):
     """Worker function for CPU multiprocessing."""
     seed, model_path, device_str, num_sims, batch_size, \
         temperature_moves, dirichlet_alpha, dirichlet_weight, max_turns, \
-        dynamic_sims, static_turns = args
+        dynamic_sims, static_turns, feature_weights_path = args
 
     _limit_threads()
     device = torch.device(device_str)
@@ -303,7 +311,8 @@ def _worker_play(args):
 
     mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_sims, batch_size=batch_size,
-                top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims)
+                top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims,
+                feature_weights_path=feature_weights_path)
 
     result = play_selfplay_game(
         mcts, seed,
@@ -350,6 +359,10 @@ def main():
     p.add_argument('--static-turns', type=int, default=0,
                    help='Force full sims for first N turns (overrides dynamic). '
                         'Ensures maximum search quality in the critical opening.')
+    p.add_argument('--feature-value-weights', default=None,
+                   help='Path to feature_value_weights.npz. When set, MCTS '
+                        'replaces the NN value head with the linear feature '
+                        'evaluator. Required for value-quality self-play.')
     args = p.parse_args()
 
     if args.device:
@@ -411,7 +424,8 @@ def main():
                                         jit_trace=True)
         mcts = MCTS(net, torch.device(device_str), max_score=max_score,
                      num_simulations=args.sims, batch_size=args.batch_size,
-                     top_k=30, c_puct=2.5, dynamic_sims=args.dynamic_sims)
+                     top_k=30, c_puct=2.5, dynamic_sims=args.dynamic_sims,
+                     feature_weights_path=args.feature_value_weights)
 
         for i, seed in enumerate(seeds):
             result = play_selfplay_game(
@@ -444,7 +458,7 @@ def main():
             (seed, args.model, 'cpu', args.sims, args.batch_size,
              args.temperature_moves, args.dirichlet_alpha,
              args.dirichlet_weight, args.max_turns, args.dynamic_sims,
-             args.static_turns)
+             args.static_turns, args.feature_value_weights)
             for seed in seeds
         ]
 
@@ -502,7 +516,8 @@ def main():
                       args.sims, args.batch_size, max_score,
                       args.temperature_moves, args.dirichlet_alpha,
                       args.dirichlet_weight, args.max_turns,
-                      args.dynamic_sims, args.static_turns))
+                      args.dynamic_sims, args.static_turns,
+                      args.feature_value_weights))
             p.start()
             workers.append(p)
 
