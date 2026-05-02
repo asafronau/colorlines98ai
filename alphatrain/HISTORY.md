@@ -1872,3 +1872,60 @@ synthetic modes. Policy mean=3,465 on these seeds.
   + linear R² ceiling on remaining_turns. Found R²=0.13 ceiling.
 - `alphatrain/scripts/feature_vs_nn_value.py` — head-to-head: NN value
   vs features on identical boards. Found 29× R² advantage for features.
+
+### Phase 20 — Architecture decision: drop the value head
+
+116. **The NN value head is permanently abandoned.** Six months of
+     failed experiments (Pillar 2b ranking head, 2g/2h self-play value
+     training, 2j categorical+TD, 2r SNR=0.03, 2u/2v drop-and-restore
+     attempts) plus the V9 collapse investigation converged on the same
+     answer: **for this game, the value head is dead weight**. With
+     val_weight=0 (the policy distillation setup that produced our
+     strongest models — 2U, 2V, 2W, 2W2), the value head outputs are
+     a near-constant random projection of backbone features (R²=0.0043
+     on survival prediction). The 18-feature linear evaluator beats it
+     by 29× and is faster. There is no scenario, given everything we
+     have tried, where retraining the value head improves search quality.
+
+117. **V10 self-play data has bootstrap_value=0 for capped games.**
+     This is the explicit signal that "we are not going to consume the
+     value-head signal at training time." Anyone in the future who
+     enables value training on V10 data will find capped boards labeled
+     as "future return = 0", which would teach the value head that
+     turn-6000 boards are deaths — exactly the wrong lesson. The
+     bootstrap=0 is intentional and load-bearing for the policy-only
+     training path.
+
+118. **V10 quality validates the decision.** First 660 regular games:
+     mean 8,102, median 8,949, 47% > 10K score, 39% capped at 6000
+     turns, 2.5M states. V7-territory at 800 sims (V7 was 8,858 at
+     1600 sims). The policy is strong, MCTS is helping, and the value
+     head plays no role beyond consuming compute and checkpoint bytes.
+
+### Architectural implications (planned for V10 training onward)
+
+The value head's role in inference has already been short-circuited
+in feature mode (`mcts.py` skips `predict_value` and `val_logits.cpu()`
+when `feature_coefs is not None`). Surgical removal at training time
+is the next step:
+
+- **Model class** (`alphatrain/model.py`): add `policy_only=True` flag
+  to `AlphaTrainNet`. When set, skip building `value_conv`, `value_bn`,
+  `value_fc1`, `value_fc2`. `forward()` returns `policy_logits` only.
+- **Training** (`alphatrain/train.py`): when `policy_only=True`, set
+  `val_weight=0` automatically, skip value-loss computation and value
+  target loading. Saves both compute and one big collate path.
+- **Inference** (`mcts.py`, `evaluate.py`, `inference_server.py`):
+  callers branch on `getattr(net, 'policy_only', False)`. If true:
+  forward returns just `pol_logits`, callers must already be in
+  feature-value mode (we should assert this at MCTS init time).
+- **Checkpoints**: write `policy_only=True` in metadata. `load_model`
+  reads this flag and instantiates the appropriate architecture.
+- **Backward compat**: existing checkpoints (without the flag) default
+  to `policy_only=False` and behave identically to today.
+
+Expected savings: ~5-10% NN forward time (value head FLOPs eliminated),
+slightly smaller checkpoints (~1-2MB), and a cleaner architecture for
+future iterations. The bigger benefit is conceptual clarity: the model
+is what it actually is — a policy network — not a half-broken
+two-headed model with one head systematically ignored.
