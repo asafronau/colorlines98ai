@@ -141,6 +141,12 @@ def main():
                         help='Estimated bonus turns beyond cap for capped games (default 2000)')
     parser.add_argument('--num-bins', type=int, default=NUM_VALUE_BINS,
                         help='Number of categorical value bins (default 64)')
+    parser.add_argument('--policy-only-data', action='store_true',
+                        help='Acknowledge that the input self-play data was '
+                             'produced for policy-only training (V10+ writes '
+                             'bootstrap_value=0 for capped games). Without '
+                             'this flag, the builder refuses such data when '
+                             'producing TD-return value targets.')
     args = parser.parse_args()
 
     gamma = args.gamma
@@ -174,6 +180,7 @@ def main():
     t0 = time.time()
     total_states = 0
     total_pairs = 0
+    capped_zero_bootstrap = 0  # count of capped games with bootstrap_value=0
 
     for fi, fpath in enumerate(files):
         game = json.load(open(fpath))
@@ -190,6 +197,12 @@ def main():
             # Compute TD returns for this game
             # Capped games use bootstrap value instead of 0 at terminal state
             bootstrap = float(game.get('bootstrap_value', 0.0))
+            if game.get('capped', False) and bootstrap == 0.0:
+                # V10+ policy-only data writes bootstrap=0 because value
+                # targets are not consumed during training. If this builder
+                # is being used to *create* value targets, that's a misuse
+                # — capped games would be labeled as deaths.
+                capped_zero_bootstrap += 1
             td_returns = compute_td_returns(game['moves'], game['score'], gamma=gamma,
                                             survival_bonus=args.survival_bonus,
                                             bootstrap_value=bootstrap,
@@ -264,6 +277,24 @@ def main():
 
     print(f"\nTotal: {total_states:,} states, {total_pairs:,} pairs from "
           f"{len(files)} games ({time.time()-t0:.0f}s)", flush=True)
+
+    # Crash on policy-only data being consumed for value training. V10+
+    # self-play writes bootstrap_value=0 for capped games because the
+    # data is intended for policy-only distillation. If this builder is
+    # producing value targets (not sqrt_turns) from such data, capped
+    # games would be labeled as deaths — the value head would learn that
+    # turn-6000 boards are losses. Refuse unless explicitly opted in.
+    if capped_zero_bootstrap > 0 and not args.sqrt_turns and \
+            not args.policy_only_data:
+        raise SystemExit(
+            f"\nFound {capped_zero_bootstrap} capped games with "
+            f"bootstrap_value=0 (V10+ policy-only data convention). The "
+            f"builder is producing TD-return value targets, which would "
+            f"label those games as deaths. Either:\n"
+            f"  - pass --policy-only-data to acknowledge that value "
+            f"targets won't be used at training time, or\n"
+            f"  - regenerate self-play with non-zero bootstrap values, or\n"
+            f"  - use --sqrt-turns to compute targets from turn counts.")
 
     # Analyze TD return distribution to determine max_score
     td_arr = np.array(all_td_scalars, dtype=np.float32)

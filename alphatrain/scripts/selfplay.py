@@ -395,6 +395,19 @@ def main():
         print("All games already completed!", flush=True)
         return
 
+    # Fail-fast: policy_only models have no NN value head. MCTS needs SOME
+    # value source — feature_value_weights or external value net. Without
+    # one, search runs blind on zeros from the server's val_buf.
+    ckpt_meta = torch.load(args.model, map_location='cpu', weights_only=False)
+    is_policy_only = ckpt_meta.get('policy_only',
+                                    'value_fc2.weight' not in ckpt_meta['model'])
+    del ckpt_meta
+    if is_policy_only and not args.feature_value_weights and not args.value_model:
+        raise SystemExit(
+            f"Model '{args.model}' is policy_only but no value source is "
+            f"configured. Pass --feature-value-weights or --value-model. "
+            f"Otherwise MCTS will search with all-zero leaf values.")
+
     print(f"Self-play: {n_games} games (seeds {args.seed_start}-{args.seed_end-1})",
           flush=True)
     print(f"Model: {args.model}", flush=True)

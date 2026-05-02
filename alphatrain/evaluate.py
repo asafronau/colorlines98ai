@@ -44,6 +44,14 @@ def _no_value_predict(*args, **kwargs):
         "predict_value called on a policy_only model. Use feature-value "
         "weights or an external value net for MCTS leaf evaluation.")
 
+
+def unpack_pol_val(out):
+    """Unpack model forward output. Returns (pol_logits, val_logits)
+    or (pol_logits, None) for policy_only models."""
+    if isinstance(out, tuple):
+        return out[0], out[1]
+    return out, None
+
 Player = Callable[[ColorLinesGame], Optional[tuple[tuple[int, int], tuple[int, int]]]]
 
 
@@ -153,6 +161,12 @@ def load_dual_model(policy_path, value_path, device, fp16=False, jit_trace=False
 
 def make_policy_player(net, device):
     """Greedy argmax policy player from AlphaTrainNet."""
+    # Detect net dtype once so we cast obs correctly each call
+    try:
+        _net_dtype = next(net.parameters()).dtype
+    except (StopIteration, AttributeError):
+        _net_dtype = torch.float32
+
     def player(game: ColorLinesGame):
         board = game.board
         nr = np.zeros(3, dtype=np.intp)
@@ -166,10 +180,11 @@ def make_policy_player(net, device):
 
         obs = torch.from_numpy(
             build_observation(board, nr, nc, ncol, nn)
-        ).unsqueeze(0).to(device)
+        ).unsqueeze(0).to(device=device, dtype=_net_dtype)
 
         with torch.no_grad():
-            logits = net(obs)[0][0].cpu().numpy()
+            pol_logits, _ = unpack_pol_val(net(obs))
+            logits = pol_logits[0].float().cpu().numpy()
 
         source_mask = game.get_source_mask()
         best_score = -1e18
@@ -201,7 +216,17 @@ def make_value_player(net, device, max_score=30000.0, top_k=30, num_samples=1):
 
     num_samples > 1: average over multiple random spawn outcomes per move.
     """
+    if getattr(net, 'policy_only', False):
+        raise RuntimeError(
+            "make_value_player requires the model's value head; the loaded "
+            "model is policy_only. Use make_policy_player or MCTS with "
+            "feature_weights_path instead.")
     from alphatrain.mcts import _build_obs_for_game
+
+    try:
+        _net_dtype = next(net.parameters()).dtype
+    except (StopIteration, AttributeError):
+        _net_dtype = torch.float32
 
     def player(game: ColorLinesGame):
         board = game.board
@@ -217,9 +242,10 @@ def make_value_player(net, device, max_score=30000.0, top_k=30, num_samples=1):
         # Get policy logits to rank candidates
         obs = torch.from_numpy(
             build_observation(board, nr, nc, ncol, nn)
-        ).unsqueeze(0).to(device)
+        ).unsqueeze(0).to(device=device, dtype=_net_dtype)
         with torch.no_grad():
-            pol_logits = net(obs)[0][0].cpu().numpy()
+            pol_t, _ = unpack_pol_val(net(obs))
+            pol_logits = pol_t[0].float().cpu().numpy()
 
         # Collect legal moves with policy scores
         source_mask = game.get_source_mask()
@@ -262,10 +288,10 @@ def make_value_player(net, device, max_score=30000.0, top_k=30, num_samples=1):
 
         obs_batch = torch.from_numpy(
             np.stack(obs_list)
-        ).to(device)
+        ).to(device=device, dtype=_net_dtype)
         with torch.no_grad():
-            _, val_logits = net(obs_batch)
-            values = net.predict_value(val_logits, max_val=max_score).cpu().numpy()
+            _, val_logits = unpack_pol_val(net(obs_batch))
+            values = net.predict_value(val_logits, max_val=max_score).float().cpu().numpy()
 
         # Average over samples per candidate
         values = values.reshape(len(candidates), num_samples).mean(axis=1)

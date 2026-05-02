@@ -248,6 +248,25 @@ def main():
     total = len(seeds) * n_per
     n_cpu = min(cpu_count(), total)
 
+    # Fail-fast: policy_only models have no NN value head. If MCTS will run
+    # (i.e. not --policy-only-mode), it needs a value source — feature
+    # weights, external value net, --value-mode, or --ranking-head.
+    # Otherwise search runs blind on zeros and produces garbage scores.
+    if not args.policy_only:  # MCTS will be used at all
+        ckpt_meta = torch.load(args.model, map_location='cpu',
+                               weights_only=False)
+        is_policy_only_model = ckpt_meta.get(
+            'policy_only', 'value_fc2.weight' not in ckpt_meta['model'])
+        del ckpt_meta
+        if is_policy_only_model and not (
+                args.feature_value_weights or args.value_net
+                or args.value_mode or args.ranking_head):
+            raise SystemExit(
+                f"Model '{args.model}' is policy_only but MCTS has no value "
+                f"source configured. Pass --feature-value-weights, "
+                f"--value-net, --value-mode, or --ranking-head. Otherwise "
+                f"MCTS will search blind.")
+
     print(f"Evaluation: {len(seeds)} seeds x {n_per} games = {total} games",
           flush=True)
     print(f"Model: {args.model}", flush=True)
