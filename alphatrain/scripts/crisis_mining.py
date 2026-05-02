@@ -61,7 +61,8 @@ def play_policy_only(net, device, seed, fp16=False, max_turns=5000):
         if fp16:
             obs = obs.half()
         with torch.inference_mode():
-            pol_logits, _ = net(obs)
+            out = net(obs)
+            pol_logits = out[0] if isinstance(out, tuple) else out
         pol_np = pol_logits[0].float().cpu().numpy()
         priors = _get_legal_priors_flat(game.board, pol_np, 30)
 
@@ -267,6 +268,16 @@ def main():
     else:
         device_str = 'cpu'
         device = torch.device('cpu')
+
+    # Fail-fast: policy_only models need an MCTS value source.
+    ckpt_meta = torch.load(args.model, map_location='cpu', weights_only=False)
+    is_policy_only_model = ckpt_meta.get(
+        'policy_only', 'value_fc2.weight' not in ckpt_meta['model'])
+    del ckpt_meta
+    if is_policy_only_model and not args.feature_value_weights:
+        raise SystemExit(
+            f"Model '{args.model}' is policy_only but no value source. "
+            f"Pass --feature-value-weights for crisis MCTS replays.")
 
     n_seeds = args.seed_end - args.seed_start
     print(f"Crisis Mining: {n_seeds} seeds ({args.seed_start}-{args.seed_end})",

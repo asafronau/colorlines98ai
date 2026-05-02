@@ -186,6 +186,21 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     net, max_score = load_model(model_path, device)
     net = net.half()
     is_policy_only = getattr(net, 'policy_only', False)
+
+    # Fail-fast: if the model has no value head AND the server has no
+    # alternative value source, val_buf will be zeros — clients that try
+    # to use it will silently train on garbage. Force the user to either
+    # use a non-policy-only model, or configure an external value source
+    # (value_model_path, value_mode, ranking_head_path).
+    server_has_value_source = (value_model_path is not None
+                               or value_mode is not None
+                               or ranking_head_path is not None)
+    if is_policy_only and not server_has_value_source:
+        print("  WARNING: policy_only model loaded with no server-side value "
+              "source configured. val_buf will be zeros — clients MUST use "
+              "feature_weights_path or pass value_net to MCTS, otherwise "
+              "search will run blind.", flush=True)
+
     dummy = torch.randn(1, 18, 9, 9, device=device).half()
     if use_compile and device_str == 'cuda':
         # torch.compile with reduce-overhead is the right mode for the
