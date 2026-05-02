@@ -34,7 +34,8 @@ def train_epoch(model, loader, optimizer, device, scaler=None, log_interval=100)
         pol_tgt = pol_tgt.to(device)
 
         with torch.amp.autocast('cuda', enabled=use_amp):
-            pol_logits, _ = model(obs)
+            out = model(obs)
+            pol_logits = out[0] if isinstance(out, tuple) else out
             loss = cross_entropy_soft(pol_logits, pol_tgt)
 
         optimizer.zero_grad(set_to_none=True)
@@ -74,7 +75,8 @@ def validate(model, loader, device, use_amp=False):
         pol_tgt = pol_tgt.to(device)
 
         with torch.amp.autocast('cuda', enabled=use_amp):
-            pol_logits, _ = model(obs)
+            out = model(obs)
+            pol_logits = out[0] if isinstance(out, tuple) else out
             loss = cross_entropy_soft(pol_logits, pol_tgt)
 
         total_loss += loss.item()
@@ -103,6 +105,10 @@ def main():
     p.add_argument('--save-dir', default='checkpoints/alphatrain')
     p.add_argument('--copy-to', type=str, default=None)
     p.add_argument('--num-workers', type=int, default=8)
+    p.add_argument('--policy-only', action='store_true',
+                   help='Train without value head (V10+ models). Smaller '
+                        'checkpoint, ~5-10% faster forward. Backbone and '
+                        'policy head are unchanged.')
     args = p.parse_args()
 
     if torch.backends.mps.is_available():
@@ -129,12 +135,14 @@ def main():
     print(f"Train: {n_train:,}, Val: {n_val:,}, max_score: {max_score:.0f}",
           flush=True)
 
-    model = AlphaTrainNet(num_blocks=args.num_blocks, channels=args.channels).to(device)
+    model = AlphaTrainNet(num_blocks=args.num_blocks, channels=args.channels,
+                          policy_only=args.policy_only).to(device)
     n_params = count_parameters(model)
     # channels_last gives better perf for small spatial dims on CUDA
     if device.type == 'cuda':
         model = model.to(memory_format=torch.channels_last)
-    print(f"Model: {args.num_blocks}b x {args.channels}ch, "
+    head_str = " policy-only" if args.policy_only else ""
+    print(f"Model: {args.num_blocks}b x {args.channels}ch{head_str}, "
           f"{n_params:,} params, {model.in_channels}ch input", flush=True)
 
     # Load weights BEFORE torch.compile (compile wraps state dict keys)
@@ -232,6 +240,7 @@ def main():
             'best_val_loss': min(best_val, vl),
             'max_score': max_score,
             'args': vars(args),
+            'policy_only': args.policy_only,
         }
         latest_path = os.path.join(args.save_dir, 'latest.pt')
         torch.save(ckpt, latest_path)

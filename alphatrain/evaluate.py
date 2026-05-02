@@ -23,8 +23,10 @@ class _JitWrapper:
     """Wraps a JIT-traced model, keeping predict_value from the original."""
 
     def __init__(self, net, dummy_input):
-        self.predict_value = net.predict_value
+        self.predict_value = net.predict_value if not net.policy_only \
+            else _no_value_predict
         self.num_value_bins = net.num_value_bins
+        self.policy_only = net.policy_only
         self._traced = torch.jit.trace(net, dummy_input)
 
     def __call__(self, x):
@@ -35,6 +37,12 @@ class _JitWrapper:
 
     def train(self, mode):
         return self
+
+
+def _no_value_predict(*args, **kwargs):
+    raise RuntimeError(
+        "predict_value called on a policy_only model. Use feature-value "
+        "weights or an external value net for MCTS leaf evaluation.")
 
 Player = Callable[[ColorLinesGame], Optional[tuple[tuple[int, int], tuple[int, int]]]]
 
@@ -61,12 +69,19 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
     nb = sum(1 for k in state if k.endswith('.conv1.weight')
              and k.startswith('blocks.'))
     ch = state['stem.0.weight'].shape[0]
-    bins = state['value_fc2.weight'].shape[0]
-    vch = state['value_conv.weight'].shape[0]
-    vhid = state['value_fc1.weight'].shape[0]
-    net = AlphaTrainNet(in_channels=in_ch, num_blocks=nb, channels=ch,
-                        num_value_bins=bins, value_channels=vch,
-                        value_hidden=vhid).to(device)
+    # Detect policy_only: explicit metadata wins; fall back to checking
+    # whether the state dict contains value-head weights at all.
+    policy_only = ckpt.get('policy_only', 'value_fc2.weight' not in state)
+    if policy_only:
+        net = AlphaTrainNet(in_channels=in_ch, num_blocks=nb, channels=ch,
+                            policy_only=True).to(device)
+    else:
+        bins = state['value_fc2.weight'].shape[0]
+        vch = state['value_conv.weight'].shape[0]
+        vhid = state['value_fc1.weight'].shape[0]
+        net = AlphaTrainNet(in_channels=in_ch, num_blocks=nb, channels=ch,
+                            num_value_bins=bins, value_channels=vch,
+                            value_hidden=vhid).to(device)
     net.load_state_dict(state)
     net.train(False)
     max_score = float(ckpt.get('max_score', 30000.0))
@@ -84,7 +99,8 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
         opts.append('jit')
 
     opt_str = f" [{'+'.join(opts)}]" if opts else ""
-    print(f"Loaded {model_path}: {nb}b x {ch}ch, epoch={epoch}, "
+    head_str = " policy-only" if policy_only else ""
+    print(f"Loaded {model_path}: {nb}b x {ch}ch{head_str}, epoch={epoch}, "
           f"max_score={max_score:.0f}"
           + (f", val_loss={val_loss:.4f}" if val_loss else "")
           + opt_str, flush=True)
