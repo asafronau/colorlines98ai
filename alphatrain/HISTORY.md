@@ -1875,17 +1875,18 @@ synthetic modes. Policy mean=3,465 on these seeds.
 
 ### Phase 20 — Architecture decision: drop the value head
 
-116. **The NN value head is permanently abandoned.** Six months of
-     failed experiments (Pillar 2b ranking head, 2g/2h self-play value
-     training, 2j categorical+TD, 2r SNR=0.03, 2u/2v drop-and-restore
-     attempts) plus the V9 collapse investigation converged on the same
-     answer: **for this game, the value head is dead weight**. With
-     val_weight=0 (the policy distillation setup that produced our
-     strongest models — 2U, 2V, 2W, 2W2), the value head outputs are
-     a near-constant random projection of backbone features (R²=0.0043
-     on survival prediction). The 18-feature linear evaluator beats it
-     by 29× and is faster. There is no scenario, given everything we
-     have tried, where retraining the value head improves search quality.
+116. **The NN value head is permanently abandoned.** A series of
+     value-training attempts (Pillar 2b ranking head, 2g/2h self-play
+     value training, 2j categorical+TD, 2r SNR=0.03 diagnosis, 2u/2v
+     drop-and-restore experiments) plus the recent V9 collapse
+     investigation converged on the same answer: **for this game, the
+     value head is dead weight**. With val_weight=0 (the policy
+     distillation setup that produced our strongest models — 2U, 2V,
+     2W, 2W2), the value head outputs are a near-constant random
+     projection of backbone features (R²=0.0043 on survival
+     prediction). The 18-feature linear evaluator beats it by 29× and
+     is faster. Given the variants we've tried, there's no obvious
+     path where retraining the value head improves search quality.
 
 117. **V10 self-play data has bootstrap_value=0 for capped games.**
      This is the explicit signal that "we are not going to consume the
