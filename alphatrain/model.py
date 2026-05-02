@@ -51,11 +51,13 @@ class AlphaTrainNet(nn.Module):
 
     def __init__(self, in_channels=18, num_blocks=10, channels=256,
                  policy_channels=128, num_value_bins=64,
-                 value_channels=32, value_hidden=512, value_dropout=0.0):
+                 value_channels=32, value_hidden=512, value_dropout=0.0,
+                 policy_only=False):
         super().__init__()
         self.in_channels = in_channels
         self.channels = channels
         self.num_value_bins = num_value_bins
+        self.policy_only = policy_only
 
         # Stem
         self.stem = nn.Sequential(
@@ -73,15 +75,18 @@ class AlphaTrainNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_conv2 = nn.Conv2d(policy_channels, 81, 1)
 
-        # Value head: conv → fc → dropout → fc → output
-        self.value_conv = nn.Conv2d(channels, value_channels, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(value_channels)
-        self.value_fc1 = nn.Linear(value_channels * BOARD_SIZE * BOARD_SIZE, value_hidden)
-        self.value_dropout = nn.Dropout(value_dropout) if value_dropout > 0 else nn.Identity()
-        self.value_fc2 = nn.Linear(value_hidden, num_value_bins)
+        # Value head: only built when policy_only=False. Skipping it on
+        # V10+ models saves ~1.4M params and ~5-10% forward-pass time.
+        if not policy_only:
+            self.value_conv = nn.Conv2d(channels, value_channels, 1, bias=False)
+            self.value_bn = nn.BatchNorm2d(value_channels)
+            self.value_fc1 = nn.Linear(value_channels * BOARD_SIZE * BOARD_SIZE, value_hidden)
+            self.value_dropout = nn.Dropout(value_dropout) if value_dropout > 0 else nn.Identity()
+            self.value_fc2 = nn.Linear(value_hidden, num_value_bins)
 
     def forward(self, x):
-        """Returns (policy_logits, value_logits)."""
+        """Returns (policy_logits, value_logits) or just policy_logits
+        when policy_only=True."""
         out = self.stem(x)
         out = self.blocks(out)
         out = F.relu(self.backbone_bn(out))
@@ -90,6 +95,9 @@ class AlphaTrainNet(nn.Module):
         p = F.relu(self.policy_bn(self.policy_conv1(out)))
         p = self.policy_conv2(p)
         policy_logits = p.reshape(p.size(0), -1)
+
+        if self.policy_only:
+            return policy_logits
 
         # Value
         v = F.relu(self.value_bn(self.value_conv(out)))

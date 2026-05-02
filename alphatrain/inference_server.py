@@ -185,6 +185,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     from alphatrain.evaluate import load_model
     net, max_score = load_model(model_path, device)
     net = net.half()
+    is_policy_only = getattr(net, 'policy_only', False)
     dummy = torch.randn(1, 18, 9, 9, device=device).half()
     if use_compile and device_str == 'cuda':
         # torch.compile with reduce-overhead is the right mode for the
@@ -301,6 +302,10 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                 hash(obs_np[i].tobytes()) % (2**31) / (2**31)
                 for i in range(count)], dtype=np.float32)
             return torch.from_numpy(hashes).to(device) * 200
+        if val_logits is None:
+            # policy_only model with no external value source — clients
+            # using feature-value MCTS will ignore val_buf entirely.
+            return torch.zeros(count, device=device)
         return net.predict_value(val_logits, max_val=max_score)
 
     GPU_BATCH_CAP = num_workers * max_batch  # no artificial cap
@@ -347,7 +352,11 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                     gpu_obs[:count] = torch.from_numpy(
                         obs_buf[slot_id, :count]).half()
 
-                    pol_logits, val_logits = net_traced(gpu_obs[:count])
+                    out = net_traced(gpu_obs[:count])
+                    if is_policy_only:
+                        pol_logits, val_logits = out, None
+                    else:
+                        pol_logits, val_logits = out
                     values = _compute_values(gpu_obs, count, pol_logits, val_logits)
 
                     pol_buf[slot_id, :count] = pol_logits.float().cpu().numpy()
@@ -399,7 +408,11 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                 obs_staging[:total_count]).half()
 
             with torch.inference_mode():
-                pol_logits, val_logits = net_traced(gpu_obs[:total_count])
+                out = net_traced(gpu_obs[:total_count])
+                if is_policy_only:
+                    pol_logits, val_logits = out, None
+                else:
+                    pol_logits, val_logits = out
                 values = _compute_values(
                     gpu_obs, total_count, pol_logits, val_logits)
 
