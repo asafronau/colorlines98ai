@@ -1907,26 +1907,43 @@ synthetic modes. Policy mean=3,465 on these seeds.
 
 The value head's role in inference has already been short-circuited
 in feature mode (`mcts.py` skips `predict_value` and `val_logits.cpu()`
-when `feature_coefs is not None`). Surgical removal at training time
-is the next step:
+when `feature_coefs is not None`). The next step is to make the value
+head **optional at training time** via a flag — not to delete the code
+path, since we still need to load and test 2U/2V/2W/2W2 (which all
+have value heads).
 
-- **Model class** (`alphatrain/model.py`): add `policy_only=True` flag
-  to `AlphaTrainNet`. When set, skip building `value_conv`, `value_bn`,
-  `value_fc1`, `value_fc2`. `forward()` returns `policy_logits` only.
+**Both modes are supported in parallel:**
+
+- `policy_only=False` (default) → existing dual-head architecture. All
+  pre-V10 checkpoints continue to load and run identically to today,
+  including their NN value head if anyone wants to compare to feature
+  value or use it for some other experiment.
+- `policy_only=True` → smaller architecture, no value head. New
+  V10+ training uses this. Forward returns `policy_logits` only.
+
+Concrete changes:
+
+- **Model class** (`alphatrain/model.py`): add `policy_only=False` flag
+  to `AlphaTrainNet`. When True, skip building `value_conv`, `value_bn`,
+  `value_fc1`, `value_fc2`. `forward()` returns `policy_logits` only;
+  otherwise it returns the existing tuple.
 - **Training** (`alphatrain/train.py`): when `policy_only=True`, set
   `val_weight=0` automatically, skip value-loss computation and value
-  target loading. Saves both compute and one big collate path.
+  target loading. Reject `val_weight > 0` at config time as a misuse.
 - **Inference** (`mcts.py`, `evaluate.py`, `inference_server.py`):
-  callers branch on `getattr(net, 'policy_only', False)`. If true:
-  forward returns just `pol_logits`, callers must already be in
-  feature-value mode (we should assert this at MCTS init time).
-- **Checkpoints**: write `policy_only=True` in metadata. `load_model`
-  reads this flag and instantiates the appropriate architecture.
-- **Backward compat**: existing checkpoints (without the flag) default
-  to `policy_only=False` and behave identically to today.
+  callers branch on `getattr(net, 'policy_only', False)`. Both shapes
+  are handled. When `policy_only=True`, MCTS asserts that a value
+  source is provided (feature evaluator or external value net) — the
+  policy net alone has no value to back up.
+- **Checkpoints**: write `policy_only` (True or False) in metadata.
+  `load_model` reads the flag and instantiates the matching
+  architecture. Old checkpoints without the field default to False.
 
-Expected savings: ~5-10% NN forward time (value head FLOPs eliminated),
-slightly smaller checkpoints (~1-2MB), and a cleaner architecture for
-future iterations. The bigger benefit is conceptual clarity: the model
-is what it actually is — a policy network — not a half-broken
-two-headed model with one head systematically ignored.
+Expected savings on `policy_only=True` models: ~5-10% NN forward
+time (value head FLOPs eliminated), slightly smaller checkpoints
+(~1-2MB). For old models the architecture is unchanged.
+
+When to actually delete the dual-mode code: when we have 2-3
+generations of strong policy-only models (2X, 2Y, ...) and no longer
+need to compare against 2W2-era checkpoints. Probably around 2Z.
+Until then, both modes coexist.
