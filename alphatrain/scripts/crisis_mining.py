@@ -165,6 +165,10 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
         'replay_sims': num_sims,
         'moves': moves_data,
         'capped': capped,
+        # Match selfplay convention: capped games carry bootstrap_value=0.0
+        # explicitly. V10+ data is policy-only training; downstream value
+        # consumers must pass --policy-only-data to acknowledge.
+        'bootstrap_value': 0.0,
         'time': time.time() - t0,
     }
 
