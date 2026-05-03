@@ -124,7 +124,9 @@ def make_afterstate(board, sr, sc, tr, tc):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--games-dir', default='data/expert_v2')
+    parser.add_argument('--games-dir', nargs='+', default=['data/expert_v2'],
+                        help='One or more directories containing game JSONs. '
+                             'V10 typically passes regular + openings + crisis.')
     parser.add_argument('--output', default=None,
                         help='Output path (default: auto-named with gamma)')
     parser.add_argument('--gamma', type=float, default=DEFAULT_GAMMA)
@@ -158,8 +160,12 @@ def main():
         surv_str = f'_surv{args.survival_bonus}' if args.survival_bonus > 0 else ''
         args.output = f'alphatrain/data/expert_v2_pairwise_g{g_str}{surv_str}.pt'
 
-    files = sorted(glob.glob(os.path.join(args.games_dir, 'game_seed*.json')))
-    print(f"Found {len(files)} game files in {args.games_dir}", flush=True)
+    files = []
+    for d in args.games_dir:
+        d_files = sorted(glob.glob(os.path.join(d, 'game_seed*.json')))
+        print(f"Found {len(d_files)} game files in {d}", flush=True)
+        files.extend(d_files)
+    print(f"Total: {len(files)} games across {len(args.games_dir)} dir(s)", flush=True)
     print(f"Gamma: {gamma}, survival_bonus: {args.survival_bonus}, "
           f"bins: {num_bins}, output: {args.output}", flush=True)
 
