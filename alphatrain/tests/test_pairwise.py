@@ -1,10 +1,17 @@
-"""Tests for pairwise training pipeline: afterstate pairs, collate, loss."""
+"""Tests for pairwise training pipeline: afterstate pairs, collate, loss.
+
+NOTE: marked skip on arch/v2-clean — pairwise/value-head training is
+being removed. Both this test file and the production code it covers
+will be deleted in Stage 2.
+"""
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import pytest
 from alphatrain.model import AlphaTrainNet
+
+pytestmark = pytest.mark.skip(reason="value-head/pairwise — deleted in Stage 2")
 
 
 class TestPairwiseCollate:

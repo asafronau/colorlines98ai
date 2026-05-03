@@ -122,6 +122,7 @@ class TestDihedralAugmentation:
             assert len(set(lut)) == NUM_MOVES, f"Transform {t} has duplicates"
 
 
+@pytest.mark.skip(reason="TD value targets — deleted in arch/v2-clean Stage 2")
 class TestTDValues:
     """Tests using synthetic game data (works everywhere, including Colab)."""
 
