@@ -1,9 +1,15 @@
-"""Tests for afterstate computation."""
+"""Tests for afterstate computation.
+
+NOTE: marked skip on arch/v2-clean — afterstate is part of the pairwise
+ranking head pipeline (value-head training) that is being deleted.
+"""
 
 import numpy as np
 import pytest
 from alphatrain.afterstate import compute_afterstate
 from game.config import BOARD_SIZE
+
+pytestmark = pytest.mark.skip(reason="afterstate/pairwise — deleted in Stage 2")
 
 
 def test_simple_move_no_clear():
