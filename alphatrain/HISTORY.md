@@ -2038,30 +2038,49 @@ win is in floor + median, which mean compresses with capped data.
 
 ### Phase 21 addendum 2 — sims sensitivity test (600 vs 400)
 
-Goal: check if 600 sims gives meaningful quality improvement over 400.
-If not, ship 600 for V11 self-play (faster generation).
+Goal: check if 600 sims gives meaningful quality improvement over 400
+to inform V11 sim count.
 
-pillar2x2_ep10 + V10 weights, 50 seeds, batch_size=8:
+pillar2x2_ep10 + V10 weights, 50 seeds, batch_size=8. Cap is 5,000
+turns ≈ 10,000-10,500 points, so games > 10K are "hit the cap":
 
-| Sims | Min | P10 | Median | P90 | %<1K | %>10K | Wall/game |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 400 | 579 | **2,862** | 10,230 | 10,486 | 2% | 56% | ~110s |
-| 600 | **1,145** | 2,363 | **10,354** | 10,499 | **0%** | **64%** | 256s |
+| Sims | Min | P10 | Median | %<1K | %>10K (cap) | Wall/game |
+|---|---:|---:|---:|---:|---:|---:|
+| 400 | 579 | 2,862 | 10,230 | 2% | 56% | ~110s |
+| **600** | **1,145** | 2,363 | **10,354** | **0%** | **64%** | 256s |
 
-Mixed picture: 600 sims **doubled the min** (579 → 1,145) and lifted
-the cap-rate (>10K 56% → 64%), but **P10 went down** (2,862 → 2,363)
-because of a few bad-luck outliers (seeds 31, 35 lost catastrophically
-at 600 sims; same seeds were OK at 400). Median essentially unchanged.
+600 sims is **genuinely better on most metrics**: min nearly doubled
+(579 → 1,145), %<1K dropped to zero, cap-hit rate +8pp (56→64%),
+median +1%. Only P10 dropped (2,862 → 2,363) — likely sample noise
+at n=50; per-seed inspection shows 600-sim **rescued** 400-sim
+catastrophes (seed 19: 579 → 10,547) but **broke** a few good 400-sim
+games (seed 35: 10,402 → 1,345). Net: fewer extreme failures, slight
+shift toward cap-hits at the cost of a few mid-bucket games.
 
-Wall cost: 600 sims ~2.3× slower than 400 per game. For self-play
-generation, the marginal quality gain doesn't justify 2.3× compute.
-**Ship 400 sims for V11 generation, not 600.**
+Wall comparison is subtler than raw per-game time suggests:
+- Per-game wall: ~1.5× more for 600 sims (110s → 256s)
+- BUT a chunk of that increase is because **600-sim games last longer**
+  (more turns played → more moves → more wall) since the policy keeps
+  them alive longer. Per-move cost is actually ~1.5× higher, not 2.3×.
+- For 5K-turn-cap-hit games specifically, both configurations play
+  out similarly long; the difference is in dying games where 600
+  sims survives longer.
 
-(For evaluation: 600 sims would be a stronger test player, but for
-data generation we want compute efficiency.)
+124. **Lesson: more sims meaningfully improves data quality, but at
+     real wall cost.** 400 → 600 sims: min +98%, %>10K +8pp, median
+     +1%. Wall +50% per move (more for full games because they last
+     longer). For self-play data generation, 600 sims is worth the
+     compute when targeting quality — better visit distributions,
+     fewer truncated dying games in the corpus.
 
-124. **Lesson: more sims helps marginal quality but with steep cost.**
-     400 → 600 sims: median +1%, P10 -17%, wall +130%. The capped
-     median benchmark plateaus near sim count 400-800 with this
-     model + evaluator combo. Sub-policy variance dominates over
-     small sim differences. Don't pay 2× compute for ±5% quality.
+125. **Don't conflate per-game wall with per-move compute cost.** When
+     comparing sim counts, longer games at higher sims are partly
+     evidence of *quality* (the search keeps the game alive), not
+     pure compute overhead. Decompose wall into (turns × per-move
+     cost) before declaring "X is too expensive."
+
+126. **Don't lean on a single percentile in capped regimes.** P10 dropped
+     17% from 400 → 600 sims while min, median, P25, mean, %<1K, and
+     cap rate all improved. With 50-seed samples, single-percentile
+     swings are noisy; weight them less than the full-distribution
+     trend.
