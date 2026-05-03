@@ -1947,3 +1947,58 @@ When to actually delete the dual-mode code: when we have 2-3
 generations of strong policy-only models (2X, 2Y, ...) and no longer
 need to compare against 2W2-era checkpoints. Probably around 2Z.
 Until then, both modes coexist.
+
+### Phase 21 — V10 results (pillar2x family)
+
+Policy-only evaluation, 500 seeds (0..499), 400 sims, batch_size=8,
+deterministic mode. These are the canonical baseline numbers for
+comparing to future iterations.
+
+| Model | Train run | Mean | Median | <500 | <1000 | >5000 | >10000 | Max |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| pillar2v_endgame ep6 | V8/V9 era | 2,452 | 1,746 | 6.4% | 27% | 12% | 1% | 11,454 |
+| pillar2w2 ep10 | V8/V9 era | 2,934 | 2,248 | 4.2% | 20% | 17% | 1% | 16,833 |
+| **pillar2x ep6** | V10, lr=1e-4 | **3,450** | 2,492 | 3.8% | 16% | 23% | 4% | 24,636 |
+| **pillar2x2 ep10** | V10, lr=3e-4 | **4,110** | **3,314** | **1.6%** | **12%** | **32%** | **6%** | 23,314 |
+
+119. **Iteration cadence: each V-step adds ~18-20% to policy-only mean.**
+     2V → 2W2: +20% (2,452 → 2,934). 2W2 → 2X: +18% (2,934 → 3,450).
+     2X → 2X2: +19% (3,450 → 4,110). Stronger lr (3e-4 vs 1e-4) was
+     the difference between 2X and 2X2 — same V10 corpus, same warm-
+     start, different optimizer. The "stubborn loss" we observed at
+     lr=1e-4 (val plateau ~2.09) was a local minimum, not a global
+     floor. lr=3e-4 dislodged it (val=2.07) and the resulting policy
+     scored 19% higher. Future iterations: prefer 3e-4 with no decay
+     for fine-tune-from-warmstart.
+
+120. **Floor came up dramatically with V10 → pillar2x2.** Sub-500-score
+     games dropped from 4.2% (2W2) → 1.6% (2X2). Sub-1000 from 20% → 12%.
+     Tail came up too: >5000 from 17% → 32%. >10000 from 1% → 6%.
+     This is the V9 collapse fully reversed plus genuine forward
+     progress. Each iteration produces both a stronger floor (fewer
+     catastrophic deaths) and a heavier tail (more capped/long games)
+     simultaneously — the right shape for survival-game improvement.
+
+121. **The feature evaluator improves with stronger self-play data.**
+     Re-fitting feature_value_weights on V10 (selfplay_v10_s800 +
+     crisis_v10, ~60K positions) jumped val R² from 0.1259 (V8 fit)
+     to 0.2060 — +64%. Coefficient pattern shifted: V8 fit was
+     dominated by `mobility` (-0.55); V10 fit by `largest` (+0.85)
+     and `low_mob_balls` (-0.58). Several features sign-flipped due
+     to multicollinearity redistribution (avg_reach, ratio). The
+     combined V(board) prediction is what matters for MCTS leaf
+     eval; evaluator should be re-fitted each V-iteration as the
+     state distribution shifts toward longer/healthier trajectories.
+     `feature_value_weights_2x.npz` is the V10-fitted version.
+
+### Roadmap to 30K median / 3K floor target
+
+At ~20%/iteration on policy-only mean:
+- Current: 2X2 = 4,110 mean / 3,314 median / 867 P10
+- After 5 more iterations (~5 weeks if 1 week each): mean ~10K
+- After 10 iterations: mean ~25K
+- Target hit: probably 12-15 iterations from here
+
+Floor is the harder problem. P10 doubled 666 → 867 across 2W2 → 2X2,
+which is faster than mean. Same compounding rate gets P10 to 3K in
+~7 iterations. Tail is easier; floor is the bottleneck.
