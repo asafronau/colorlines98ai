@@ -2002,3 +2002,66 @@ At ~20%/iteration on policy-only mean:
 Floor is the harder problem. P10 doubled 666 → 867 across 2W2 → 2X2,
 which is faster than mean. Same compounding rate gets P10 to 3K in
 ~7 iterations. Tail is easier; floor is the bottleneck.
+
+### Phase 21 addendum — feature-value-weights re-fit on V10 (`_2x.npz`)
+
+Re-fit feature_value_weights on V10 self-play (selfplay_v10_s800 +
+crisis_v10, ~60K positions). Val R² jumped 0.1259 (V8 fit) → 0.2060
+(+64%). Top coefficients: `largest`=+0.85 (new dominant), `low_mob_balls`
+=-0.58, `avg_reach`=-0.48 (sign-flipped vs V8 fit due to multicollinearity
+with largest), `diff_adj`=-0.40. Saved as feature_value_weights_2x.npz.
+
+A/B at MCTS@400 sims, pillar2x2_ep10, 50 seeds:
+
+| Weights | Min | P10 | Median | P90 | Max |
+|---|---:|---:|---:|---:|---:|
+| V8 fit (old) | 541 | 1,300 | 7,916 | 10,505 | 10,566 |
+| **V10 fit (new)** | **579** | **2,862** | **10,230** | 10,486 | 10,566 |
+
+The headline impact is **P10 doubled** (1,300 → 2,862, +120%) and
+**median +29%** (7,916 → 10,230). Cap-clipped tail unchanged (everyone
+hits the cap floor anyway). Mean was misleading at +11% — the real
+win is in floor + median, which mean compresses with capped data.
+
+122. **Lesson: focus on min/median/P10 in capped-game regimes.** With
+     56-74% of MCTS games hitting the 5K-6K cap, mean is dominated by
+     cap value × cap rate, not by quality differences in the body of
+     the distribution. Median and P10 separate iterations cleanly;
+     mean does not.
+
+123. **The feature-value evaluator should be re-fitted each V-iteration.**
+     The R² jump from V8 fit to V10 fit (0.13 → 0.21) plus the +29%
+     median lift in MCTS suggests the evaluator needs fresh data as
+     the policy distribution shifts. Cheap (5 min, ~60K positions)
+     and high-leverage. Rule: refit before each major self-play
+     campaign.
+
+### Phase 21 addendum 2 — sims sensitivity test (600 vs 400)
+
+Goal: check if 600 sims gives meaningful quality improvement over 400.
+If not, ship 600 for V11 self-play (faster generation).
+
+pillar2x2_ep10 + V10 weights, 50 seeds, batch_size=8:
+
+| Sims | Min | P10 | Median | P90 | %<1K | %>10K | Wall/game |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 400 | 579 | **2,862** | 10,230 | 10,486 | 2% | 56% | ~110s |
+| 600 | **1,145** | 2,363 | **10,354** | 10,499 | **0%** | **64%** | 256s |
+
+Mixed picture: 600 sims **doubled the min** (579 → 1,145) and lifted
+the cap-rate (>10K 56% → 64%), but **P10 went down** (2,862 → 2,363)
+because of a few bad-luck outliers (seeds 31, 35 lost catastrophically
+at 600 sims; same seeds were OK at 400). Median essentially unchanged.
+
+Wall cost: 600 sims ~2.3× slower than 400 per game. For self-play
+generation, the marginal quality gain doesn't justify 2.3× compute.
+**Ship 400 sims for V11 generation, not 600.**
+
+(For evaluation: 600 sims would be a stronger test player, but for
+data generation we want compute efficiency.)
+
+124. **Lesson: more sims helps marginal quality but with steep cost.**
+     400 → 600 sims: median +1%, P10 -17%, wall +130%. The capped
+     median benchmark plateaus near sim count 400-800 with this
+     model + evaluator combo. Sub-policy variance dominates over
+     small sim differences. Don't pay 2× compute for ±5% quality.
