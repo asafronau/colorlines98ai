@@ -245,7 +245,12 @@ def main():
     p.add_argument('--continue-turns', type=int, default=500,
                    help='Max turns to play from rewind point')
     p.add_argument('--max-turns', type=int, default=5000,
-                   help='Max turns for policy-only probe game')
+                   help='Hard cap on total game length for replay games '
+                        '(snapshot turn + replay turns ≤ max_turns).')
+    p.add_argument('--policy-max-turns', type=int, default=None,
+                   help='Cap on the policy-only probe game length. Probes '
+                        'beyond this are treated as survivors and produce '
+                        'no replay tasks. Default: falls back to --max-turns.')
     p.add_argument('--device', default=None)
     p.add_argument('--workers', type=int, default=1,
                    help='Parallel workers (1=serial, >1=GPU server)')
@@ -314,7 +319,11 @@ def main():
               flush=True)
 
     # ── Phase 1: Policy probes (serial, instant) ──
-    print(f"\n=== Phase 1: Policy probes ===", flush=True)
+    policy_max_turns = (args.policy_max_turns
+                        if args.policy_max_turns is not None
+                        else args.max_turns)
+    print(f"\n=== Phase 1: Policy probes (cap {policy_max_turns}t) ===",
+          flush=True)
     t0 = time.time()
     replay_tasks = []  # (snapshot, replay_seed, num_sims, label)
     skipped = 0
@@ -323,9 +332,9 @@ def main():
 
     for seed in range(args.seed_start, args.seed_end):
         snapshots, pol_score, pol_turns = play_policy_only(
-            net, device, seed, fp16=fp16, max_turns=args.max_turns)
+            net, device, seed, fp16=fp16, max_turns=policy_max_turns)
 
-        if pol_turns >= args.max_turns:
+        if pol_turns >= policy_max_turns:
             skipped += 1
             continue
 
