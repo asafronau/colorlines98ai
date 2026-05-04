@@ -15,6 +15,7 @@ Usage:
 """
 
 import os
+import re
 import time
 import argparse
 import json
@@ -173,6 +174,103 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
     }
 
 
+def _probe_worker(slot_id, seed_queue, task_queue, progress_queue,
+                  obs_shm_name, pol_shm_name, val_shm_name,
+                  num_workers, max_batch,
+                  request_queue, response_queue,
+                  policy_max_turns, recovery_turns, recovery_sims,
+                  prevention_turns, prevention_sims,
+                  existing_keys):
+    """Phase 1 worker: pull seed, play policy-only via inference server,
+    push replay tasks for the dying probes back to main.
+
+    Each forward pass is batch=1 inside this worker, but the server gathers
+    across all `num_workers` slots, so the GPU sees avg batch ~num_workers.
+    Restores Phase 1 to roughly the same per-eval throughput as Phase 2.
+    """
+    torch.set_num_threads(1)
+
+    from multiprocessing.shared_memory import SharedMemory
+    from alphatrain.inference_server import InferenceClient
+    from alphatrain.mcts import _build_obs_for_game, _get_legal_priors_flat
+
+    obs_shm = SharedMemory(name=obs_shm_name)
+    pol_shm = SharedMemory(name=pol_shm_name)
+    val_shm = SharedMemory(name=val_shm_name)
+    N, B = num_workers, max_batch
+    obs_buf = np.ndarray((N, B, 18, 9, 9), dtype=np.float32, buffer=obs_shm.buf)
+    pol_buf = np.ndarray((N, B, 6561), dtype=np.float32, buffer=pol_shm.buf)
+    val_buf = np.ndarray((N, B), dtype=np.float32, buffer=val_shm.buf)
+
+    client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
+                             request_queue, response_queue)
+    existing_keys = set(existing_keys)
+
+    while True:
+        seed = seed_queue.get()
+        if seed is None:
+            break
+
+        # Play policy-only via server.
+        game = ColorLinesGame(seed=seed)
+        game.reset()
+        snapshots = []
+        turn = 0
+        died = False
+
+        while turn < policy_max_turns and not game.game_over:
+            snapshots.append({
+                'board': game.board.copy(),
+                'next_balls': list(game.next_balls),
+                'turn': turn,
+                'score': game.score,
+                'empty': int(np.sum(game.board == 0)),
+            })
+            obs_np = _build_obs_for_game(game)
+            pol_np, _ = client.evaluate(obs_np)
+            priors = _get_legal_priors_flat(game.board, pol_np, 30)
+            if not priors:
+                died = True
+                break
+            best = max(priors.items(), key=lambda x: x[1])[0]
+            sf = best // 81
+            tf = best % 81
+            game.move((sf // 9, sf % 9), (tf // 9, tf % 9))
+            turn += 1
+
+        if game.game_over and not died:
+            died = True
+
+        if not died:
+            progress_queue.put((seed, 'survived', 0, 0))
+            continue
+
+        # Build replay tasks for this dying seed.
+        tasks_pushed = 0
+        skipped_existing = 0
+        for label, rewind, sims in [
+            ('recovery', recovery_turns, recovery_sims),
+            ('prevention', prevention_turns, prevention_sims),
+        ]:
+            rewind_idx = max(0, turn - rewind)
+            if rewind_idx >= len(snapshots):
+                continue
+            if (seed, label) in existing_keys:
+                skipped_existing += 1
+                continue
+            snapshot = dict(snapshots[rewind_idx])
+            snapshot['original_seed'] = seed
+            replay_seed = seed * 37 + rewind
+            task_queue.put((snapshot, replay_seed, sims, label))
+            tasks_pushed += 1
+
+        progress_queue.put((seed, 'died', tasks_pushed, skipped_existing))
+
+    obs_shm.close()
+    pol_shm.close()
+    val_shm.close()
+
+
 def _replay_worker(slot_id, task_queue, result_queue,
                     obs_shm_name, pol_shm_name, val_shm_name,
                     num_workers, max_batch,
@@ -298,116 +396,112 @@ def main():
     print(f"Continue: {args.continue_turns} turns | Device: {device} | "
           f"Workers: {args.workers}", flush=True)
 
-    # Load model on target device for fast policy probes.
-    # Uses 'spawn' start method so CUDA works in both main and workers.
-    net, _ = load_model(args.model, device,
-                        fp16=(device_str != 'cpu'),
-                        jit_trace=True)
-    fp16 = False
-    try:
-        fp16 = next(net.parameters()).dtype == torch.float16
-    except (StopIteration, AttributeError):
-        pass
-
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # Check existing files for resume
+    # Resume support: filenames already in the save dir tell us which
+    # (seed, label) replays are done and should be skipped.
     existing_files = set(os.listdir(args.save_dir))
     already_done = len([f for f in existing_files if f.endswith('.json')])
     if already_done > 0:
         print(f"Resuming: {already_done} replays already in {args.save_dir}",
               flush=True)
 
-    # ── Phase 1: Policy probes (serial, instant) ──
+    _resume_re = re.compile(r'game_seed(\d+)_(\w+)_score\d+\.json')
+    existing_keys = set()
+    for f in existing_files:
+        m = _resume_re.match(f)
+        if m:
+            existing_keys.add((int(m.group(1)), m.group(2)))
+
     policy_max_turns = (args.policy_max_turns
                         if args.policy_max_turns is not None
                         else args.max_turns)
-    print(f"\n=== Phase 1: Policy probes (cap {policy_max_turns}t) ===",
-          flush=True)
-    t0 = time.time()
-    replay_tasks = []  # (snapshot, replay_seed, num_sims, label)
-    skipped = 0
-    died = 0
-    already_skipped = 0
 
-    for seed in range(args.seed_start, args.seed_end):
-        snapshots, pol_score, pol_turns = play_policy_only(
-            net, device, seed, fp16=fp16, max_turns=policy_max_turns)
-
-        if pol_turns >= policy_max_turns:
-            skipped += 1
-            continue
-
-        died += 1
-
-        replays = [
-            ('recovery', args.recovery_turns, args.recovery_sims),
-            ('prevention', args.prevention_turns, args.prevention_sims),
-        ]
-
-        for label, rewind, sims in replays:
-            rewind_idx = max(0, pol_turns - rewind)
-            if rewind_idx >= len(snapshots):
-                continue
-
-            # Skip if already exists (resume-safe)
-            pattern = f"game_seed{seed}_{label}_score"
-            if any(f.startswith(pattern) for f in existing_files):
-                already_skipped += 1
-                continue
-
-            snapshot = snapshots[rewind_idx]
-            snapshot['original_seed'] = seed
-            replay_seed = seed * 37 + rewind
-            replay_tasks.append((snapshot, replay_seed, sims, label))
-
-        if (died + skipped) % 100 == 0:
-            print(f"  Probed {died + skipped}/{n_seeds}: "
-                  f"{died} died, {skipped} survived, "
-                  f"{len(replay_tasks)} replay tasks", flush=True)
-
-    probe_time = time.time() - t0
-    if already_skipped > 0:
-        print(f"  ({already_skipped} replays already done, skipped)", flush=True)
-    print(f"Phase 1 done: {died} died, {skipped} survived, "
-          f"{len(replay_tasks)} replay tasks ({probe_time:.0f}s)", flush=True)
-
-    if not replay_tasks:
-        print("No replay tasks — all seeds survived!", flush=True)
-        return
-
-    # ── Phase 2: Replays ──
-    print(f"\n=== Phase 2: {len(replay_tasks)} replays "
-          f"({args.workers} workers) ===", flush=True)
-    t1 = time.time()
-    total_replays = 0
-    total_states = 0
+    # Pull model max_score from checkpoint (used by both paths to
+    # configure MCTS / server).
+    ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
+    srv_max_score = float(ckpt.get('max_score', 30000.0))
+    del ckpt
 
     if args.workers <= 1:
-        # Serial mode — reload model on target device (safe, no fork)
-        net_gpu, ser_max_score = load_model(args.model, device,
-                                            fp16=(device_str != 'cpu'),
-                                            jit_trace=True)
-        mcts = MCTS(net_gpu, device, max_score=ser_max_score,
+        # ── Serial mode: load model in main, do everything sequentially ──
+        net, _ = load_model(args.model, device,
+                            fp16=(device_str != 'cpu'),
+                            jit_trace=True)
+        fp16 = False
+        try:
+            fp16 = next(net.parameters()).dtype == torch.float16
+        except (StopIteration, AttributeError):
+            pass
+
+        print(f"\n=== Phase 1: Policy probes (cap {policy_max_turns}t) ===",
+              flush=True)
+        t0 = time.time()
+        replay_tasks = []
+        skipped = 0
+        died = 0
+        already_skipped = 0
+
+        for seed in range(args.seed_start, args.seed_end):
+            snapshots, pol_score, pol_turns = play_policy_only(
+                net, device, seed, fp16=fp16, max_turns=policy_max_turns)
+            if pol_turns >= policy_max_turns:
+                skipped += 1
+                continue
+            died += 1
+            for label, rewind, sims in [
+                ('recovery', args.recovery_turns, args.recovery_sims),
+                ('prevention', args.prevention_turns, args.prevention_sims),
+            ]:
+                rewind_idx = max(0, pol_turns - rewind)
+                if rewind_idx >= len(snapshots):
+                    continue
+                if (seed, label) in existing_keys:
+                    already_skipped += 1
+                    continue
+                snapshot = snapshots[rewind_idx]
+                snapshot['original_seed'] = seed
+                replay_seed = seed * 37 + rewind
+                replay_tasks.append((snapshot, replay_seed, sims, label))
+            if (died + skipped) % 100 == 0:
+                print(f"  Probed {died + skipped}/{n_seeds}: "
+                      f"{died} died, {skipped} survived, "
+                      f"{len(replay_tasks)} replay tasks", flush=True)
+
+        probe_time = time.time() - t0
+        if already_skipped > 0:
+            print(f"  ({already_skipped} replays already done, skipped)",
+                  flush=True)
+        print(f"Phase 1 done: {died} died, {skipped} survived, "
+              f"{len(replay_tasks)} replay tasks ({probe_time:.0f}s)",
+              flush=True)
+
+        if not replay_tasks:
+            print("No replay tasks — all seeds survived!", flush=True)
+            return
+
+        # Phase 2: serial replays
+        print(f"\n=== Phase 2: {len(replay_tasks)} replays (serial) ===",
+              flush=True)
+        t1 = time.time()
+        total_replays = 0
+        total_states = 0
+        mcts = MCTS(net, device, max_score=srv_max_score,
                     num_simulations=args.recovery_sims,
                     batch_size=args.batch_size,
                     top_k=30, c_puct=2.5,
                     feature_weights_path=args.feature_value_weights)
-
         for ti, (snapshot, replay_seed, sims, label) in enumerate(replay_tasks):
             result = replay_from_snapshot(
                 mcts, snapshot, replay_seed, sims,
                 args.continue_turns, args.max_turns,
                 feature_weights_path=args.feature_value_weights)
-
             orig_seed = snapshot.get('original_seed', replay_seed)
             fname = f"game_seed{orig_seed}_{label}_score{result['score']}.json"
             with open(os.path.join(args.save_dir, fname), 'w') as f:
                 json.dump(result, f)
-
             total_replays += 1
             total_states += len(result['moves'])
-
             cap = " [CAP]" if result.get('capped') else ""
             survived = result['turns'] - snapshot['turn']
             elapsed = time.time() - t1
@@ -417,66 +511,136 @@ def main():
                   f"{cap} ETA {eta/60:.0f}m", flush=True)
 
     else:
-        # GPU server mode (spawn-safe)
+        # ── Server mode: parallelize BOTH phases through one server ──
         from alphatrain.inference_server import InferenceServer
         MPQueue = mp.Queue
         Process = mp.Process
-
-        ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
-        srv_max_score = float(ckpt.get('max_score', 30000.0))
-        del ckpt
 
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
                                  max_batch_per_worker=args.batch_size,
                                  use_compile=args.compile)
         server.start()
-
-        task_queue = MPQueue()
-        for task in replay_tasks:
-            task_queue.put(task)
-        for _ in range(args.workers):
-            task_queue.put(None)
-
-        result_queue = MPQueue()
-
-        workers = []
-        for i in range(args.workers):
-            p = Process(
-                target=_replay_worker,
-                args=(i, task_queue, result_queue,
-                      server._obs_shm.name, server._pol_shm.name,
-                      server._val_shm.name,
-                      args.workers, args.batch_size,
-                      server.request_queue, server.response_queues[i],
-                      args.batch_size, srv_max_score,
-                      args.continue_turns, args.max_turns,
-                      args.feature_value_weights))
-            p.start()
-            workers.append(p)
-
         try:
+            # Phase 1: parallel policy probes via the server
+            print(f"\n=== Phase 1: Policy probes "
+                  f"(cap {policy_max_turns}t, {args.workers} workers) ===",
+                  flush=True)
+            t0 = time.time()
+
+            seed_queue = MPQueue()
+            for s in range(args.seed_start, args.seed_end):
+                seed_queue.put(s)
+            for _ in range(args.workers):
+                seed_queue.put(None)
+
+            probe_task_queue = MPQueue()
+            progress_queue = MPQueue()
+
+            probe_workers = []
+            for i in range(args.workers):
+                proc = Process(
+                    target=_probe_worker,
+                    args=(i, seed_queue, probe_task_queue, progress_queue,
+                          server._obs_shm.name, server._pol_shm.name,
+                          server._val_shm.name,
+                          args.workers, args.batch_size,
+                          server.request_queue, server.response_queues[i],
+                          policy_max_turns,
+                          args.recovery_turns, args.recovery_sims,
+                          args.prevention_turns, args.prevention_sims,
+                          list(existing_keys)))
+                proc.start()
+                probe_workers.append(proc)
+
+            died = 0
+            skipped = 0
+            already_skipped = 0
+            for _ in range(n_seeds):
+                _seed, status, n_pushed, n_skipped = progress_queue.get(
+                    timeout=3600)
+                if status == 'died':
+                    died += 1
+                else:
+                    skipped += 1
+                already_skipped += n_skipped
+                done_so_far = died + skipped
+                if done_so_far % 100 == 0:
+                    print(f"  Probed {done_so_far}/{n_seeds}: "
+                          f"{died} died, {skipped} survived "
+                          f"({(time.time()-t0):.0f}s)", flush=True)
+
+            for proc in probe_workers:
+                proc.join(timeout=30)
+
+            # Drain replay tasks pushed by the probe workers.
+            replay_tasks = []
+            while True:
+                try:
+                    replay_tasks.append(probe_task_queue.get_nowait())
+                except Exception:
+                    break
+
+            probe_time = time.time() - t0
+            if already_skipped > 0:
+                print(f"  ({already_skipped} replays already done, skipped)",
+                      flush=True)
+            print(f"Phase 1 done: {died} died, {skipped} survived, "
+                  f"{len(replay_tasks)} replay tasks ({probe_time:.0f}s)",
+                  flush=True)
+
+            if not replay_tasks:
+                print("No replay tasks — all seeds survived!", flush=True)
+                return
+
+            # Phase 2: parallel replays via the same server
+            print(f"\n=== Phase 2: {len(replay_tasks)} replays "
+                  f"({args.workers} workers) ===", flush=True)
+            t1 = time.time()
+            total_replays = 0
+            total_states = 0
+
+            task_queue = MPQueue()
+            for task in replay_tasks:
+                task_queue.put(task)
+            for _ in range(args.workers):
+                task_queue.put(None)
+
+            result_queue = MPQueue()
+            replay_workers = []
+            for i in range(args.workers):
+                proc = Process(
+                    target=_replay_worker,
+                    args=(i, task_queue, result_queue,
+                          server._obs_shm.name, server._pol_shm.name,
+                          server._val_shm.name,
+                          args.workers, args.batch_size,
+                          server.request_queue, server.response_queues[i],
+                          args.batch_size, srv_max_score,
+                          args.continue_turns, args.max_turns,
+                          args.feature_value_weights))
+                proc.start()
+                replay_workers.append(proc)
+
             for ti in range(len(replay_tasks)):
                 result = result_queue.get(timeout=7200)
-
                 orig_seed = result.get('original_seed', result['seed'])
                 label = result.get('label', 'replay')
                 fname = f"game_seed{orig_seed}_{label}_score{result['score']}.json"
                 with open(os.path.join(args.save_dir, fname), 'w') as f:
                     json.dump(result, f)
-
                 total_replays += 1
                 total_states += len(result['moves'])
-
                 elapsed = time.time() - t1
                 eta = elapsed / (ti + 1) * (len(replay_tasks) - ti - 1)
                 if (ti + 1) % 10 == 0:
                     print(f"  [{ti+1}/{len(replay_tasks)}] "
                           f"{total_states:,} states, "
                           f"ETA {eta/60:.0f}m", flush=True)
+
+            for proc in replay_workers:
+                proc.join(timeout=5)
         finally:
-            for p in workers:
-                p.join(timeout=5)
             server.shutdown()
 
     elapsed = time.time() - t0
