@@ -6,14 +6,16 @@ An AlphaZero-inspired AI for [Color Lines 98](https://en.wikipedia.org/wiki/Line
 
 ## Results
 
-| Player | Mean Score | Max Score | Search |
-|--------|-----------|-----------|--------|
-| Heuristic (tournament bracket, 200 rollouts) | 5,700 | 25,764 | CPU rollouts |
-| **Neural policy (standalone, 0 sims)** | **2,972** | **21,260** | None |
-| **Neural MCTS (400 sims)** | **6,016** | **30,544** | GPU MCTS |
-| **Neural MCTS (1,600 sims)** | **8,552** | **30,330** | GPU MCTS |
+| Player | Mean | Median | P10 | Cap-hit | Search |
+|--------|---:|---:|---:|---:|--------|
+| Heuristic (tournament bracket, 200 rollouts) | 5,700 | — | — | n/a | CPU rollouts (no cap) |
+| **Neural policy standalone — pillar2y_epoch_15** (500 seeds) | **5,102** | 3,509 | 988 | n/a | None (single forward pass) |
+| **Neural MCTS @ 400 sims — pillar2x2_epoch_10** (50 seeds) | **7,825** | 10,230 | 2,862 | 56% | feature-value MCTS |
+| **Neural MCTS @ 600 sims — pillar2x2_epoch_10** (50 seeds) | **8,337** | 10,354 | 2,363 | 64% | feature-value MCTS |
 
-The neural player at 1,600 simulations exceeds the heuristic by 50%. The standalone policy (single forward pass, no search) approaches expert human level. Score progression across training iterations:
+MCTS evaluations run with a 5,000-turn cap (~10,500-point ceiling); when a game survives the cap it's truncated, so reported `Mean` is compressed and `Max` would be misleading (a hypothetical uncapped game scores arbitrarily higher). `Median` + `P10` + `Cap-hit %` describe the distribution more honestly. The 1,600-sim bucket is dropped — at this player strength 600 sims matches or exceeds 1,600 (HISTORY lessons 124–126), and the standalone policy alone reaches 43,656 max on uncapped games.
+
+Neural MCTS @ 600 exceeds the heuristic mean by 46%; standalone policy alone is now within 10% of the heuristic without any search. Score progression across training iterations:
 
 | Iteration | Policy Mean | Key Change |
 |-----------|------------|------------|
