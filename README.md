@@ -20,23 +20,30 @@ The neural player at 1,600 simulations exceeds the heuristic by 50%. The standal
 | 2U | 1,763 | Pure policy distillation (dropped value head from training) |
 | 2V | 2,680 | Static 1600 sims + crisis mining |
 | 2W | 2,972 | Opening book (2200 sims) + diverse crisis data |
+| 2W2 | 2,934 | Re-fit on cleaner V8/V9 corpus |
+| 2X | 3,450 | First V10 run (feature-value MCTS data, lr=1e-4, policy-only model) |
+| 2X2 | **4,110** | V10 with lr=3e-4 — same data, +19% over 2X |
+| 2Y | **5,102** | V11 corpus (7.78M states, feature-value MCTS @ 600 sims), 15 epochs, lr=3e-4 — +24% over 2X2 |
+| 2Y2 | (training) | Same V11 corpus, 40-epoch retrain to fix early cosine cooldown |
 
 ## Architecture
 
-- **Model:** 10-block x 256-channel ResNet (13.3M parameters)
+- **Model:** 10-block x 256-channel ResNet (~12M parameters in policy-only mode)
 - **Input:** 18-channel board representation (7 color planes, empty cells, next ball positions, connected component areas, line potentials in 4 directions)
 - **Policy head:** 6,561 logits (81 source x 81 target positions)
-- **Value head:** Exists but untrained (val_weight=0) — provides Q-diversity for MCTS exploration
+- **No NN value head:** V10+ models are policy-only. The MCTS leaf value comes from a separate **18-feature linear evaluator** (`feature_value_weights*.npz`) — a ridge regression on board statistics that predicts `log(1 + remaining_turns)`. Re-fitted per V-iteration; V11 fit reaches val R²=0.34.
 - **Training:** Pure policy distillation from MCTS self-play visit distributions
-- **Search:** PUCT MCTS with virtual loss batching, GPU inference server for parallel workers
+- **Search:** PUCT MCTS with virtual loss batching, GPU inference server for parallel workers, leaf values from the feature evaluator (not the network)
 
 ## Key Discoveries
 
-This project produced 86 documented lessons (see [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) for the complete experiment history). Some highlights:
+This project produced 126 documented lessons (see [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) for the complete experiment history). Some highlights:
 
 **The shared backbone conflict.** Training both policy and value heads on a shared ResNet backbone is a zero-sum game. The value head never learned meaningful board discrimination (0.03 SNR), and increasing its loss weight progressively destroyed policy quality (1,244 → 943 standalone score). Dropping the value head from training and dedicating 100% of gradient to policy gave +85% improvement.
 
 **The value head is dead for training but alive for search.** Attempting to remove the value head entirely broke MCTS — even garbage values provide essential Q-diversity for virtual loss and exploration. The untrained value head acts as exploration noise that prevents the search from degenerating.
+
+**The 18-feature linear evaluator beats the NN value head — by 30×.** The "untrained value head provides Q-diversity" trick worked but the values themselves were garbage (R²=0.03 on remaining-turns). Replacing them with a tiny ridge regression over hand-coded board statistics (largest connected component, average reachability, partition fragmentation, mobility, etc.) gave R²≈0.21 on V10 data, R²≈0.34 on V11 data — and **+29% MCTS median lift** vs the same NN-value model. The feature evaluator is fitted per V-iteration on the latest self-play corpus; the model itself drops the NN value head entirely (`policy_only=True`).
 
 **Color Lines may not need value prediction.** A perfect player survives indefinitely, so the "value" of every healthy board is infinite. The policy learns survival tactics directly from MCTS visit distributions without explicit value targets.
 
@@ -77,17 +84,17 @@ rust_engine/           # Rust game engine (verified identical to Python, for fas
 
 ## Training Pipeline
 
-1. **Self-play:** GPU inference server with N CPU workers playing MCTS games in parallel. Static 1600 sims per move. Each game saves board states + MCTS visit distributions as JSON.
+1. **Self-play:** GPU inference server with N CPU workers playing feature-value MCTS games in parallel. Static **600 sims** per move (V11 default — earlier iterations used 800 / 1600; per-V tuning trades quality for compute). Each game saves board states + MCTS visit distributions as JSON.
 
-2. **Crisis mining:** Policy-only probes find seeds where the model dies (~1 second per game). Deep search (1600-2000 sims) replays from crisis positions generate targeted training data.
+2. **Crisis mining:** Policy-only probes find seeds where the model dies. Deep search (600 sims, recovery rewind 15 / prevention rewind 30) replays from crisis positions generate targeted training data. Phase 1 (probes) and Phase 2 (replays) both run through the inference server in parallel.
 
-3. **Opening generation:** First 200-500 turns at 2200 sims for elite opening decisions.
+3. **Feature-value fitting:** A 30-second ridge regression over 80K sampled board states yields a fresh `feature_value_weights_*.npz`. Re-fit per V-iteration on the latest corpus.
 
-4. **Tensor building:** Convert game JSONs to GPU-resident training tensors with 8x dihedral augmentation.
+4. **Tensor building:** Convert game JSONs to GPU-resident training tensors with 8× dihedral augmentation.
 
-5. **Training:** Pure policy distillation on H100/G4. The model learns to predict the MCTS search distribution from a single forward pass.
+5. **Training:** Pure policy distillation on G4 / L4 / H100. The model learns to predict the MCTS search distribution from a single forward pass. Warm-starts from the previous iteration's best checkpoint.
 
-6. **Evaluation:** GPU-accelerated parallel evaluation on 1000+ seeds with percentile breakdown.
+6. **Evaluation:** GPU-accelerated parallel evaluation on 50–500 seeds with percentile breakdown. Both standalone-policy and MCTS-search eval at multiple sim counts.
 
 ## Setup
 
