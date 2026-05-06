@@ -425,7 +425,8 @@ class MCTS:
                  inference_client=None, dynamic_sims=False,
                  heuristic_value=False, value_net=None,
                  terminal_value=None, override_threshold=0.0,
-                 feature_weights_path=None, early_stop=False):
+                 feature_weights_path=None, early_stop=False,
+                 q_weight=1.0):
         self.net = net
         self.device = device
         self.max_score = max_score
@@ -440,6 +441,12 @@ class MCTS:
         self.terminal_value = terminal_value
         self.override_threshold = override_threshold
         self.early_stop = early_stop
+        # PUCT: score = q_weight * q_norm + U. Default 1.0 (current
+        # behavior). q_weight=0 makes search pure-prior (no Q signal,
+        # virtual loss only). Useful for diagnosing whether the leaf
+        # evaluator is contributing or just adding noise — see
+        # ChatGPT review note 2026-05-05.
+        self.q_weight = q_weight
         self._fp16 = False
         self._sim_rng = None  # SimpleRng, set per search
 
@@ -531,6 +538,7 @@ class MCTS:
         best_child = None
         sqrt_parent = math.sqrt(node.visit_count)
         q_range = max_q - min_q
+        q_weight = self.q_weight
 
         for action, child in node.children.items():
             if child.visit_count > 0:
@@ -539,7 +547,7 @@ class MCTS:
             else:
                 q_norm = 0.5
             u = self.c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
-            score = q_norm + u
+            score = q_weight * q_norm + u
             if score > best_score:
                 best_score = score
                 best_action = action
@@ -612,6 +620,7 @@ class MCTS:
         top_k = self.top_k
         batch_size = self.batch_size
         num_sims = self.num_simulations
+        q_weight = self.q_weight
 
         # Dynamic sims: reduce search for positions where policy is confident.
         # Check raw prior (before Dirichlet) — reflects true policy confidence.
@@ -679,7 +688,7 @@ class MCTS:
                             else:
                                 q_norm = 0.5
                             u = c_puct * child.prior * sqrt_parent / (1 + vc)
-                            score = q_norm + u
+                            score = q_weight * q_norm + u
                             if score > best_score:
                                 best_score = score
                                 best_action = act_i
@@ -918,7 +927,7 @@ def make_mcts_player(net, device, max_score=30000.0,
                      num_simulations=400, c_puct=2.5, top_k=30,
                      batch_size=16, value_net=None, terminal_value=None,
                      override_threshold=0.0, feature_weights_path=None,
-                     early_stop=False):
+                     early_stop=False, q_weight=1.0):
     """Create MCTS player function for use with evaluate."""
     mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_simulations,
@@ -926,7 +935,7 @@ def make_mcts_player(net, device, max_score=30000.0,
                 value_net=value_net, terminal_value=terminal_value,
                 override_threshold=override_threshold,
                 feature_weights_path=feature_weights_path,
-                early_stop=early_stop)
+                early_stop=early_stop, q_weight=q_weight)
 
     def player(game):
         return mcts.search(game)

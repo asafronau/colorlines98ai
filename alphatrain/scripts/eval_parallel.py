@@ -109,7 +109,7 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                       value_net_path=None, device_str='cpu',
                       terminal_value=None, override_threshold=0.0,
                       max_turns=5000, feature_weights_path=None,
-                      early_stop=False):
+                      early_stop=False, q_weight=1.0):
     """Persistent worker: pull seeds, play greedy MCTS games, push results."""
     torch.set_num_threads(1)
 
@@ -152,7 +152,7 @@ def _eval_mcts_worker(slot_id, seed_queue, result_queue,
                 terminal_value=terminal_value,
                 override_threshold=override_threshold,
                 feature_weights_path=feature_weights_path,
-                early_stop=early_stop)
+                early_stop=early_stop, q_weight=q_weight)
 
     while True:
         seed = seed_queue.get()
@@ -195,6 +195,11 @@ def main():
     p.add_argument('--games-per-seed', type=int, default=5)
     p.add_argument('--simulations', type=int, default=400)
     p.add_argument('--c-puct', type=float, default=2.5)
+    p.add_argument('--q-weight', type=float, default=1.0,
+                   help='PUCT score = q_weight * q_norm + U. Default 1.0 '
+                        '(current behavior). 0.0 = pure-prior search '
+                        '(useful diagnostic for whether the leaf '
+                        'evaluator is contributing or just adding noise).')
     p.add_argument('--top-k', type=int, default=30)
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--override-threshold', type=float, default=0.0,
@@ -497,7 +502,8 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         value_net=vnet, terminal_value=tv,
         override_threshold=getattr(args, 'override_threshold', 0.0),
         feature_weights_path=getattr(args, 'feature_value_weights', None),
-        early_stop=getattr(args, 'early_stop', False))
+        early_stop=getattr(args, 'early_stop', False),
+        q_weight=getattr(args, 'q_weight', 1.0))
 
     results = []
     t0 = time.time()
@@ -583,7 +589,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                   getattr(args, 'override_threshold', 0.0),
                   getattr(args, 'max_turns', 5000),
                   args.feature_value_weights,
-                  getattr(args, 'early_stop', False)))
+                  getattr(args, 'early_stop', False),
+                  getattr(args, 'q_weight', 1.0)))
         proc.start()
         workers.append(proc)
 
