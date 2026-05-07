@@ -1,15 +1,21 @@
-"""AlphaTrain ResNet model.
+"""AlphaTrain ResNet model — policy-only.
 
-Dual-head ResNet for Color Lines 98:
+10x256 ResNet for Color Lines 98:
 - Input: (batch, 18, 9, 9) — tactical observation channels
 - Backbone: Conv stem + N residual blocks
 - Policy head: (batch, 6561) flat joint logits
-- Value head: (batch, num_bins) categorical score distribution
 
-Design choices:
-- Pre-activation ResBlocks (BN→ReLU→Conv) for better gradient flow
-- Policy via conv (256→128→81 channels) reshpaed to 6561 — no huge linear layer
-- Categorical value with two-hot targets — handles high-variance scores
+The original dual-head (policy + value) architecture was retired after
+HISTORY lessons 112-118. The NN value head never learned meaningful
+survival signal (R² ≈ 0.03 on remaining-turns); training conflict on
+the shared backbone destroyed policy quality. V10+ models are policy-
+only and use a separate feature-value evaluator at MCTS leaves.
+
+Future work (HISTORY lessons 130+): a small value head trained on a
+*frozen* backbone, with multi-horizon survival classification targets,
+is the planned escape from the linear evaluator's r ≈ 0.5 ceiling.
+That head should be a separate `nn.Module` (not built into this class)
+so the policy training loop stays clean.
 """
 
 import torch
@@ -38,26 +44,24 @@ class ResBlock(nn.Module):
         return out + x
 
 
-class AlphaTrainNet(nn.Module):
-    """Dual-head ResNet for AlphaTrain.
+class PolicyNet(nn.Module):
+    """Policy-only ResNet for AlphaTrain.
+
+    Single-output forward returning policy logits of shape
+    (batch, 6561) — flat joint encoding of (source_idx * 81 + target_idx).
 
     Args:
         in_channels: observation channels (default 18)
         num_blocks: residual blocks (default 10)
         channels: hidden width (default 256)
         policy_channels: intermediate policy conv channels (default 128)
-        num_value_bins: categorical value bins (default 64)
     """
 
     def __init__(self, in_channels=18, num_blocks=10, channels=256,
-                 policy_channels=128, num_value_bins=64,
-                 value_channels=32, value_hidden=512, value_dropout=0.0,
-                 policy_only=False):
+                 policy_channels=128):
         super().__init__()
         self.in_channels = in_channels
         self.channels = channels
-        self.num_value_bins = num_value_bins
-        self.policy_only = policy_only
 
         # Stem
         self.stem = nn.Sequential(
@@ -67,136 +71,42 @@ class AlphaTrainNet(nn.Module):
         )
 
         # Backbone
-        self.blocks = nn.Sequential(*[ResBlock(channels) for _ in range(num_blocks)])
+        self.blocks = nn.Sequential(
+            *[ResBlock(channels) for _ in range(num_blocks)])
         self.backbone_bn = nn.BatchNorm2d(channels)
 
         # Policy head: conv → (batch, 81, 9, 9) → (batch, 6561)
-        self.policy_conv1 = nn.Conv2d(channels, policy_channels, 1, bias=False)
+        self.policy_conv1 = nn.Conv2d(
+            channels, policy_channels, 1, bias=False)
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_conv2 = nn.Conv2d(policy_channels, 81, 1)
 
-        # Value head: only built when policy_only=False. Skipping it on
-        # V10+ models saves ~1.4M params and ~5-10% forward-pass time.
-        if not policy_only:
-            self.value_conv = nn.Conv2d(channels, value_channels, 1, bias=False)
-            self.value_bn = nn.BatchNorm2d(value_channels)
-            self.value_fc1 = nn.Linear(value_channels * BOARD_SIZE * BOARD_SIZE, value_hidden)
-            self.value_dropout = nn.Dropout(value_dropout) if value_dropout > 0 else nn.Identity()
-            self.value_fc2 = nn.Linear(value_hidden, num_value_bins)
-
     def forward(self, x):
-        """Returns (policy_logits, value_logits) or just policy_logits
-        when policy_only=True."""
+        """Returns policy_logits of shape (batch, 6561)."""
         out = self.stem(x)
         out = self.blocks(out)
         out = F.relu(self.backbone_bn(out))
 
-        # Policy
         p = F.relu(self.policy_bn(self.policy_conv1(out)))
         p = self.policy_conv2(p)
-        policy_logits = p.reshape(p.size(0), -1)
+        return p.reshape(p.size(0), -1)
 
-        if self.policy_only:
-            return policy_logits
+    def backbone_features(self, x):
+        """Run stem + blocks + backbone_bn + ReLU; return (B, channels, 9, 9).
 
-        # Value
-        v = F.relu(self.value_bn(self.value_conv(out)))
-        v = v.reshape(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
-        value_logits = self.value_fc2(v)
-
-        return policy_logits, value_logits
-
-    def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
-        """Decode value head output to scalar.
-
-        For scalar head (num_value_bins=1): sigmoid clamped to [0, max_val].
-        For categorical head (num_value_bins>1): softmax over bins.
+        Used by the (planned) frozen-backbone value head — the head
+        trains on these features without backprop into the policy net.
         """
-        if self.num_value_bins == 1:
-            return torch.sigmoid(value_logits.squeeze(-1)) * max_val
-        probs = F.softmax(value_logits, dim=-1)
-        bins = torch.linspace(min_val, max_val, self.num_value_bins,
-                              device=value_logits.device)
-        return (probs * bins).sum(dim=-1)
-
-
-class ValueNet(nn.Module):
-    """Standalone value network for position evaluation.
-
-    Same 18-channel input as AlphaTrainNet but outputs only value prediction.
-    Smaller architecture (fewer blocks/channels) since value is simpler than policy.
-    """
-
-    def __init__(self, in_channels=18, num_blocks=6, channels=128,
-                 num_value_bins=1):
-        super().__init__()
-        self.in_channels = in_channels
-        self.channels = channels
-        self.num_value_bins = num_value_bins
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(),
-        )
-        self.blocks = nn.Sequential(*[ResBlock(channels) for _ in range(num_blocks)])
-        self.backbone_bn = nn.BatchNorm2d(channels)
-
-        self.value_conv = nn.Conv2d(channels, 8, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(8)
-        self.value_fc1 = nn.Linear(8 * BOARD_SIZE * BOARD_SIZE, 256)
-        self.value_fc2 = nn.Linear(256, num_value_bins)
-
-    def forward(self, x):
-        """Returns value_logits: (batch, num_value_bins)."""
         out = self.stem(x)
         out = self.blocks(out)
-        out = F.relu(self.backbone_bn(out))
-
-        v = F.relu(self.value_bn(self.value_conv(out)))
-        v = v.reshape(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
-        return self.value_fc2(v)
-
-    def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
-        if self.num_value_bins == 1:
-            return torch.sigmoid(value_logits.squeeze(-1)) * max_val
-        probs = F.softmax(value_logits, dim=-1)
-        bins = torch.linspace(min_val, max_val, self.num_value_bins,
-                              device=value_logits.device)
-        return (probs * bins).sum(dim=-1)
+        return F.relu(self.backbone_bn(out))
 
 
-class DualNetWrapper:
-    """Wraps separate PolicyNet + ValueNet with unified dual-head interface.
-
-    MCTS and InferenceServer see the same (pol_logits, val_logits) API.
-    Two forward passes through two independent backbones.
-    """
-
-    def __init__(self, policy_net, value_net):
-        self.policy_net = policy_net
-        self.value_net = value_net
-        self.num_value_bins = value_net.num_value_bins
-
-    def __call__(self, x):
-        pol_logits, _ = self.policy_net(x)
-        val_logits = self.value_net(x)
-        return pol_logits, val_logits
-
-    def predict_value(self, value_logits, min_val=0.0, max_val=30000.0):
-        return self.value_net.predict_value(value_logits, min_val, max_val)
-
-    def parameters(self):
-        """Yield all parameters from both models."""
-        yield from self.policy_net.parameters()
-        yield from self.value_net.parameters()
-
-    def train(self, mode=True):
-        self.policy_net.train(mode)
-        self.value_net.train(mode)
-        return self
+# Back-compat alias: old checkpoints reference AlphaTrainNet by name.
+# `load_model` filters value_* keys so old dual-head checkpoints load
+# into PolicyNet without erroring. Once V10+ pillar2x/2y/etc. are the
+# only checkpoints we read, this alias can be deleted.
+AlphaTrainNet = PolicyNet
 
 
 def count_parameters(model):
