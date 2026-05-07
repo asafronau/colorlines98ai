@@ -19,7 +19,7 @@ import random
 import numpy as np
 
 from alphatrain.scripts.mine_death_features import (
-    board_features, FEATURE_NAMES,
+    board_features_with_next, FEATURE_NAMES, NEXT_BALL_FEATURE_NAMES,
 )
 
 
@@ -47,10 +47,16 @@ def main():
     all_files = all_files[:args.max_games]
     print(f"Sampling from {len(all_files)} games", flush=True)
 
-    feature_names_full = list(FEATURE_NAMES) + ['ratio', 'frag_score']
+    feature_names_full = (list(FEATURE_NAMES) + list(NEXT_BALL_FEATURE_NAMES)
+                          + ['ratio', 'frag_score'])
+    assert len(feature_names_full) == 24
 
     X = []
     y = []
+
+    nb_r = np.zeros(3, dtype=np.int8)
+    nb_c = np.zeros(3, dtype=np.int8)
+    nb_col = np.zeros(3, dtype=np.int8)
 
     for gi, path in enumerate(all_files):
         with open(path) as f:
@@ -67,9 +73,17 @@ def main():
             min(args.positions_per_game, max_idx - 5))
 
         for idx in sample_idxs:
-            board = np.array(moves[idx]['board'], dtype=np.int8)
-            raw = board_features(board)
-            feat = list(raw)
+            mv = moves[idx]
+            board = np.array(mv['board'], dtype=np.int8)
+            # Extract next-ball arrays from the move JSON.
+            nbs = mv.get('next_balls') or []
+            n_next = min(len(nbs), 3)
+            for i in range(n_next):
+                nb_r[i] = nbs[i]['row']
+                nb_c[i] = nbs[i]['col']
+                nb_col[i] = nbs[i]['color']
+            raw = board_features_with_next(board, nb_r, nb_c, nb_col, n_next)
+            feat = list(raw)  # 22 features (16 board + 6 next-ball)
             empty_v = feat[FEATURE_NAMES.index('empty')]
             largest_v = feat[FEATURE_NAMES.index('largest')]
             n_comp_v = feat[FEATURE_NAMES.index('components')]
