@@ -27,7 +27,9 @@ import torch
 from numba import njit
 
 from alphatrain.observation import build_observation
-from alphatrain.scripts.mine_death_features import board_features
+from alphatrain.scripts.mine_death_features import (
+    board_features, board_features_with_next,
+)
 from game.board import _label_empty_components, _is_reachable
 
 BOARD_SIZE = 9
@@ -110,16 +112,23 @@ def _evaluate_board(board):
 
 
 @njit(cache=True)
-def _evaluate_features_linear(board, coefs, means, stds, bias):
-    """Linear value function over the 18 board features.
+def _evaluate_features_linear(board, next_r, next_c, next_col, n_next,
+                              coefs, means, stds, bias):
+    """Linear value function over 24 board+next-ball features.
 
-    Computes V(board) = bias + sum_i coefs[i] * (feat_i - means[i]) / stds[i].
-    Feature order matches alphatrain.scripts.mine_death_features.FEATURE_NAMES
-    plus derived [ratio, frag_score].
+    V(board, next) = bias + Σ_i coefs[i] · (feat_i − means[i]) / stds[i].
+    Feature order: 16 board features (FEATURE_NAMES) + 6 next-ball features
+    (NEXT_BALL_FEATURE_NAMES) + 2 derived [ratio, frag_score] = 24 total.
+
+    The next-ball features use the 3 known upcoming spawns to compute
+    deltas in board health (largest component, mobility, etc.) and
+    cheap "where do they land" stats (same-color adjacency, blocked
+    cells). Closes the input-information gap relative to the policy
+    network, which sees next-ball positions/colors via obs channels 8-11.
 
     Returns float scalar suitable for use as MCTS leaf value.
     """
-    feats = board_features(board)
+    feats = board_features_with_next(board, next_r, next_c, next_col, n_next)
     empty = feats[0]
     n_components = feats[1]
     largest = feats[2]
@@ -127,32 +136,34 @@ def _evaluate_features_linear(board, coefs, means, stds, bias):
     ratio = largest / denom_empty
     frag_score = (empty - largest) * n_components
 
-    f0 = feats[0]; f1 = feats[1]; f2 = feats[2]; f3 = feats[3]
-    f4 = feats[4]; f5 = feats[5]; f6 = feats[6]; f7 = feats[7]
-    f8 = feats[8]; f9 = feats[9]; f10 = feats[10]; f11 = feats[11]
-    f12 = feats[12]; f13 = feats[13]; f14 = feats[14]; f15 = feats[15]
-    f16 = ratio
-    f17 = frag_score
-
     v = bias
-    v += coefs[0] * (f0 - means[0]) / stds[0]
-    v += coefs[1] * (f1 - means[1]) / stds[1]
-    v += coefs[2] * (f2 - means[2]) / stds[2]
-    v += coefs[3] * (f3 - means[3]) / stds[3]
-    v += coefs[4] * (f4 - means[4]) / stds[4]
-    v += coefs[5] * (f5 - means[5]) / stds[5]
-    v += coefs[6] * (f6 - means[6]) / stds[6]
-    v += coefs[7] * (f7 - means[7]) / stds[7]
-    v += coefs[8] * (f8 - means[8]) / stds[8]
-    v += coefs[9] * (f9 - means[9]) / stds[9]
-    v += coefs[10] * (f10 - means[10]) / stds[10]
-    v += coefs[11] * (f11 - means[11]) / stds[11]
-    v += coefs[12] * (f12 - means[12]) / stds[12]
-    v += coefs[13] * (f13 - means[13]) / stds[13]
-    v += coefs[14] * (f14 - means[14]) / stds[14]
-    v += coefs[15] * (f15 - means[15]) / stds[15]
-    v += coefs[16] * (f16 - means[16]) / stds[16]
-    v += coefs[17] * (f17 - means[17]) / stds[17]
+    # 16 board features
+    v += coefs[0] * (feats[0] - means[0]) / stds[0]
+    v += coefs[1] * (feats[1] - means[1]) / stds[1]
+    v += coefs[2] * (feats[2] - means[2]) / stds[2]
+    v += coefs[3] * (feats[3] - means[3]) / stds[3]
+    v += coefs[4] * (feats[4] - means[4]) / stds[4]
+    v += coefs[5] * (feats[5] - means[5]) / stds[5]
+    v += coefs[6] * (feats[6] - means[6]) / stds[6]
+    v += coefs[7] * (feats[7] - means[7]) / stds[7]
+    v += coefs[8] * (feats[8] - means[8]) / stds[8]
+    v += coefs[9] * (feats[9] - means[9]) / stds[9]
+    v += coefs[10] * (feats[10] - means[10]) / stds[10]
+    v += coefs[11] * (feats[11] - means[11]) / stds[11]
+    v += coefs[12] * (feats[12] - means[12]) / stds[12]
+    v += coefs[13] * (feats[13] - means[13]) / stds[13]
+    v += coefs[14] * (feats[14] - means[14]) / stds[14]
+    v += coefs[15] * (feats[15] - means[15]) / stds[15]
+    # 6 next-ball features
+    v += coefs[16] * (feats[16] - means[16]) / stds[16]
+    v += coefs[17] * (feats[17] - means[17]) / stds[17]
+    v += coefs[18] * (feats[18] - means[18]) / stds[18]
+    v += coefs[19] * (feats[19] - means[19]) / stds[19]
+    v += coefs[20] * (feats[20] - means[20]) / stds[20]
+    v += coefs[21] * (feats[21] - means[21]) / stds[21]
+    # 2 derived
+    v += coefs[22] * (ratio - means[22]) / stds[22]
+    v += coefs[23] * (frag_score - means[23]) / stds[23]
     return v
 
 
@@ -450,6 +461,12 @@ class MCTS:
         self._fp16 = False
         self._sim_rng = None  # SimpleRng, set per search
 
+        # Pre-allocated next-ball buffers — used per leaf to feed the
+        # feature evaluator. Reused across calls to avoid allocation churn.
+        self._nb_r = np.zeros(3, dtype=np.int8)
+        self._nb_c = np.zeros(3, dtype=np.int8)
+        self._nb_col = np.zeros(3, dtype=np.int8)
+
         # Feature-based linear value evaluator (replaces NN value head when set)
         self.feature_coefs = None
         self.feature_means = None
@@ -461,8 +478,11 @@ class MCTS:
             self.feature_means = data['means'].astype(np.float32)
             self.feature_stds = data['stds'].astype(np.float32)
             self.feature_bias = float(data['bias'])
-            assert self.feature_coefs.shape[0] == 18, \
-                f"Expected 18 feature coefs, got {self.feature_coefs.shape[0]}"
+            assert self.feature_coefs.shape[0] == 24, (
+                f"Expected 24 feature coefs (16 board + 6 next-ball + 2 "
+                f"derived), got {self.feature_coefs.shape[0]}. The feature "
+                f"format changed when next-ball features were added — refit "
+                f"weights with the current fit_feature_value.py.")
         # Pre-allocate obs buffer for server mode (reused across searches)
         if inference_client is not None:
             self._obs_np_buf = np.empty(
@@ -477,6 +497,23 @@ class MCTS:
             dtype = torch.float16 if self._fp16 else torch.float32
             self._obs_buf = torch.empty(batch_size, 18, 9, 9,
                                         device=device, dtype=dtype)
+
+    def _fill_next_ball_buffers(self, game):
+        """Fill self._nb_r/_nb_c/_nb_col from game.next_balls (up to 3).
+
+        Returns the count of valid next balls (0-3). Used as input to the
+        feature evaluator's next-ball-aware feature extraction.
+        """
+        nb = game.next_balls
+        n = len(nb)
+        if n > 3:
+            n = 3
+        for i in range(n):
+            pos, col = nb[i]
+            self._nb_r[i] = pos[0]
+            self._nb_c[i] = pos[1]
+            self._nb_col[i] = col
+        return n
 
     def _nn_evaluate_single(self, game):
         """Single NN forward pass -> (priors dict, value scalar).
@@ -592,8 +629,10 @@ class MCTS:
         # Override NN root_value with feature evaluator if enabled, so
         # min_q/max_q anchor matches subsequent leaf values
         if self.feature_coefs is not None:
+            n_next = self._fill_next_ball_buffers(game)
             root_value = float(_evaluate_features_linear(
-                game.board, self.feature_coefs, self.feature_means,
+                game.board, self._nb_r, self._nb_c, self._nb_col, n_next,
+                self.feature_coefs, self.feature_means,
                 self.feature_stds, self.feature_bias))
         for action, prior in priors.items():
             root.children[action] = Node(prior=prior)
@@ -802,8 +841,10 @@ class MCTS:
                     if self.terminal_value is not None:
                         value = self.terminal_value
                     elif self.feature_coefs is not None:
+                        n_next = self._fill_next_ball_buffers(batch_games[b])
                         value = float(_evaluate_features_linear(
                             batch_games[b].board,
+                            self._nb_r, self._nb_c, self._nb_col, n_next,
                             self.feature_coefs, self.feature_means,
                             self.feature_stds, self.feature_bias))
                     elif self.value_net is not None:
@@ -824,8 +865,10 @@ class MCTS:
                             ch[action_key] = Node(prior=float(pri[i]))
                     # Value source priority: features > vnet > NN val head
                     if self.feature_coefs is not None:
+                        n_next = self._fill_next_ball_buffers(batch_games[b])
                         value = float(_evaluate_features_linear(
                             batch_games[b].board,
+                            self._nb_r, self._nb_c, self._nb_col, n_next,
                             self.feature_coefs, self.feature_means,
                             self.feature_stds, self.feature_bias))
                     elif vnet_values is not None:

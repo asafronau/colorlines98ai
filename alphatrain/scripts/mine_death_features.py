@@ -187,8 +187,82 @@ FEATURE_NAMES = [
     'center_balls', 'center_colors',
 ]
 
+# Next-ball-aware features (computed by board_features_with_next using the
+# 3 known upcoming spawns from `game.next_balls`). The policy network sees
+# next-ball info via channels 8-11 of the observation; these features close
+# the information gap for the leaf-value evaluator.
+NEXT_BALL_FEATURE_NAMES = [
+    'delta_largest',     # largest empty component, after spawn − before
+    'delta_components',  # n_components, after − before
+    'delta_low_mob',     # low_mob_balls, after − before
+    'delta_avg_reach',   # avg_reach, after − before
+    'n_next_same_color_adj',  # # of next-ball cells with ≥1 same-color neighbor on current board (line-clear potential)
+    'n_next_blocked',    # # of next balls landing on currently-occupied cells (wasted spawn)
+]
+
 # Derived features added in Python
 DERIVED_NAMES = ['ratio', 'frag_score']
+
+ALL_FEATURE_NAMES = FEATURE_NAMES + NEXT_BALL_FEATURE_NAMES + DERIVED_NAMES
+assert len(ALL_FEATURE_NAMES) == 24
+
+
+@njit(cache=True)
+def board_features_with_next(board, next_r, next_c, next_col, n_next):
+    """Board features + 6 next-ball-aware features.
+
+    Args:
+        board: (9, 9) int8
+        next_r, next_c: int arrays of length ≥ n_next — spawn rows/cols
+        next_col: int array of length ≥ n_next — spawn colors
+        n_next: number of valid next balls (0-3)
+
+    Returns a 22-tuple: 16 board features (matches `board_features`) followed
+    by 6 next-ball features:
+        delta_largest, delta_components, delta_low_mob, delta_avg_reach,
+        n_next_same_color_adj, n_next_blocked.
+    """
+    feats_before = board_features(board)
+
+    # Apply spawns to a copy. Track blocked / same-color hits per ball.
+    board_after = board.copy()
+    n_blocked = 0
+    n_same_color_adj = 0
+    for i in range(n_next):
+        r = int(next_r[i])
+        c = int(next_c[i])
+        col = int(next_col[i])
+        if board[r, c] != 0:
+            n_blocked += 1
+            continue
+        # Count same-color neighbors on the *current* board (before spawn).
+        # Each ball contributes at most 1 to n_same_color_adj.
+        has_same = False
+        if r > 0 and board[r - 1, c] == col:
+            has_same = True
+        elif r < BOARD_SIZE - 1 and board[r + 1, c] == col:
+            has_same = True
+        elif c > 0 and board[r, c - 1] == col:
+            has_same = True
+        elif c < BOARD_SIZE - 1 and board[r, c + 1] == col:
+            has_same = True
+        if has_same:
+            n_same_color_adj += 1
+        board_after[r, c] = col
+
+    feats_after = board_features(board_after)
+
+    delta_largest = feats_after[2] - feats_before[2]
+    delta_components = feats_after[1] - feats_before[1]
+    delta_low_mob = feats_after[7] - feats_before[7]
+    delta_avg_reach = feats_after[5] - feats_before[5]
+
+    return (feats_before[0], feats_before[1], feats_before[2], feats_before[3],
+            feats_before[4], feats_before[5], feats_before[6], feats_before[7],
+            feats_before[8], feats_before[9], feats_before[10], feats_before[11],
+            feats_before[12], feats_before[13], feats_before[14], feats_before[15],
+            delta_largest, delta_components, delta_low_mob, delta_avg_reach,
+            n_same_color_adj, n_blocked)
 
 
 def main():

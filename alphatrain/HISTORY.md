@@ -2084,3 +2084,68 @@ Wall comparison is subtler than raw per-game time suggests:
      cap rate all improved. With 50-seed samples, single-percentile
      swings are noisy; weight them less than the full-distribution
      trend.
+
+### Phase 22 — q_weight calibration unlocks 2Y2 MCTS (May 2026)
+
+After pillar2y2 (V11, 40 epochs) showed standalone strength (5,586 mean)
+without matching MCTS gain — actually a regression vs 2X2 at 400 sims —
+ChatGPT review flagged the diagnosis: PUCT's `q_norm + U` formula
+overweights the noisy feature evaluator (Pearson r ≈ 0.5 with truth) on
+distilled-policy generations. q_norm rescales any signal to [0,1],
+giving a noisy r=0.5 estimator the same dynamic range as a perfect Q.
+
+Added `q_weight` parameter to PUCT: `score = q_weight * q_norm + U`.
+
+Sweep on 2Y2 + `_2y.npz` @ 400 sims, 50 seeds:
+| q_weight | Mean | Median | P10 | %≥10K |
+|---:|---:|---:|---:|---:|
+| 0.00 | 6,104 | 6,860 | 924 | 24% |
+| 0.25 | 6,755 | 7,387 | 1,475 | 44% |
+| **0.50** | **7,517** | **9,248** | **1,821** | **42%** |
+| 0.75 | 5,434 | 5,016 | 954 | 24% |
+| 1.00 | 6,263 | 6,014 | 958 | 34% |
+
+127. **q_weight calibration matters as policies get sharper.** A
+     distilled student inherits the teacher's search through its
+     policy, producing peaked priors. With q_weight=1.0, q_norm gives
+     full PUCT swing to a low-r leaf evaluator; the noise pulls visits
+     away from the policy's good moves more than truth-correlated
+     signal pulls them toward better ones. Halving q_weight (0.5)
+     proportions Q to its actual confidence and recovers +20% mean /
+     +54% median on 2Y2 vs the q=1.0 baseline. q_weight is now a
+     first-class hyperparameter — track it per generation.
+
+128. **q=0 is also bad. The evaluator IS doing real work — at the right
+     weight.** Pure-prior search (q=0) underperformed q=0.5 by 23%
+     mean, 35% median. Bottom-line: don't drop the leaf evaluator,
+     just don't overweight it.
+
+### Phase 22 addendum — next-ball features didn't move the needle
+
+Per-iteration ChatGPT review suggested adding next-ball-aware features
+to the feature evaluator (delta_largest, delta_components, etc.) since
+the policy network sees next_balls via observation channels 8-11 but
+the 18-feature evaluator was board-only.
+
+Implementation: extended `board_features` to `board_features_with_next`
+emitting 6 new features (4 deltas after applying the 3 known spawns,
+plus n_next_same_color_adj and n_next_blocked). Total feature count
+went 18 → 24. Refit on V11 corpus (10K games × 10 positions = 80K
+samples).
+
+Result: **Val R² = 0.3427 vs the old 0.3424** — essentially zero gain.
+All 6 new features got near-zero coefficients (max abs 0.031,
+min 0.000).
+
+129. **Linear scalar features can't represent next-ball interactions.**
+     The deltas are mechanically small (3 balls perturb a 36-empty
+     board's `largest` by 0-3), and that perturbation is largely
+     redundant with the existing board features. Where next-ball signal
+     would matter — chokepoint landings, chain reactions, specific
+     tactical clears — those are non-linear in any reasonable scalar
+     feature space. The next bottleneck for Q quality is *non-linearity*,
+     not *missing inputs*. The infra is committed for future feature
+     experiments, but the path forward for stronger Q is either: (a) NN
+     value head distilled from the policy backbone, (b) survival-horizon
+     classification that handles cap censoring properly, or (c) accept
+     the linear ceiling and lean on stronger teacher search instead.
