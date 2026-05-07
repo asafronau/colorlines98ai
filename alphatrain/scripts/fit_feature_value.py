@@ -49,7 +49,7 @@ def main():
 
     feature_names_full = (list(FEATURE_NAMES) + list(NEXT_BALL_FEATURE_NAMES)
                           + ['ratio', 'frag_score'])
-    assert len(feature_names_full) == 24
+    assert len(feature_names_full) == 25
 
     X = []
     y = []
