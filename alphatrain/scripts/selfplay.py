@@ -48,10 +48,8 @@ def save_game_json(result, save_dir):
         'seed': seed,
         'score': score,
         'moves': result['moves'],
+        'capped': bool(result.get('capped', False)),
     }
-    if result.get('capped', False):
-        data['capped'] = True
-        data['bootstrap_value'] = result['bootstrap_value']
     with open(path, 'w') as f:
         json.dump(data, f)
     return path
@@ -59,24 +57,14 @@ def save_game_json(result, save_dir):
 
 def play_selfplay_game(mcts, seed, temperature_moves=15,
                        dirichlet_alpha=0.3, dirichlet_weight=0.25,
-                       top_k_save=5, max_turns=0, static_turns=0):
+                       top_k_save=5, max_turns=0):
     """Play one self-play game, recording raw board data for JSON output.
 
     Saves in the same format as Rust expert games so build_expert_v2_tensor.py
     can process self-play and expert data identically.
 
-    Args:
-        mcts: MCTS instance
-        seed: game seed
-        temperature_moves: use temperature=1 for first N moves
-        dirichlet_alpha: Dirichlet noise parameter
-        dirichlet_weight: weight for noise at root
-        top_k_save: number of top moves to save from visit counts
-        max_turns: cap game at this many turns (0=no cap).
-            Capped games get bootstrap_value instead of death.
-
     Returns:
-        dict with 'seed', 'score', 'moves', 'capped', 'bootstrap_value'
+        dict with 'seed', 'score', 'turns', 'moves', 'capped', 'time'.
     """
     game = ColorLinesGame(seed=seed)
     game.reset()
@@ -85,13 +73,6 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
     t0 = time.time()
     turn = 0
     capped = False
-
-    # Dynamic sims tracking
-    ds_high = 0   # P_max > 0.9
-    ds_mid = 0    # 0.7 < P_max <= 0.9
-    ds_low = 0    # P_max <= 0.7
-    ds_total_sims = 0
-    ds_last_report = 0  # turn at last report
 
     while not game.game_over:
         if max_turns > 0 and turn >= max_turns:
@@ -102,13 +83,10 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         # Record board state BEFORE move
         board_snapshot = game.board.copy().tolist()
         nb = game.next_balls
-        next_balls = []
-        for pos_col in nb:
-            next_balls.append({
-                'row': int(pos_col[0][0]),
-                'col': int(pos_col[0][1]),
-                'color': int(pos_col[1]),
-            })
+        next_balls = [
+            {'row': int(pc[0][0]), 'col': int(pc[0][1]), 'color': int(pc[1])}
+            for pc in nb
+        ]
 
         # MCTS search — get action + full visit count distribution
         result = mcts.search(
@@ -116,60 +94,40 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
             temperature=temp,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_weight=dirichlet_weight,
-            return_policy=True,
-            force_full_search=(static_turns > 0 and turn < static_turns))
+            return_policy=True)
 
         if result[0] is None:
             break
-
         action, policy_target = result
 
-        # Track dynamic sims stats
-        if hasattr(mcts, '_last_max_prior'):
-            mp = mcts._last_max_prior
-            if mp > 0.5:
-                ds_high += 1
-            elif mp > 0.3:
-                ds_mid += 1
-            else:
-                ds_low += 1
-            ds_total_sims += mcts._last_effective_sims
-
-        # Extract top-K moves from visit count distribution
+        # Top-K moves from visit count distribution
         top_indices = np.argsort(policy_target)[::-1][:top_k_save]
-        top_moves = []
-        top_scores = []
+        top_moves, top_scores = [], []
         for idx in top_indices:
             if policy_target[idx] <= 0:
                 break
             flat = int(idx)
-            src_flat = flat // 81
-            tgt_flat = flat % 81
+            sf = flat // 81
+            tf = flat % 81
             top_moves.append({
-                'sr': int(src_flat // 9), 'sc': int(src_flat % 9),
-                'tr': int(tgt_flat // 9), 'tc': int(tgt_flat % 9),
+                'sr': int(sf // 9), 'sc': int(sf % 9),
+                'tr': int(tf // 9), 'tc': int(tf % 9),
             })
-            # Use log(visit_fraction + eps) as score — softmax in build script
-            # recovers the original distribution
             top_scores.append(float(np.log(policy_target[idx] + 1e-8)))
 
-        # The chosen move
         chosen_src, chosen_tgt = action
-        chosen_move = {
-            'sr': int(chosen_src[0]), 'sc': int(chosen_src[1]),
-            'tr': int(chosen_tgt[0]), 'tc': int(chosen_tgt[1]),
-        }
-
         moves_data.append({
             'board': board_snapshot,
             'next_balls': next_balls,
             'num_next': len(nb),
-            'chosen_move': chosen_move,
+            'chosen_move': {
+                'sr': int(chosen_src[0]), 'sc': int(chosen_src[1]),
+                'tr': int(chosen_tgt[0]), 'tc': int(chosen_tgt[1]),
+            },
             'top_moves': top_moves,
             'top_scores': top_scores,
         })
 
-        # Execute move
         move_result = game.move(action[0], action[1])
         if not move_result['valid']:
             break
@@ -177,43 +135,8 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         turn += 1
         if turn % 500 == 0:
             elapsed = time.time() - t0
-            ds_total = ds_high + ds_mid + ds_low
-            if ds_total > 0:
-                avg_sims = ds_total_sims / ds_total
-                # Stats since last report
-                ds_since = ds_total - ds_last_report
-                print(f"    seed={seed} turn={turn} score={game.score} "
-                      f"{elapsed:.0f}s | "
-                      f"P>.5:{100*ds_high/ds_total:.0f}% "
-                      f".3-.5:{100*ds_mid/ds_total:.0f}% "
-                      f"<.3:{100*ds_low/ds_total:.0f}% "
-                      f"avg_sims={avg_sims:.0f}", flush=True)
-                ds_last_report = ds_total
-            else:
-                print(f"    seed={seed} turn={turn} score={game.score} "
-                      f"{elapsed:.0f}s", flush=True)
-
-    elapsed = time.time() - t0
-
-    # Bootstrap value for capped games: write 0.0.
-    # The previous NN-based bootstrap was on the value-head scale (~99 for
-    # pillar2w2 with max_score=200) and the feature-based bootstrap is on a
-    # log(1+remaining_turns) scale (~4-5) — neither matches the per-turn
-    # reward scale that build_expert_v2_tensor.py uses for TD returns.
-    # V10 is policy-distillation (val_weight=0) so bootstrap_value is
-    # unused; explicitly zero avoids accidental misuse downstream.
-    bootstrap_value = 0.0
-
-    # Dynamic sims summary
-    ds_total = ds_high + ds_mid + ds_low
-    ds_stats = None
-    if ds_total > 0:
-        ds_stats = {
-            'high_pct': 100 * ds_high / ds_total,
-            'mid_pct': 100 * ds_mid / ds_total,
-            'low_pct': 100 * ds_low / ds_total,
-            'avg_sims': ds_total_sims / ds_total,
-        }
+            print(f"    seed={seed} turn={turn} score={game.score} "
+                  f"{elapsed:.0f}s", flush=True)
 
     return {
         'seed': seed,
@@ -221,9 +144,7 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
         'turns': turn,
         'moves': moves_data,
         'capped': capped,
-        'bootstrap_value': bootstrap_value,
-        'time': elapsed,
-        'dynamic_sims_stats': ds_stats,
+        'time': time.time() - t0,
     }
 
 
@@ -238,8 +159,7 @@ def _server_worker(slot_id, seed_queue, result_queue,
                    request_queue, response_queue,
                    num_sims, batch_size, max_score,
                    temperature_moves, dirichlet_alpha, dirichlet_weight,
-                   max_turns, dynamic_sims=False, static_turns=0,
-                   feature_weights_path=None):
+                   max_turns, feature_weights_path):
     """Persistent worker for GPU server mode self-play."""
     torch.set_num_threads(1)
 
@@ -259,7 +179,7 @@ def _server_worker(slot_id, seed_queue, result_queue,
                              request_queue, response_queue)
     mcts = MCTS(inference_client=client, max_score=max_score,
                 num_simulations=num_sims, batch_size=batch_size,
-                top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims,
+                top_k=30, c_puct=2.5,
                 feature_weights_path=feature_weights_path)
 
     while True:
@@ -272,16 +192,11 @@ def _server_worker(slot_id, seed_queue, result_queue,
             temperature_moves=temperature_moves,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_weight=dirichlet_weight,
-            max_turns=max_turns,
-            static_turns=static_turns)
+            max_turns=max_turns)
 
         cap_str = " [CAPPED]" if result.get('capped') else ""
-        ds = result.get('dynamic_sims_stats')
-        ds_str = (f" | P>.9:{ds['high_pct']:.0f}% .7-.9:{ds['mid_pct']:.0f}% "
-                  f"<.7:{ds['low_pct']:.0f}% avg={ds['avg_sims']:.0f}sims"
-                  if ds else "")
         print(f"  [w{slot_id}] seed={seed}: score={result['score']}, "
-              f"turns={result['turns']}{cap_str}, {result['time']:.0f}s{ds_str}",
+              f"turns={result['turns']}{cap_str}, {result['time']:.0f}s",
               flush=True)
 
         result_queue.put(result)
@@ -289,41 +204,6 @@ def _server_worker(slot_id, seed_queue, result_queue,
     obs_shm.close()
     pol_shm.close()
     val_shm.close()
-
-
-def _worker_play(args):
-    """Worker function for CPU multiprocessing."""
-    seed, model_path, device_str, num_sims, batch_size, \
-        temperature_moves, dirichlet_alpha, dirichlet_weight, max_turns, \
-        dynamic_sims, static_turns, feature_weights_path = args
-
-    _limit_threads()
-    device = torch.device(device_str)
-
-    net, max_score = load_model(model_path, device,
-                                fp16=(device_str != 'cpu'),
-                                jit_trace=True)
-
-    mcts = MCTS(net, device, max_score=max_score,
-                num_simulations=num_sims, batch_size=batch_size,
-                top_k=30, c_puct=2.5, dynamic_sims=dynamic_sims,
-                feature_weights_path=feature_weights_path)
-
-    result = play_selfplay_game(
-        mcts, seed,
-        temperature_moves=temperature_moves,
-        dirichlet_alpha=dirichlet_alpha,
-        dirichlet_weight=dirichlet_weight,
-        max_turns=max_turns,
-        static_turns=static_turns)
-
-    ds = result.get('dynamic_sims_stats')
-    ds_str = (f" | P>.5:{ds['high_pct']:.0f}% .3-.5:{ds['mid_pct']:.0f}% "
-              f"<.3:{ds['low_pct']:.0f}% avg={ds['avg_sims']:.0f}sims"
-              if ds else "")
-    print(f"  seed={seed}: score={result['score']}, "
-          f"turns={result['turns']}, {result['time']:.0f}s{ds_str}", flush=True)
-    return result
 
 
 def main():
@@ -337,27 +217,17 @@ def main():
                    help='Force device (mps/cuda/cpu). Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
                    help='Parallel workers (1=local MPS, >1=CPU multiprocessing)')
-    p.add_argument('--value-model', default=None,
-                   help='Separate ValueNet checkpoint (if None, use value head from --model)')
-    p.add_argument('--deterministic', action='store_true',
-                   help='Per-request GPU processing (exact scores, slower)')
     p.add_argument('--save-dir', default='data/selfplay')
     p.add_argument('--temperature-moves', type=int, default=15)
     p.add_argument('--dirichlet-alpha', type=float, default=0.3)
     p.add_argument('--dirichlet-weight', type=float, default=0.25)
     p.add_argument('--max-turns', type=int, default=0,
                    help='Cap games at this many turns (0=no cap). '
-                        'Capped games use bootstrap value instead of death.')
-    p.add_argument('--dynamic-sims', action='store_true',
-                   help='Reduce sims for confident moves (P_max>0.5: sims/10, '
-                        'P_max>0.3: sims/4). Saves ~2-3x compute.')
-    p.add_argument('--static-turns', type=int, default=0,
-                   help='Force full sims for first N turns (overrides dynamic). '
-                        'Ensures maximum search quality in the critical opening.')
-    p.add_argument('--feature-value-weights', default=None,
-                   help='Path to feature_value_weights.npz. When set, MCTS '
-                        'replaces the NN value head with the linear feature '
-                        'evaluator. Required for value-quality self-play.')
+                        'Capped games are saved with capped=True.')
+    p.add_argument('--feature-value-weights', required=True,
+                   help='Path to feature_value_weights.npz. Required — '
+                        'PolicyNet has no NN value head; MCTS leaf values '
+                        'come from the linear feature evaluator.')
     p.add_argument('--compile', action='store_true',
                    help='Use torch.compile(mode=reduce-overhead) instead of '
                         'torch.jit.trace in the inference server. CUDA only; '
@@ -395,19 +265,6 @@ def main():
         print("All games already completed!", flush=True)
         return
 
-    # Fail-fast: policy_only models have no NN value head. MCTS needs SOME
-    # value source — feature_value_weights or external value net. Without
-    # one, search runs blind on zeros from the server's val_buf.
-    ckpt_meta = torch.load(args.model, map_location='cpu', weights_only=False)
-    is_policy_only = ckpt_meta.get('policy_only',
-                                    'value_fc2.weight' not in ckpt_meta['model'])
-    del ckpt_meta
-    if is_policy_only and not args.feature_value_weights and not args.value_model:
-        raise SystemExit(
-            f"Model '{args.model}' is policy_only but no value source is "
-            f"configured. Pass --feature-value-weights or --value-model. "
-            f"Otherwise MCTS will search with all-zero leaf values.")
-
     print(f"Self-play: {n_games} games (seeds {args.seed_start}-{args.seed_end-1})",
           flush=True)
     print(f"Model: {args.model}", flush=True)
@@ -426,18 +283,12 @@ def main():
         # Local mode: single process
         if device_str == 'cpu':
             _limit_threads()
-        if args.value_model:
-            from alphatrain.evaluate import load_dual_model
-            net, max_score = load_dual_model(
-                args.model, args.value_model, torch.device(device_str),
-                fp16=(device_str != 'cpu'), jit_trace=True)
-        else:
-            net, max_score = load_model(args.model, torch.device(device_str),
-                                        fp16=(device_str != 'cpu'),
-                                        jit_trace=True)
+        net, max_score = load_model(args.model, torch.device(device_str),
+                                    fp16=(device_str != 'cpu'),
+                                    jit_trace=True)
         mcts = MCTS(net, torch.device(device_str), max_score=max_score,
                      num_simulations=args.sims, batch_size=args.batch_size,
-                     top_k=30, c_puct=2.5, dynamic_sims=args.dynamic_sims,
+                     top_k=30, c_puct=2.5,
                      feature_weights_path=args.feature_value_weights)
 
         for i, seed in enumerate(seeds):
@@ -446,8 +297,7 @@ def main():
                 temperature_moves=args.temperature_moves,
                 dirichlet_alpha=args.dirichlet_alpha,
                 dirichlet_weight=args.dirichlet_weight,
-                max_turns=args.max_turns,
-                static_turns=args.static_turns)
+                max_turns=args.max_turns)
 
             save_game_json(result, args.save_dir)
 
@@ -455,39 +305,9 @@ def main():
             total_score += result['score']
             elapsed = time.time() - t0
             eta = elapsed / (i + 1) * (n_games - i - 1)
-
-            ds = result.get('dynamic_sims_stats')
-            ds_str = (f" | P>.9:{ds['high_pct']:.0f}% .7-.9:{ds['mid_pct']:.0f}% "
-                      f"<.7:{ds['low_pct']:.0f}% avg={ds['avg_sims']:.0f}sims"
-                      if ds else "")
             print(f"  [{i+1}/{n_games}] seed={seed}: score={result['score']}, "
                   f"turns={result['turns']}, {result['time']:.0f}s "
-                  f"(ETA {eta/60:.0f}m){ds_str}", flush=True)
-    elif device_str == 'cpu':
-        # CPU multiprocessing — env vars already set at module top
-        _limit_threads()
-        from multiprocessing import Pool
-        worker_args = [
-            (seed, args.model, 'cpu', args.sims, args.batch_size,
-             args.temperature_moves, args.dirichlet_alpha,
-             args.dirichlet_weight, args.max_turns, args.dynamic_sims,
-             args.static_turns, args.feature_value_weights)
-            for seed in seeds
-        ]
-
-        with Pool(args.workers) as pool:
-            for i, result in enumerate(pool.imap_unordered(
-                    _worker_play, worker_args)):
-                save_game_json(result, args.save_dir)
-
-                total_states += result['turns']
-                total_score += result['score']
-                elapsed = time.time() - t0
-                eta = elapsed / (i + 1) * (n_games - i - 1)
-
-                print(f"  [{i+1}/{n_games}] seed={result['seed']}: "
-                      f"score={result['score']} (ETA {eta/60:.0f}m)", flush=True)
-
+                  f"(ETA {eta/60:.0f}m)", flush=True)
     else:
         # GPU server mode: workers>1 + MPS/CUDA
         # N CPU workers share one GPU via InferenceServer.
@@ -505,8 +325,6 @@ def main():
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
                                  max_batch_per_worker=args.batch_size,
-                                 value_model_path=args.value_model,
-                                 deterministic=args.deterministic,
                                  use_compile=args.compile)
         server.start()
 
@@ -530,7 +348,6 @@ def main():
                       args.sims, args.batch_size, max_score,
                       args.temperature_moves, args.dirichlet_alpha,
                       args.dirichlet_weight, args.max_turns,
-                      args.dynamic_sims, args.static_turns,
                       args.feature_value_weights))
             p.start()
             workers.append(p)
