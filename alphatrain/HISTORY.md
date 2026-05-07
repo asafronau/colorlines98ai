@@ -2149,3 +2149,72 @@ min 0.000).
      value head distilled from the policy backbone, (b) survival-horizon
      classification that handles cap censoring properly, or (c) accept
      the linear ceiling and lean on stronger teacher search instead.
+
+### Phase 22 addendum 2 — threshold-encoded line completion (still negative)
+
+After the continuous `max_next_line` came back at +0.020 (noise floor),
+we added two binary indicators alongside it: `next_makes_4plus` and
+`next_makes_5plus`. The idea was the linear model can't represent a
+step function with a single continuous coefficient, but binary
+thresholds bypass that limitation.
+
+Refit on V11 corpus (16K games × 10 positions = 128,290 samples):
+
+```
+max_next_line       +0.0184  (continuous)
+next_makes_4plus    +0.0096  (>=4 threshold)
+next_makes_5plus    -0.0085  (>=5 threshold, NEGATIVE)
+```
+
+R² unchanged at 0.343.
+
+130. **Confounding sinks the threshold features.** `next_makes_5plus=1`
+     should *causally* help survival (the spawn completes a clearable
+     line, gain points, free space). But the regression assigns it a
+     *negative* coefficient. Reason: the event is rare (~2-3% of
+     positions) and correlated with crisis-phase positions where
+     same-color clusters are dense from accumulated damage. The
+     regression learns the correlation ("these are dying positions")
+     instead of the local tactic ("this clear buys time"). With
+     confounded features and no causal adjustment, linear regression
+     locks onto the confound rather than the tactic. To capture
+     "spawn enables clear → +survival" causally, you need either an
+     interventional setup (compare to counterfactual spawn) or a
+     model rich enough to factor the confound out (NN learns
+     "high-cluster-density board, plus this spawn-clear" as a 2D
+     interaction; linear regression cannot).
+
+### Phase 22 addendum 3 — 800-sim Colab eval validates search headroom
+
+After q_weight=0.5 calibration unlocked 2Y2 MCTS at 400 sims (mean
+7,517 / median 9,248 on M5 seeds 0-49), ran an 800-sim Colab L4 eval
+on a different 50-seed sample to test scaling.
+
+| Sims | Mean | Median | P10 | %≥10K | Δ vs Pol |
+|---:|---:|---:|---:|---:|---:|
+| 400 | 6,323 | 7,188 | 1,373 | 36% | +21% |
+| 800 | 7,530 | 9,966 | 1,660 | 50% | +45% |
+
+Doubling sims: mean +19%, median +39%, %≥10K +14pp. The recalibrated
+PUCT scales cleanly with search depth.
+
+131. **The distillation ceiling tightened by miscalibrated PUCT, not
+     by capacity exhaustion.** Earlier diagnosis ("2Y2 standalone
+     improved but MCTS plateau'd → student saturated the teacher")
+     was incomplete. With q_weight=1.0 the search was overweighting
+     a noisy Q and *more sims compounded the miscalibration* — that's
+     why MCTS looked plateaued. With q_weight=0.5, doubling sims
+     400→800 lifts median by +39%. The student has NOT fully embodied
+     the teacher's search; deeper search at inference still extracts
+     real signal. Matters for V12 self-play strategy: more sims is
+     still a productive lever before the NN-value-head escape.
+
+132. **2Y2 needs ~2× the sims to match 2X2's old MCTS result.** 2X2
+     + V10 weights @ q=1.0 @ 400 sims: 7,825 mean (HISTORY lesson 124).
+     2Y2 + V11 weights @ q=0.5 @ 800 sims: 7,530 mean (different
+     seed set; Pol baselines differ so direct comparison is noisy).
+     Sim-count parity is roughly 2:1 — 2Y2's stronger policy means
+     each sim adds less marginal information. This is the
+     distillation-ceiling-as-search-cost: NOT "MCTS plateaus at this
+     model" but "MCTS at this model needs more sims to break out
+     past the previous-iteration's MCTS."
