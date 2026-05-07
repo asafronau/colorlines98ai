@@ -440,7 +440,7 @@ class MCTS:
                  heuristic_value=False, value_net=None,
                  terminal_value=None, override_threshold=0.0,
                  feature_weights_path=None, early_stop=False,
-                 q_weight=1.0):
+                 q_weight=1.0, value_head_path=None):
         self.net = net
         self.device = device
         self.max_score = max_score
@@ -486,6 +486,32 @@ class MCTS:
                 f"derived), got {self.feature_coefs.shape[0]}. The feature "
                 f"format changed when next-ball features were added — refit "
                 f"weights with the current fit_feature_value.py.")
+
+        # NN value head (multi-horizon survival classifier). Mutually
+        # exclusive with feature_weights_path — one Q source at a time.
+        # Server mode (inference_client) NOT yet supported with value
+        # head; the server can't run the head over the backbone features.
+        # Local mode only for the probe phase.
+        self.value_head = None
+        if value_head_path is not None:
+            if feature_weights_path is not None:
+                raise ValueError(
+                    "value_head_path and feature_weights_path are "
+                    "mutually exclusive. Pick one.")
+            if inference_client is not None:
+                raise NotImplementedError(
+                    "value head + inference server not yet wired. "
+                    "Run with inference_client=None (single-process MCTS).")
+            if net is None:
+                raise ValueError(
+                    "value_head_path requires net to be set "
+                    "(value head reuses the policy backbone features).")
+            from alphatrain.value_head import (
+                load as _load_vh, DEFAULT_HORIZON_WEIGHTS as _DEFAULT_W)
+            self.value_head, _ = _load_vh(value_head_path, device=device)
+            self._horizon_weights = torch.tensor(
+                _DEFAULT_W, dtype=torch.float32, device=device)
+
         # Pre-allocate obs buffer for server mode (reused across searches)
         if inference_client is not None:
             self._obs_np_buf = np.empty(
@@ -500,6 +526,24 @@ class MCTS:
             dtype = torch.float16 if self._fp16 else torch.float32
             self._obs_buf = torch.empty(batch_size, 18, 9, 9,
                                         device=device, dtype=dtype)
+
+    def _value_head_eval_single(self, game):
+        """Run the NN value head on a single game state.
+
+        Used for the root and for terminal boards (which aren't part of
+        the batched leaf forward). Cheap (one forward) and rare per
+        search.
+        """
+        obs_np = _build_obs_for_game(game)
+        net_dtype = torch.float16 if self._fp16 else torch.float32
+        obs = torch.from_numpy(obs_np).unsqueeze(0).to(
+            device=self.device, dtype=net_dtype)
+        with torch.inference_mode():
+            feats = self.net.backbone_features(obs)
+            vh_logits = self.value_head(feats.float())
+            probs = torch.sigmoid(vh_logits)
+            scalar = (probs * self._horizon_weights).sum(dim=-1)
+        return float(scalar.item())
 
     def _fill_next_ball_buffers(self, game):
         """Fill self._nb_r/_nb_c/_nb_col from game.next_balls (up to 3).
@@ -560,13 +604,17 @@ class MCTS:
                 # Caller will override this with feature value at root;
                 # placeholder is fine.
                 value = 0.0
+            elif self.value_head is not None:
+                # Same — caller overrides with NN value head at root.
+                value = 0.0
             elif val_logits is not None:
                 value = self.net.predict_value(
                     val_logits, max_val=self.max_score).item()
             else:
                 raise RuntimeError(
                     "policy_only model has no NN value head; provide "
-                    "feature_weights_path or value_net for MCTS leaf eval.")
+                    "feature_weights_path, value_head_path, or value_net "
+                    "for MCTS leaf eval.")
         pol_np = pol_logits[0].float().cpu().numpy()
         priors = _get_legal_priors_flat(game.board, pol_np, self.top_k)
         return priors, value
@@ -637,6 +685,8 @@ class MCTS:
                 game.board, self._nb_r, self._nb_c, self._nb_col, n_next,
                 self.feature_coefs, self.feature_means,
                 self.feature_stds, self.feature_bias))
+        elif self.value_head is not None:
+            root_value = self._value_head_eval_single(game)
         for action, prior in priors.items():
             root.children[action] = Node(prior=prior)
         root.visit_count = 1
@@ -794,8 +844,10 @@ class MCTS:
             # === BATCH EVALUATE ===
             # In feature-value mode the value head is unused; skip the value
             # transfer (~half of total .cpu() cost) and predict_value compute.
-            skip_nn_value = self.feature_coefs is not None
+            skip_nn_value = self.feature_coefs is not None or \
+                            self.value_head is not None
             val_np = None
+            vh_np = None  # value head scalar V per leaf, when value_head set
             if obs_count > 0:
                 if use_server:
                     pol_np, val_np = self.inference_client.evaluate_batch(
@@ -804,16 +856,29 @@ class MCTS:
                     # evaluate_batch call (worker is single-threaded)
                 else:
                     with torch.inference_mode():
-                        out = self.net(self._obs_buf[:obs_count])
-                        # policy_only returns just pol_logits; dual-head
-                        # returns (pol, val).
-                        if isinstance(out, tuple):
-                            pol_logits, val_logits = out
+                        if self.value_head is not None:
+                            # Run backbone once, apply BOTH policy and
+                            # value heads from the shared features.
+                            pol_logits, feats = \
+                                self.net.forward_with_features(
+                                    self._obs_buf[:obs_count])
+                            vh_logits = self.value_head(feats.float())
+                            vh_probs = torch.sigmoid(vh_logits)
+                            vh_scalars = (vh_probs *
+                                          self._horizon_weights).sum(dim=-1)
+                            vh_np = vh_scalars.float().cpu().numpy()
+                            val_logits = None
                         else:
-                            pol_logits, val_logits = out, None
-                        if not skip_nn_value and val_logits is not None:
-                            values_t = self.net.predict_value(
-                                val_logits, max_val=self.max_score)
+                            out = self.net(self._obs_buf[:obs_count])
+                            # policy_only returns just pol_logits; dual-head
+                            # returns (pol, val).
+                            if isinstance(out, tuple):
+                                pol_logits, val_logits = out
+                            else:
+                                pol_logits, val_logits = out, None
+                            if not skip_nn_value and val_logits is not None:
+                                values_t = self.net.predict_value(
+                                    val_logits, max_val=self.max_score)
                     pol_np = pol_logits.float().cpu().numpy()  # fp32 for JIT
                     if not skip_nn_value and val_logits is not None:
                         val_np = values_t.cpu().numpy()
@@ -850,6 +915,10 @@ class MCTS:
                             self._nb_r, self._nb_c, self._nb_col, n_next,
                             self.feature_coefs, self.feature_means,
                             self.feature_stds, self.feature_bias))
+                    elif self.value_head is not None:
+                        # Terminal boards weren't in the batched forward;
+                        # evaluate alone. Cheap (1 forward) and rare.
+                        value = self._value_head_eval_single(batch_games[b])
                     elif self.value_net is not None:
                         value = 0.0
                     else:
@@ -866,7 +935,7 @@ class MCTS:
                         action_key = int(flat_idx[i])
                         if action_key not in ch:
                             ch[action_key] = Node(prior=float(pri[i]))
-                    # Value source priority: features > vnet > NN val head
+                    # Value source priority: features > value_head > vnet > NN val head
                     if self.feature_coefs is not None:
                         n_next = self._fill_next_ball_buffers(batch_games[b])
                         value = float(_evaluate_features_linear(
@@ -874,6 +943,8 @@ class MCTS:
                             self._nb_r, self._nb_c, self._nb_col, n_next,
                             self.feature_coefs, self.feature_means,
                             self.feature_stds, self.feature_bias))
+                    elif vh_np is not None:
+                        value = float(vh_np[nn_idx])
                     elif vnet_values is not None:
                         value = float(vnet_values[nn_idx])
                     else:
@@ -973,7 +1044,8 @@ def make_mcts_player(net, device, max_score=30000.0,
                      num_simulations=400, c_puct=2.5, top_k=30,
                      batch_size=16, value_net=None, terminal_value=None,
                      override_threshold=0.0, feature_weights_path=None,
-                     early_stop=False, q_weight=1.0):
+                     early_stop=False, q_weight=1.0,
+                     value_head_path=None):
     """Create MCTS player function for use with evaluate."""
     mcts = MCTS(net, device, max_score=max_score,
                 num_simulations=num_simulations,
@@ -981,7 +1053,8 @@ def make_mcts_player(net, device, max_score=30000.0,
                 value_net=value_net, terminal_value=terminal_value,
                 override_threshold=override_threshold,
                 feature_weights_path=feature_weights_path,
-                early_stop=early_stop, q_weight=q_weight)
+                early_stop=early_stop, q_weight=q_weight,
+                value_head_path=value_head_path)
 
     def player(game):
         return mcts.search(game)
