@@ -63,8 +63,12 @@ def _action_sequence(model_path, weights_path):
 
 def _default_paths():
     """Look for production assets, fall back to a tiny test model if missing."""
-    model = 'alphatrain/data/pillar2x2_epoch_10.pt'
-    weights = 'alphatrain/data/feature_value_weights_2x.npz'
+    model = 'alphatrain/data/pillar2y2_epoch_40.pt'
+    weights = 'alphatrain/data/feature_value_weights_2y_nb.npz'
+    if not (os.path.exists(model) and os.path.exists(weights)):
+        # Fall back to pillar2x2 with whatever 25-feat weights we have
+        model = 'alphatrain/data/pillar2x2_epoch_10.pt'
+        weights = 'alphatrain/data/feature_value_weights_2y_nb.npz'
     if not (os.path.exists(model) and os.path.exists(weights)):
         return None, None
     return model, weights
