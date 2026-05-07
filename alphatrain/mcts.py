@@ -114,19 +114,17 @@ def _evaluate_board(board):
 @njit(cache=True)
 def _evaluate_features_linear(board, next_r, next_c, next_col, n_next,
                               coefs, means, stds, bias):
-    """Linear value function over 25 board+next-ball features.
+    """Linear value function over 27 board+next-ball features.
 
     V(board, next) = bias + Σ_i coefs[i] · (feat_i − means[i]) / stds[i].
-    Feature order: 16 board features (FEATURE_NAMES) + 7 next-ball features
-    (NEXT_BALL_FEATURE_NAMES) + 2 derived [ratio, frag_score] = 25 total.
+    Feature order: 16 board features (FEATURE_NAMES) + 9 next-ball features
+    (NEXT_BALL_FEATURE_NAMES) + 2 derived [ratio, frag_score] = 27 total.
 
-    The 7 next-ball features capture both aggregate post-spawn deltas
-    (delta_largest, delta_components, delta_low_mob, delta_avg_reach) and
-    direct tactical signals: n_next_same_color_adj, n_next_blocked, and
-    crucially `max_next_line` — the longest same-color line passing
-    through any non-blocked spawn cell after the spawns are placed. The
-    last one operationalizes "this spawn completes a 4-in-a-row" or
-    "this spawn extends a diagonal toward a future big clear".
+    Next-ball features include aggregate deltas, tactical line completion
+    indicators (max_next_line, next_makes_4plus, next_makes_5plus), and
+    the cheap landing-cell stats. The threshold-encoded indicators let
+    the linear model learn the step function "+1 from going 3→4 length"
+    that a single continuous feature can't represent on its own.
 
     Returns float scalar suitable for use as MCTS leaf value.
     """
@@ -156,7 +154,7 @@ def _evaluate_features_linear(board, next_r, next_c, next_col, n_next,
     v += coefs[13] * (feats[13] - means[13]) / stds[13]
     v += coefs[14] * (feats[14] - means[14]) / stds[14]
     v += coefs[15] * (feats[15] - means[15]) / stds[15]
-    # 7 next-ball features
+    # 9 next-ball features
     v += coefs[16] * (feats[16] - means[16]) / stds[16]
     v += coefs[17] * (feats[17] - means[17]) / stds[17]
     v += coefs[18] * (feats[18] - means[18]) / stds[18]
@@ -164,9 +162,11 @@ def _evaluate_features_linear(board, next_r, next_c, next_col, n_next,
     v += coefs[20] * (feats[20] - means[20]) / stds[20]
     v += coefs[21] * (feats[21] - means[21]) / stds[21]
     v += coefs[22] * (feats[22] - means[22]) / stds[22]
+    v += coefs[23] * (feats[23] - means[23]) / stds[23]
+    v += coefs[24] * (feats[24] - means[24]) / stds[24]
     # 2 derived
-    v += coefs[23] * (ratio - means[23]) / stds[23]
-    v += coefs[24] * (frag_score - means[24]) / stds[24]
+    v += coefs[25] * (ratio - means[25]) / stds[25]
+    v += coefs[26] * (frag_score - means[26]) / stds[26]
     return v
 
 
@@ -481,8 +481,8 @@ class MCTS:
             self.feature_means = data['means'].astype(np.float32)
             self.feature_stds = data['stds'].astype(np.float32)
             self.feature_bias = float(data['bias'])
-            assert self.feature_coefs.shape[0] == 25, (
-                f"Expected 25 feature coefs (16 board + 7 next-ball + 2 "
+            assert self.feature_coefs.shape[0] == 27, (
+                f"Expected 27 feature coefs (16 board + 9 next-ball + 2 "
                 f"derived), got {self.feature_coefs.shape[0]}. The feature "
                 f"format changed when next-ball features were added — refit "
                 f"weights with the current fit_feature_value.py.")
