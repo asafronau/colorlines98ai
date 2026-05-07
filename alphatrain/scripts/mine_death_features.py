@@ -198,18 +198,26 @@ NEXT_BALL_FEATURE_NAMES = [
     'delta_avg_reach',   # avg_reach, after − before
     'n_next_same_color_adj',  # # of next-ball cells with ≥1 same-color neighbor on current board (line-clear potential)
     'n_next_blocked',    # # of next balls landing on currently-occupied cells (wasted spawn)
+    # Tactical: max same-color line length passing through any non-blocked
+    # spawn cell after the spawns are placed. Captures expert intuition
+    # like "this spawn completes a 4-in-a-row → next move clears" or
+    # "this spawn extends an existing diagonal toward a future big clear".
+    # Aggregate deltas (above) didn't capture this — they're linear-redundant
+    # with board features. This one operationalizes the local tactical
+    # reading directly: max_next_line >= 5 means the game would clear it.
+    'max_next_line',
 ]
 
 # Derived features added in Python
 DERIVED_NAMES = ['ratio', 'frag_score']
 
 ALL_FEATURE_NAMES = FEATURE_NAMES + NEXT_BALL_FEATURE_NAMES + DERIVED_NAMES
-assert len(ALL_FEATURE_NAMES) == 24
+assert len(ALL_FEATURE_NAMES) == 25
 
 
 @njit(cache=True)
 def board_features_with_next(board, next_r, next_c, next_col, n_next):
-    """Board features + 6 next-ball-aware features.
+    """Board features + 7 next-ball-aware features.
 
     Args:
         board: (9, 9) int8
@@ -217,10 +225,10 @@ def board_features_with_next(board, next_r, next_c, next_col, n_next):
         next_col: int array of length ≥ n_next — spawn colors
         n_next: number of valid next balls (0-3)
 
-    Returns a 22-tuple: 16 board features (matches `board_features`) followed
-    by 6 next-ball features:
+    Returns a 23-tuple: 16 board features (matches `board_features`) followed
+    by 7 next-ball features:
         delta_largest, delta_components, delta_low_mob, delta_avg_reach,
-        n_next_same_color_adj, n_next_blocked.
+        n_next_same_color_adj, n_next_blocked, max_next_line.
     """
     feats_before = board_features(board)
 
@@ -257,12 +265,42 @@ def board_features_with_next(board, next_r, next_c, next_col, n_next):
     delta_low_mob = feats_after[7] - feats_before[7]
     delta_avg_reach = feats_after[5] - feats_before[5]
 
+    # Tactical: max line length through any non-blocked spawn cell on the
+    # AFTER-spawn board. Walks 4 directions (horizontal, vertical, both
+    # diagonals) from each spawn, counting consecutive same-color cells
+    # (including the spawn itself).
+    max_next_line = 0
+    for i in range(n_next):
+        r = int(next_r[i])
+        c = int(next_c[i])
+        col = int(next_col[i])
+        if board[r, c] != 0:
+            continue  # blocked spawn
+        for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+            length = 1
+            # forward
+            cr, cc = r + dr, c + dc
+            while (0 <= cr < BOARD_SIZE and 0 <= cc < BOARD_SIZE
+                   and board_after[cr, cc] == col):
+                length += 1
+                cr += dr
+                cc += dc
+            # backward
+            cr, cc = r - dr, c - dc
+            while (0 <= cr < BOARD_SIZE and 0 <= cc < BOARD_SIZE
+                   and board_after[cr, cc] == col):
+                length += 1
+                cr -= dr
+                cc -= dc
+            if length > max_next_line:
+                max_next_line = length
+
     return (feats_before[0], feats_before[1], feats_before[2], feats_before[3],
             feats_before[4], feats_before[5], feats_before[6], feats_before[7],
             feats_before[8], feats_before[9], feats_before[10], feats_before[11],
             feats_before[12], feats_before[13], feats_before[14], feats_before[15],
             delta_largest, delta_components, delta_low_mob, delta_avg_reach,
-            n_same_color_adj, n_blocked)
+            n_same_color_adj, n_blocked, max_next_line)
 
 
 def main():
