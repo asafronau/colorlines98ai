@@ -243,8 +243,11 @@ def _run_mcts_local(args, task_seeds, total, device_str):
     print(f"\n{'='*60}\nMCTS player ({total} games, local {device}, "
           f"{args.simulations} sims, bs={args.batch_size})\n{'='*60}",
           flush=True)
+    # JIT-traced models can't expose backbone_features (the value head
+    # path needs the un-traced model). Skip JIT when --value-head-path.
+    use_jit = args.value_head_path is None
     net, max_score = load_model(args.model, device,
-                                fp16=(device_str != 'cpu'), jit_trace=True)
+                                fp16=(device_str != 'cpu'), jit_trace=use_jit)
     player = make_mcts_player(
         net, device, max_score=max_score,
         num_simulations=args.simulations,
@@ -252,7 +255,8 @@ def _run_mcts_local(args, task_seeds, total, device_str):
         override_threshold=args.override_threshold,
         feature_weights_path=args.feature_value_weights,
         early_stop=args.early_stop,
-        q_weight=args.q_weight)
+        q_weight=args.q_weight,
+        value_head_path=args.value_head_path)
 
     results = []
     t0 = time.time()
@@ -390,6 +394,12 @@ def main():
     p.add_argument('--feature-value-weights', default=None,
                    help='Path to feature_value_weights.npz. Required when '
                         'running MCTS — the model has no NN value head.')
+    p.add_argument('--value-head-path', default=None,
+                   help='Path to a trained ValueHead checkpoint (Phase 3 '
+                        'NN value head). Mutually exclusive with '
+                        '--feature-value-weights. LOCAL-MODE ONLY for now '
+                        '(server mode would need to wire the head over '
+                        'backbone features — TODO).')
     p.add_argument('--early-stop', action='store_true',
                    help='Exit MCTS early when greedy root child is locked '
                         'in. Eval-only — preserves pick, not visit dist.')

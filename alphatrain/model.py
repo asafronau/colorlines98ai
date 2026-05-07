@@ -83,23 +83,36 @@ class PolicyNet(nn.Module):
 
     def forward(self, x):
         """Returns policy_logits of shape (batch, 6561)."""
-        out = self.stem(x)
-        out = self.blocks(out)
-        out = F.relu(self.backbone_bn(out))
-
-        p = F.relu(self.policy_bn(self.policy_conv1(out)))
-        p = self.policy_conv2(p)
-        return p.reshape(p.size(0), -1)
+        feats = self.backbone_features(x)
+        return self._policy_from_features(feats)
 
     def backbone_features(self, x):
         """Run stem + blocks + backbone_bn + ReLU; return (B, channels, 9, 9).
 
-        Used by the (planned) frozen-backbone value head — the head
-        trains on these features without backprop into the policy net.
+        Used by the frozen-backbone value head — the head trains on
+        these features without backprop into the policy net.
         """
         out = self.stem(x)
         out = self.blocks(out)
         return F.relu(self.backbone_bn(out))
+
+    def _policy_from_features(self, feats):
+        """Apply the policy head to backbone features. Public via
+        forward_with_features() for callers that want both."""
+        p = F.relu(self.policy_bn(self.policy_conv1(feats)))
+        p = self.policy_conv2(p)
+        return p.reshape(p.size(0), -1)
+
+    def forward_with_features(self, x):
+        """Returns (policy_logits, backbone_features).
+
+        Useful for ValueHead inference where we want the policy AND
+        the features in one forward pass — avoids redundant backbone
+        compute. Policy head + ValueHead can share `feats`.
+        """
+        feats = self.backbone_features(x)
+        pol_logits = self._policy_from_features(feats)
+        return pol_logits, feats
 
 
 # Back-compat alias: old checkpoints reference AlphaTrainNet by name.
