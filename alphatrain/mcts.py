@@ -489,28 +489,40 @@ class MCTS:
 
         # NN value head (multi-horizon survival classifier). Mutually
         # exclusive with feature_weights_path — one Q source at a time.
-        # Server mode (inference_client) NOT yet supported with value
-        # head; the server can't run the head over the backbone features.
-        # Local mode only for the probe phase.
+        #
+        # Two modes:
+        #   - Local (no inference_client): MCTS owns the head and runs
+        #     it over backbone features after the policy forward pass.
+        #   - Server (inference_client): the server already runs the head
+        #     fused with the policy net and writes scalar V into val_buf.
+        #     MCTS keeps a flag so leaf eval reads val_np instead of
+        #     computing V from features.
         self.value_head = None
+        self.value_head_via_server = False
         if value_head_path is not None:
             if feature_weights_path is not None:
                 raise ValueError(
                     "value_head_path and feature_weights_path are "
                     "mutually exclusive. Pick one.")
             if inference_client is not None:
-                raise NotImplementedError(
-                    "value head + inference server not yet wired. "
-                    "Run with inference_client=None (single-process MCTS).")
-            if net is None:
-                raise ValueError(
-                    "value_head_path requires net to be set "
-                    "(value head reuses the policy backbone features).")
-            from alphatrain.value_head import (
-                load as _load_vh, DEFAULT_HORIZON_WEIGHTS as _DEFAULT_W)
-            self.value_head, _ = _load_vh(value_head_path, device=device)
-            self._horizon_weights = torch.tensor(
-                _DEFAULT_W, dtype=torch.float32, device=device)
+                # Server runs the head; MCTS just reads val_np from val_buf.
+                self.value_head_via_server = True
+                from alphatrain.value_head import (
+                    DEFAULT_HORIZON_WEIGHTS as _DEFAULT_W)
+                self._horizon_weights = torch.tensor(
+                    _DEFAULT_W, dtype=torch.float32,
+                    device=device if device is not None else 'cpu')
+            else:
+                if net is None:
+                    raise ValueError(
+                        "value_head_path requires net to be set "
+                        "(value head reuses the policy backbone features).")
+                from alphatrain.value_head import (
+                    load as _load_vh,
+                    DEFAULT_HORIZON_WEIGHTS as _DEFAULT_W)
+                self.value_head, _ = _load_vh(value_head_path, device=device)
+                self._horizon_weights = torch.tensor(
+                    _DEFAULT_W, dtype=torch.float32, device=device)
 
         # Pre-allocate obs buffer for server mode (reused across searches)
         if inference_client is not None:
@@ -919,6 +931,9 @@ class MCTS:
                         # Terminal boards weren't in the batched forward;
                         # evaluate alone. Cheap (1 forward) and rare.
                         value = self._value_head_eval_single(batch_games[b])
+                    elif self.value_head_via_server:
+                        # Survival head: terminal board ⇒ no future, V=0.
+                        value = 0.0
                     elif self.value_net is not None:
                         value = 0.0
                     else:

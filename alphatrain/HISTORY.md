@@ -2218,3 +2218,80 @@ PUCT scales cleanly with search depth.
      distillation-ceiling-as-search-cost: NOT "MCTS plateaus at this
      model" but "MCTS at this model needs more sims to break out
      past the previous-iteration's MCTS."
+
+### Phase 3R — NN ValueHead beats linear evaluator (May 2026)
+
+Built a tiny `ValueHead` (~8K params) on the **frozen** pillar2y2 backbone:
+multi-horizon survival classifier predicting `P(survive ≥ H)` for H ∈
+{25, 50, 100, 200}, combined into a scalar `V = 1.0·p25 + 0.8·p50 +
+0.5·p100 + 0.25·p200`. Trained on V11 corpus (7.78M states, 5 epochs,
+1.5h on M5). Calibration on K=64 rollout val set: r=0.91-0.95 across
+horizons (epoch 3 best on both trajectory loss and calibration).
+
+**Wired into the inference server in server-mode.** `_PolicyValueWrapper`
+fuses `forward_with_features` + head into one traced GPU pass, writes
+scalar V to `val_buf` per batch. MCTS in server mode reads V directly;
+no per-leaf head re-run. 16-worker eval at full speed.
+
+**Phase 1 sweep (200 sims × 50 seeds, max-turns 8000):**
+- q=1.0: mean 9,152, %<1K 4%, %≥10K 34%
+- q=1.5: mean 8,322, %<1K 2%, %≥10K 32%
+- q=2.0: mean 9,527, %<1K 6%, %≥10K 50% ← winner
+
+**Phase 2 (400 sims × 50 seeds, q=2.0, max-turns 5000):**
+
+| metric | linear @ 400 | NN q=2.0 @ 400 | delta |
+|---|---|---|---|
+| mean | 7,517 | **9,051** | **+20%** |
+| %<1K | 4% | **2%** | −50% |
+| %≥10K | 42% | **74%** | **+76%** |
+| %>5K | — | **88%** | — |
+
+133. **Always sweep `q_weight` when introducing a new value source.**
+     Initial 50×400 attempt at q_weight=0.5 (the linear-evaluator-tuned
+     default) trended near 2X2 quality — looked like the head was
+     broken. ChatGPT review pointed out: head's V ∈ [0, 2.55] (sum of
+     weighted survival probs, max=1+0.8+0.5+0.25), totally different
+     scalar distribution from the linear evaluator. q_weight tuned for
+     one source mis-blends the other. 100-sim sweep across q ∈ {0.1,
+     0.25, 0.5, 1.0, 2.0} showed monotone improvement past 0.5 — q=1.0
+     and q=2.0 *each matched the linear baseline at 4× less sim
+     budget*. The "head is bad" hypothesis was wrong; only the blend
+     was wrong. Lesson: a new value source is a new scalar distribution;
+     PUCT q_weight must be re-tuned, not inherited.
+
+134. **Server-mode fused inference is the right architecture for
+     auxiliary heads.** Local-mode head eval (per-worker MCTS owns the
+     head) was 4-8× slower than server mode. The fused
+     `_PolicyValueWrapper` keeps the head's compute inside the GPU loop
+     where backbone features are already computed for the policy
+     forward, so the marginal cost of the value head is essentially the
+     8K-param head conv + GAP + linear (sub-millisecond on a 256ch
+     featuremap batch). MCTS in server mode just reads `val_buf` — no
+     per-leaf head invocation. Pattern generalizes: any small auxiliary
+     head trained on the policy backbone should fuse into the server's
+     forward, not run separately in MCTS.
+
+135. **Cap-clip is a distribution skewer; track it explicitly.** The
+     400-sim Phase 2 mean (9,051) was *lower* than 200-sim Phase 1 mean
+     (9,527), violating the "more compute → better games" expectation.
+     Reason: max-turns 5000 cap clipped many of the 74% reaching 10K+
+     at ~10,300 (the empirical cap-hit ceiling, per P95=10,398 in
+     earlier 100-sim runs). When a large fraction of games hit the cap,
+     the cap becomes the dominant bound on the mean — extra search
+     compute can't push past it. Add explicit cap-hit logging
+     (`turns == max_turns` count) before drawing conclusions about
+     mean differences across runs with different caps. The TRUE
+     ceiling for q=2.0/400-sim requires re-running with max-turns 8000+.
+
+136. **The "is the head broken?" diagnostic ladder works.**
+     ChatGPT's recommended ladder before retraining the head was:
+     (1) q_weight sweep (cheapest, no retrain), (2) fp16 parity smoke,
+     (3) saturation check on visited leaves, (4) correlation with
+     linear evaluator on the same leaves, (5) only then consider
+     retraining target. Level 1 alone solved it here. Lesson: when a
+     new component disappoints, try the cheapest alternative
+     explanation first — scale-mismatch, blend-tuning, BN calibration,
+     etc. — before assuming the component itself is broken. The "head
+     doesn't work" hypothesis would have led to retraining or
+     architecture changes; the actual fix was a CLI flag.
