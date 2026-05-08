@@ -48,6 +48,70 @@ Generate better data → train → repeat.
 - [ ] Increase sims (400 → 800) when model is stronger
 - [ ] Consider hybrid MCTS (NN policy + heuristic leaf eval) for 8,000+ data
 
+### Phase 3R: Value Head Diagnostic & Retrain ← CURRENT
+
+V11 NN value head trained (r=0.91-0.95 on K=64 calibration). Wired into the
+inference server in server-mode (fused with policy backbone via
+`_PolicyValueWrapper`). Initial 50-seed A/B vs linear evaluator at
+q_weight=0.5 c_puct=2.5 400 sims trends near 2X2 quality — *worse than
+linear evaluator*. Diagnose before retraining anything.
+
+**Cheap fixes already validated against the code (do after current eval):**
+
+- [ ] Local-mode terminal V=0 — `mcts.py:935` calls
+  `_value_head_eval_single` on terminal boards; should be V=0 to match
+  server semantics. One-line fix.
+- [ ] Backbone compat warn at MCTS init — `value_head` ckpt stores
+  `backbone_path`; warn if it doesn't match `--model`. One-liner.
+- [ ] Cap-hit logging in `eval_parallel` (turns == max-turns counts).
+- [ ] Persist `horizon_weights` in the value-head checkpoint instead of
+  importing `DEFAULT_HORIZON_WEIGHTS` in the server. Defer until we
+  actually tune blends.
+
+**Diagnostic ladder (do not retrain until each level rules out a cause):**
+
+1. [ ] **q_weight sweep** — head V ∈ [0, 2.55] vs linear evaluator's very
+  different scale. q_weight=0.5 was tuned for the linear evaluator and
+  is probably wrong. Sweep {0.1, 0.25, 0.5, 1.0, 2.0} on 10 seeds × 400
+  sims server-mode. ~30 min total. Cheapest possible fix.
+
+2. [ ] **fp16 parity smoke** — fixed-batch script: local fp32 V vs fused
+  server fp16 V; report max/mean abs diff. If the fused-server pass
+  drifts, force fp32 in `_PolicyValueWrapper`.
+
+3. [ ] **Saturation diagnostic** — V11 has 92-98% positives across
+  horizons. If the head outputs ~0.95 everywhere, V ≈ 2.55 constant and
+  MCTS is effectively running policy-only. Script: play one game,
+  every 50 turns dump (head logits, σ logits per horizon, scalar V) on
+  current board AND on ~50 leaves MCTS visited. Healthy signal: V std
+  ≥ 0.1, per-horizon σ spread across [0.3, 0.95].
+
+4. [ ] **Correlation with linear evaluator** on the same set of visited
+  leaves. r > 0.6 ⇒ noisy-but-similar signal, fixable by tuning. r < 0.3
+  ⇒ wrong target.
+
+**If diagnostic shows the head is the wrong target, retrain options:**
+
+- [ ] **Retrain on score-to-go regression** (final_score - current_score,
+  normalized). Continuous range, no censoring, matches what MCTS Q-norm
+  cares about. Same frozen backbone, same V11 corpus. Survival labels
+  with 92%+ positives don't carry enough information for MCTS leaf eval.
+- [ ] If saturation is the issue but signal direction is right: retrain
+  with `pos_weight` or focal loss to force the head off the
+  always-survive prior.
+- [ ] Crisis-state oversampling — V11 trajectories are mostly mid-game.
+  States MCTS spends sims on at game end (≤10 empty squares) are
+  underrepresented. Re-weight or oversample those during training.
+
+**Methodological caveats from ChatGPT review (validated):**
+
+- Best-ckpt selection in `train_value_head.py:323` uses `inner_val_loss`
+  (trajectory BCE), not K-rollout calibration. Coincided this run
+  (epoch 3 best on both), but won't always.
+- Training labels measure survival under recorded V11 trajectories
+  (MCTS+oracle); validation rollouts are policy-only greedy. Different
+  policies — diagnostic mismatch baked in.
+
 ### Known Issues
 
 - [ ] **GPU server mode -14% quality gap with multi-worker**: 16-worker MCTS scores

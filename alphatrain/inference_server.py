@@ -65,9 +65,11 @@ class InferenceServer:
     """Manages shared memory and the GPU inference subprocess."""
 
     def __init__(self, model_path, num_workers, device=None,
-                 max_batch_per_worker=MAX_BATCH, use_compile=False):
+                 max_batch_per_worker=MAX_BATCH, use_compile=False,
+                 value_head_path=None):
         self.model_path = model_path
         self.use_compile = use_compile
+        self.value_head_path = value_head_path
         self.num_workers = num_workers
         self.max_batch = max_batch_per_worker
 
@@ -105,7 +107,7 @@ class InferenceServer:
                   self.num_workers, self.max_batch,
                   self._obs_shm.name, self._pol_shm.name, self._val_shm.name,
                   self.request_queue, self.response_queues,
-                  self.use_compile),
+                  self.use_compile, self.value_head_path),
             daemon=True)
         self._process.start()
 
@@ -129,12 +131,19 @@ class InferenceServer:
 
 def _gpu_loop(model_path, device_str, num_workers, max_batch,
               obs_shm_name, pol_shm_name, val_shm_name,
-              request_queue, response_queues, use_compile=False):
+              request_queue, response_queues, use_compile=False,
+              value_head_path=None):
     """GPU inference process main loop.
 
     Gathers requests from multiple workers using busy-poll, then runs
     a single forward pass on the combined batch. Scatters results back
     via shared memory, signals each worker's response queue.
+
+    When `value_head_path` is set, loads the trained ValueHead, runs it
+    on the same backbone features as the policy, computes the scalar
+    leaf value V = Σ w_h · σ(logit_h), and writes V into val_buf.
+    Otherwise val_buf stays zero and clients are expected to use the
+    feature-value evaluator (or accept zero leaf values for testing).
     """
     obs_shm = SharedMemory(name=obs_shm_name)
     pol_shm = SharedMemory(name=pol_shm_name)
@@ -148,6 +157,20 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     from alphatrain.evaluate import load_model
     net, _ = load_model(model_path, device)
     net = net.half()
+
+    # Optional NN value head — runs over the SAME backbone features as
+    # the policy. We don't trace the head separately; we'll trace the
+    # combined forward function below.
+    value_head = None
+    horizon_weights = None
+    if value_head_path is not None:
+        from alphatrain.value_head import (
+            load as load_vh, DEFAULT_HORIZON_WEIGHTS)
+        value_head, _ = load_vh(value_head_path, device=device)
+        value_head = value_head.half()
+        horizon_weights = torch.tensor(
+            DEFAULT_HORIZON_WEIGHTS, dtype=torch.float16, device=device)
+        print(f"  ValueHead loaded from {value_head_path}", flush=True)
 
     # CUDA-only: convert weights + activations to channels_last (NHWC).
     # ResNets on Ampere/Ada are 1.3-2x faster in NHWC because cuDNN
@@ -164,6 +187,29 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                         device=device, dtype=torch.float16,
                         memory_format=mem_fmt).normal_()
 
+    # Forward callable: either policy-only or fused (policy + scalar V).
+    if value_head is not None:
+        class _PolicyValueWrapper(torch.nn.Module):
+            def __init__(self, net, head, hw):
+                super().__init__()
+                self.net = net
+                self.head = head
+                self.register_buffer('hw', hw)
+
+            def forward(self, x):
+                pol, feats = self.net.forward_with_features(x)
+                vh_logits = self.head(feats)
+                vh_probs = torch.sigmoid(vh_logits)
+                scalar_V = (vh_probs * self.hw).sum(dim=-1)
+                return pol, scalar_V
+
+        forward_module = _PolicyValueWrapper(net, value_head, horizon_weights)
+        forward_module = forward_module.to(device).half().eval()
+        returns_value = True
+    else:
+        forward_module = net
+        returns_value = False
+
     if use_compile and device_str == 'cuda':
         # torch.compile(reduce-overhead) is faster than jit.trace on CUDA
         # for the small repeated batches we issue here. Pays a 1-2 min
@@ -171,20 +217,23 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
         print("  Compiling model with torch.compile(mode='reduce-overhead')...",
               flush=True)
         t0 = time.time()
-        net_traced = torch.compile(net, mode='reduce-overhead', fullgraph=False)
+        net_traced = torch.compile(forward_module,
+                                   mode='reduce-overhead', fullgraph=False)
         with torch.inference_mode():
             for _ in range(3):
                 net_traced(dummy)
         print(f"  Compile + warmup: {time.time()-t0:.1f}s", flush=True)
     else:
-        net_traced = torch.jit.trace(net, dummy)
+        net_traced = torch.jit.trace(forward_module, dummy)
 
     max_total = num_workers * max_batch
     gpu_obs = torch.empty(max_total, 18, 9, 9,
                           device=device, dtype=torch.float16,
                           memory_format=mem_fmt)
     obs_staging = np.empty((max_total,) + OBS_SHAPE, dtype=np.float32)
-    # val_buf is zeroed once and never updated — clients use feature MCTS.
+    # When no NN value head is configured, val_buf stays zero forever
+    # and clients are expected to use the feature-value MCTS evaluator.
+    # When a head is configured, val_buf is rewritten on every batch.
     val_buf[:] = 0.0
 
     total_evals = 0
@@ -245,14 +294,23 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
             obs_staging[:total_count]).half()
 
         with torch.inference_mode():
-            pol_logits = net_traced(gpu_obs[:total_count])
+            if returns_value:
+                pol_logits, scalar_V = net_traced(gpu_obs[:total_count])
+            else:
+                pol_logits = net_traced(gpu_obs[:total_count])
+                scalar_V = None
 
-        # Scatter policy logits back. val_buf stays zeroed.
+        # Scatter policy logits back. If a value head ran on the server,
+        # also scatter scalar V into val_buf; otherwise val_buf stays zero.
         pol_cpu = pol_logits.float().cpu().numpy()
+        val_cpu = scalar_V.float().cpu().numpy() if scalar_V is not None else None
         offset = 0
         for slot_id, count in pending:
             np.copyto(pol_buf[slot_id, :count],
                       pol_cpu[offset:offset + count])
+            if val_cpu is not None:
+                np.copyto(val_buf[slot_id, :count],
+                          val_cpu[offset:offset + count])
             offset += count
             response_queues[slot_id].put(1)
 

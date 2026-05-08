@@ -82,7 +82,8 @@ def _mcts_server_worker(slot_id, seed_queue, result_queue,
                         num_workers, max_batch, request_queue, response_queue,
                         num_sims, c_puct, top_k, max_score,
                         override_threshold, max_turns,
-                        feature_weights_path, early_stop, q_weight):
+                        feature_weights_path, early_stop, q_weight,
+                        value_head_path):
     torch.set_num_threads(1)
     from multiprocessing.shared_memory import SharedMemory
     from alphatrain.inference_server import InferenceClient, OBS_SHAPE, POL_SIZE
@@ -104,7 +105,8 @@ def _mcts_server_worker(slot_id, seed_queue, result_queue,
                 batch_size=max_batch,
                 override_threshold=override_threshold,
                 feature_weights_path=feature_weights_path,
-                early_stop=early_stop, q_weight=q_weight)
+                early_stop=early_stop, q_weight=q_weight,
+                value_head_path=value_head_path)
 
     while True:
         seed = seed_queue.get()
@@ -193,7 +195,8 @@ def _run_mcts_server(args, task_seeds, total, device_str):
 
     server = InferenceServer(args.model, n_workers, device=device_str,
                              max_batch_per_worker=args.batch_size,
-                             use_compile=args.compile)
+                             use_compile=args.compile,
+                             value_head_path=args.value_head_path)
     server.start()
 
     seed_queue = MPQueue()
@@ -210,7 +213,7 @@ def _run_mcts_server(args, task_seeds, total, device_str):
                           args.simulations, args.c_puct, args.top_k, max_score,
                           args.override_threshold, args.max_turns,
                           args.feature_value_weights, args.early_stop,
-                          args.q_weight))
+                          args.q_weight, args.value_head_path))
         p.start()
         procs.append(p)
 
@@ -397,9 +400,10 @@ def main():
     p.add_argument('--value-head-path', default=None,
                    help='Path to a trained ValueHead checkpoint (Phase 3 '
                         'NN value head). Mutually exclusive with '
-                        '--feature-value-weights. LOCAL-MODE ONLY for now '
-                        '(server mode would need to wire the head over '
-                        'backbone features — TODO).')
+                        '--feature-value-weights. Works in both local '
+                        '(--workers 1) and server (--workers >1) modes; '
+                        'in server mode the GPU loop runs the head fused '
+                        'with the policy net and ships scalar V per leaf.')
     p.add_argument('--early-stop', action='store_true',
                    help='Exit MCTS early when greedy root child is locked '
                         'in. Eval-only — preserves pick, not visit dist.')
@@ -420,12 +424,19 @@ def main():
     seeds = args.seeds
     total = len(seeds)
 
-    # Fail-fast: MCTS needs the feature evaluator. PolicyNet has no NN
-    # value head; without feature weights, search runs blind on zeros.
-    if not args.policy_only and not args.feature_value_weights:
+    # Fail-fast: MCTS needs a leaf-value source. PolicyNet has no NN
+    # value head built in; provide either the linear feature evaluator
+    # (--feature-value-weights) or the trained NN ValueHead
+    # (--value-head-path). Without one, search runs blind on zeros.
+    if not args.policy_only and not (args.feature_value_weights
+                                      or args.value_head_path):
         raise SystemExit(
-            "MCTS requires --feature-value-weights (policy model has no "
-            "NN value head). Pass --policy-only to skip MCTS.")
+            "MCTS requires --feature-value-weights or --value-head-path. "
+            "Pass --policy-only to skip MCTS.")
+    if args.feature_value_weights and args.value_head_path:
+        raise SystemExit(
+            "--feature-value-weights and --value-head-path are mutually "
+            "exclusive. Pick one Q source.")
 
     print(f"Evaluation: {total} games (one per seed)", flush=True)
     print(f"Model: {args.model}", flush=True)
