@@ -159,7 +159,8 @@ def _server_worker(slot_id, seed_queue, result_queue,
                    request_queue, response_queue,
                    num_sims, batch_size, max_score,
                    temperature_moves, dirichlet_alpha, dirichlet_weight,
-                   max_turns, feature_weights_path):
+                   max_turns, feature_weights_path, value_head_path,
+                   q_weight):
     """Persistent worker for GPU server mode self-play."""
     torch.set_num_threads(1)
 
@@ -180,7 +181,9 @@ def _server_worker(slot_id, seed_queue, result_queue,
     mcts = MCTS(inference_client=client, max_score=max_score,
                 num_simulations=num_sims, batch_size=batch_size,
                 top_k=30, c_puct=2.5,
-                feature_weights_path=feature_weights_path)
+                feature_weights_path=feature_weights_path,
+                value_head_path=value_head_path,
+                q_weight=q_weight)
 
     while True:
         seed = seed_queue.get()
@@ -224,16 +227,32 @@ def main():
     p.add_argument('--max-turns', type=int, default=0,
                    help='Cap games at this many turns (0=no cap). '
                         'Capped games are saved with capped=True.')
-    p.add_argument('--feature-value-weights', required=True,
-                   help='Path to feature_value_weights.npz. Required — '
-                        'PolicyNet has no NN value head; MCTS leaf values '
-                        'come from the linear feature evaluator.')
+    p.add_argument('--feature-value-weights', default=None,
+                   help='Path to feature_value_weights.npz (linear evaluator). '
+                        'Mutually exclusive with --value-head-path.')
+    p.add_argument('--value-head-path', default=None,
+                   help='Path to a trained ValueHead checkpoint. The server '
+                        'runs the head fused with the policy net per leaf. '
+                        'Mutually exclusive with --feature-value-weights.')
+    p.add_argument('--q-weight', type=float, default=2.0,
+                   help='PUCT q-weight. Default 2.0 (calibrated for the NN '
+                        'value head V scale; use 0.5 for the linear '
+                        'evaluator).')
     p.add_argument('--compile', action='store_true',
                    help='Use torch.compile(mode=reduce-overhead) instead of '
                         'torch.jit.trace in the inference server. CUDA only; '
                         'ignored on MPS/CPU. Pays a 1-2 min warm-up upfront '
                         'for ~10-30% faster forward passes after.')
     args = p.parse_args()
+
+    if not (args.feature_value_weights or args.value_head_path):
+        raise SystemExit(
+            "selfplay needs an MCTS leaf-value source: pass either "
+            "--feature-value-weights or --value-head-path.")
+    if args.feature_value_weights and args.value_head_path:
+        raise SystemExit(
+            "--feature-value-weights and --value-head-path are mutually "
+            "exclusive. Pick one.")
 
     if args.device:
         device_str = args.device
@@ -289,7 +308,9 @@ def main():
         mcts = MCTS(net, torch.device(device_str), max_score=max_score,
                      num_simulations=args.sims, batch_size=args.batch_size,
                      top_k=30, c_puct=2.5,
-                     feature_weights_path=args.feature_value_weights)
+                     feature_weights_path=args.feature_value_weights,
+                     value_head_path=args.value_head_path,
+                     q_weight=args.q_weight)
 
         for i, seed in enumerate(seeds):
             result = play_selfplay_game(
@@ -325,7 +346,8 @@ def main():
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
                                  max_batch_per_worker=args.batch_size,
-                                 use_compile=args.compile)
+                                 use_compile=args.compile,
+                                 value_head_path=args.value_head_path)
         server.start()
 
         seed_queue = MPQueue()
@@ -348,7 +370,8 @@ def main():
                       args.sims, args.batch_size, max_score,
                       args.temperature_moves, args.dirichlet_alpha,
                       args.dirichlet_weight, args.max_turns,
-                      args.feature_value_weights))
+                      args.feature_value_weights, args.value_head_path,
+                      args.q_weight))
             p.start()
             workers.append(p)
 
