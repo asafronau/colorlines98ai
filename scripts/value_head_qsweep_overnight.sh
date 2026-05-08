@@ -2,7 +2,9 @@
 # Overnight q_weight refinement for the NN ValueHead.
 #
 # Phase 1: 200 sims x 50 seeds, --max-turns 8000  for q in {1.0, 1.5, 2.0}
-# Phase 2: 400 sims x 50 seeds, --max-turns 5000  at the Phase-1 winner
+# Phase 2: 400 sims x 50 seeds, --max-turns 8000  at the Phase-1 winner
+# (The previous overnight at 400/5000 had most games hitting the cap and
+# bottoming the mean at ~9050; 8000 lets the head's true ceiling show.)
 #
 # Total ETA: ~1.5-2 hours on M5 Max + MPS, 16 workers.
 #
@@ -104,7 +106,7 @@ echo "=========================================================="
 # Phase 2: 400 sims x 50 seeds at winner
 echo
 echo "PHASE 2: 400 sims x 50 seeds at q=$best_qw"
-run_one "$best_qw" 400 5000 "$LOG_DIR/q${best_qw}_400sim.log" || {
+run_one "$best_qw" 400 8000 "$LOG_DIR/q${best_qw}_400sim.log" || {
   echo "Phase 2 failed"; exit 1
 }
 
