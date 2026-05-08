@@ -83,7 +83,8 @@ def play_policy_only(net, device, seed, fp16=False, max_turns=5000):
 
 def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
                          continue_turns, max_turns=5000,
-                         feature_weights_path=None):
+                         feature_weights_path=None,
+                         value_head_path=None, q_weight=2.0):
     """Replay from a saved board position with MCTS search."""
     game = ColorLinesGame(seed=replay_seed)
     game.reset(
@@ -97,7 +98,9 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
         num_simulations=num_sims, c_puct=mcts.c_puct,
         top_k=mcts.top_k, batch_size=mcts.batch_size,
         inference_client=mcts.inference_client,
-        feature_weights_path=feature_weights_path)
+        feature_weights_path=feature_weights_path,
+        value_head_path=value_head_path,
+        q_weight=q_weight)
 
     moves_data = []
     t0 = time.time()
@@ -276,7 +279,8 @@ def _replay_worker(slot_id, task_queue, result_queue,
                     num_workers, max_batch,
                     request_queue, response_queue,
                     batch_size, max_score, continue_turns, max_turns,
-                    feature_weights_path=None):
+                    feature_weights_path=None, value_head_path=None,
+                    q_weight=2.0):
     """Persistent worker for GPU server mode replay."""
     torch.set_num_threads(1)
 
@@ -305,12 +309,15 @@ def _replay_worker(slot_id, task_queue, result_queue,
         mcts = MCTS(inference_client=client, max_score=max_score,
                     num_simulations=num_sims, batch_size=batch_size,
                     top_k=30, c_puct=2.5,
-                    feature_weights_path=feature_weights_path)
+                    feature_weights_path=feature_weights_path,
+                    value_head_path=value_head_path,
+                    q_weight=q_weight)
 
         result = replay_from_snapshot(
             mcts, snapshot, replay_seed, num_sims,
             continue_turns, max_turns,
-            feature_weights_path=feature_weights_path)
+            feature_weights_path=feature_weights_path,
+            value_head_path=value_head_path, q_weight=q_weight)
         result['label'] = label
         result['original_seed'] = snapshot.get('original_seed', replay_seed)
 
@@ -355,9 +362,16 @@ def main():
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--save-dir', default='data/crisis_v1')
     p.add_argument('--feature-value-weights', default=None,
-                   help='Path to feature_value_weights.npz. When set, MCTS '
-                        'replaces the NN value head with the linear feature '
-                        'evaluator. Required for value-quality crisis mining.')
+                   help='Path to feature_value_weights.npz (linear evaluator). '
+                        'Mutually exclusive with --value-head-path.')
+    p.add_argument('--value-head-path', default=None,
+                   help='Path to a trained ValueHead checkpoint. The server '
+                        'runs the head fused with the policy net. Mutually '
+                        'exclusive with --feature-value-weights.')
+    p.add_argument('--q-weight', type=float, default=2.0,
+                   help='PUCT q-weight. Default 2.0 (calibrated for the NN '
+                        'value head V scale; use 0.5 for the linear '
+                        'evaluator).')
     p.add_argument('--compile', action='store_true',
                    help='Use torch.compile(mode=reduce-overhead) in the GPU '
                         'inference server. CUDA only; ignored elsewhere.')
@@ -381,10 +395,16 @@ def main():
     is_policy_only_model = ckpt_meta.get(
         'policy_only', 'value_fc2.weight' not in ckpt_meta['model'])
     del ckpt_meta
-    if is_policy_only_model and not args.feature_value_weights:
+    if is_policy_only_model and not (args.feature_value_weights
+                                      or args.value_head_path):
         raise SystemExit(
             f"Model '{args.model}' is policy_only but no value source. "
-            f"Pass --feature-value-weights for crisis MCTS replays.")
+            f"Pass --feature-value-weights or --value-head-path for crisis "
+            f"MCTS replays.")
+    if args.feature_value_weights and args.value_head_path:
+        raise SystemExit(
+            "--feature-value-weights and --value-head-path are mutually "
+            "exclusive. Pick one.")
 
     n_seeds = args.seed_end - args.seed_start
     print(f"Crisis Mining: {n_seeds} seeds ({args.seed_start}-{args.seed_end})",
@@ -490,12 +510,16 @@ def main():
                     num_simulations=args.recovery_sims,
                     batch_size=args.batch_size,
                     top_k=30, c_puct=2.5,
-                    feature_weights_path=args.feature_value_weights)
+                    feature_weights_path=args.feature_value_weights,
+                    value_head_path=args.value_head_path,
+                    q_weight=args.q_weight)
         for ti, (snapshot, replay_seed, sims, label) in enumerate(replay_tasks):
             result = replay_from_snapshot(
                 mcts, snapshot, replay_seed, sims,
                 args.continue_turns, args.max_turns,
-                feature_weights_path=args.feature_value_weights)
+                feature_weights_path=args.feature_value_weights,
+                value_head_path=args.value_head_path,
+                q_weight=args.q_weight)
             orig_seed = snapshot.get('original_seed', replay_seed)
             fname = f"game_seed{orig_seed}_{label}_score{result['score']}.json"
             with open(os.path.join(args.save_dir, fname), 'w') as f:
@@ -519,7 +543,8 @@ def main():
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
                                  max_batch_per_worker=args.batch_size,
-                                 use_compile=args.compile)
+                                 use_compile=args.compile,
+                                 value_head_path=args.value_head_path)
         server.start()
         try:
             # Phase 1: parallel policy probes via the server
@@ -618,7 +643,8 @@ def main():
                           server.request_queue, server.response_queues[i],
                           args.batch_size, srv_max_score,
                           args.continue_turns, args.max_turns,
-                          args.feature_value_weights))
+                          args.feature_value_weights, args.value_head_path,
+                          args.q_weight))
                 proc.start()
                 replay_workers.append(proc)
 
