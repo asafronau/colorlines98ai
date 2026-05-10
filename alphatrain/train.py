@@ -135,14 +135,13 @@ def main():
     print(f"Train: {n_train:,}, Val: {n_val:,}, max_score: {max_score:.0f}",
           flush=True)
 
-    model = AlphaTrainNet(num_blocks=args.num_blocks, channels=args.channels,
-                          policy_only=args.policy_only).to(device)
+    model = AlphaTrainNet(num_blocks=args.num_blocks,
+                          channels=args.channels).to(device)
     n_params = count_parameters(model)
     # channels_last gives better perf for small spatial dims on CUDA
     if device.type == 'cuda':
         model = model.to(memory_format=torch.channels_last)
-    head_str = " policy-only" if args.policy_only else ""
-    print(f"Model: {args.num_blocks}b x {args.channels}ch{head_str}, "
+    print(f"Model: {args.num_blocks}b x {args.channels}ch policy-only, "
           f"{n_params:,} params, {model.in_channels}ch input", flush=True)
 
     # Load weights BEFORE torch.compile (compile wraps state dict keys)
