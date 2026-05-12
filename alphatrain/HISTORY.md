@@ -2295,3 +2295,89 @@ no per-leaf head re-run. 16-worker eval at full speed.
      etc. — before assuming the component itself is broken. The "head
      doesn't work" hypothesis would have led to retraining or
      architecture changes; the actual fix was a CLI flag.
+
+### Phase 4 — Iteration 1: pillar2z + value_head_v12 (May 2026)
+
+First iteration of the proper AlphaZero loop with NN-driven self-play.
+
+**Pipeline:**
+1. Generator: pillar2y2 + value_head_v11 + q=2.0 (Phase 3R winner, mean 13,476).
+2. V12 corpus: 9.77M states from 450 self-play games (400 sims, 8K cap)
+   + 9,712 crisis recovery replays + 9,668 prevention replays
+   (recovery 15t/600 sims, prevention 35t/400 sims, continue 500t).
+   Crisis-heavy by design: 95% of corpus from failure-recovery
+   trajectories per Pillar 2u's "perfect player survives infinitely"
+   framing — only deaths matter.
+3. Pillar 2z training: warm-start from pillar2y2_epoch_40, batch 32768,
+   lr 3e-4, warmup 2 epochs, AMP + compile, `--policy-only`. Same
+   recipe as 2y A/B winner. Stopped at epoch 19 when 1000-game
+   policy-only evals plateaued.
+4. value_head_v12 retrained on **pillar2z's frozen backbone** using same
+   V11 survival targets, same 5-epoch recipe. Calibration r=0.89-0.94
+   across horizons (vs v11's 0.91-0.95).
+
+**Results (50 seeds × 400 sims × q=2.0 × 10K-turn cap):**
+
+| metric | pillar2y2 + v11_head (8K cap) | pillar2z + v12_head (10K cap) |
+|---|---|---|
+| Policy-only mean | 5,586 | **7,460** (+33%) |
+| MCTS mean | 13,964 | **15,465** (+11%) |
+| MCTS P10 | 5,397 | **5,992** (+11%) |
+| MCTS P50 | 16,440 (cap) | 20,004 (cap) |
+| MCTS %≥10K | 78% | **82%** |
+| MCTS %<1K | 1% | **0%** |
+
+The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
+8K-cap eval clips at ~16,400 while pillar2z's 10K-cap eval clips at
+~20,500. P10 and policy-only are the cap-clean comparison: both up
+~11-33%.
+
+137. **Iter 1 of NN-driven self-play works.** Policy-only +33% over
+     previous iter (5,586 → 7,460), MCTS +11% on cap-clean metrics.
+     This is the first time the AlphaZero loop has been demonstrated
+     for this project — each iteration's stronger player generates
+     stronger data, which produces a stronger next student. Earlier
+     attempts (pillar2g/2h era) failed because the generator was too
+     weak relative to the model; NN-MCTS at q=2.0 generates target-range
+     play that distills cleanly.
+
+138. **Value head MUST be retrained when the backbone moves.** The
+     value head is trained on FROZEN backbone features. When the
+     backbone changes (e.g., pillar2y2 → pillar2z via policy distillation
+     on V12), the head's training distribution shifts. Concretely:
+     pillar2z + value_head_v11 + q=2.0 produced a *bimodal* MCTS
+     distribution — half of games at P50 ~4,400 (catastrophic), half at
+     P75 ~15K (fine). The head was hallucinating value on positions where
+     pillar2z's features had drifted. Retraining the same architecture on
+     pillar2z's backbone (same V11 targets, same recipe, ~1.5h M5)
+     collapsed the bimodal failure into a smooth distribution. Cost is
+     small; ship this as a standard step in every iteration.
+
+139. **q_weight is robust across backbone retraining, at least here.**
+     Phase 3R established q=2.0 for pillar2y2 + v11_head. After
+     retraining the head on pillar2z's backbone, the q sweep
+     (200 sims × 50 seeds × 10K cap) showed:
+     - q=1.0: mean 9,885
+     - q=1.5: mean 9,780
+     - q=2.0: mean 12,509 ← clear winner
+     Same q wins. Saves a sweep per iteration if this generalizes — but
+     keep verifying since calibration metrics did shift slightly
+     (v12 r 0.89-0.94 vs v11 0.91-0.95).
+
+140. **At each iter, raise the eval cap.** Pillar2y2 was eval'd at 8K
+     cap (most games at cap). Pillar2z at 8K cap looked *worse* (mean
+     13,159) because the new policy could play more turns but ran out
+     of clock. At 10K cap pillar2z reveals its true mean 15,465 — most
+     metrics now at NEW cap (P75 = 20,436 cap-pinned). For Phase 5
+     (iter 2 with V13 corpus from pillar2z), plan to eval at 12-15K
+     cap. The cap moves with player strength; treat it as a method
+     constant per-iter, not project-constant.
+
+141. **The signal that "the iteration converged" is multi-metric, not
+     val_loss.** Pillar2z val_loss kept decreasing slowly through
+     epoch 19 (2.2237 → 2.2034). But policy-only 1000-game eval went
+     5,586 → 7,341 (e11) → 7,229 (e15) → 7,460 (e19) — essentially
+     plateaued from e11 onward. Loss said "keep training"; gameplay
+     said "stop." For distillation tasks, gameplay eval at 5-epoch
+     intervals is the right plateau detector. Don't burn 20 extra
+     epochs chasing val_loss reductions that don't translate to score.
