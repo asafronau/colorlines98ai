@@ -126,7 +126,7 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
 
         action, policy_target = result
 
-        top_indices = np.argsort(policy_target)[::-1][:5]
+        top_indices = np.argsort(policy_target)[::-1][:15]
         top_moves = []
         top_scores = []
         for idx in top_indices:

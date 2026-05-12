@@ -57,7 +57,7 @@ def save_game_json(result, save_dir):
 
 def play_selfplay_game(mcts, seed, temperature_moves=15,
                        dirichlet_alpha=0.3, dirichlet_weight=0.25,
-                       top_k_save=5, max_turns=0):
+                       top_k_save=15, max_turns=0):
     """Play one self-play game, recording raw board data for JSON output.
 
     Saves in the same format as Rust expert games so build_expert_v2_tensor.py
