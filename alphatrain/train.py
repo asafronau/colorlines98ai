@@ -21,22 +21,48 @@ def cross_entropy_soft(logits, targets):
     return -(targets * log_probs).sum(dim=-1).mean()
 
 
-def train_epoch(model, loader, optimizer, device, scaler=None, log_interval=100):
+def distillation_loss(logits, soft_targets, blend_alpha=1.0,
+                      target_temperature=1.0):
+    """Soft-CE on visit distribution, optionally blended with hard-CE on
+    the argmax and/or sharpened by temperature.
+
+    blend_alpha=1.0, target_temperature=1.0 → original soft CE (V12 baseline).
+    blend_alpha=0.7 → 70% soft + 30% hard CE on the teacher's top move.
+    target_temperature=0.5 → sharpen targets: targets**(1/T) renormalized.
+    """
+    if target_temperature != 1.0:
+        sharp = soft_targets.pow(1.0 / target_temperature)
+        sharp = sharp / sharp.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        soft_targets = sharp
+    log_probs = F.log_softmax(logits, dim=-1)
+    soft = -(soft_targets * log_probs).sum(dim=-1).mean()
+    if blend_alpha >= 1.0:
+        return soft
+    argmax_idx = soft_targets.argmax(dim=-1)
+    hard = F.cross_entropy(logits, argmax_idx)
+    return blend_alpha * soft + (1.0 - blend_alpha) * hard
+
+
+def train_epoch(model, loader, optimizer, device, scaler=None, log_interval=100,
+                blend_alpha=1.0, target_temperature=1.0,
+                amp_dtype=torch.float32):
     model.train()
     total_loss = 0
     n = 0
     t0 = time.time()
-    use_amp = scaler is not None
+    use_amp = amp_dtype != torch.float32
 
     for bi, batch in enumerate(loader):
         obs, pol_tgt = batch
         obs = obs.to(device)
         pol_tgt = pol_tgt.to(device)
 
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(obs)
             pol_logits = out[0] if isinstance(out, tuple) else out
-            loss = cross_entropy_soft(pol_logits, pol_tgt)
+            loss = distillation_loss(pol_logits, pol_tgt,
+                                     blend_alpha=blend_alpha,
+                                     target_temperature=target_temperature)
 
         optimizer.zero_grad(set_to_none=True)
         if use_amp:
@@ -65,16 +91,17 @@ def train_epoch(model, loader, optimizer, device, scaler=None, log_interval=100)
 
 
 @torch.no_grad()
-def validate(model, loader, device, use_amp=False):
+def validate(model, loader, device, amp_dtype=torch.float32):
     model.eval()
     total_loss = 0
     n = 0
+    use_amp = amp_dtype != torch.float32
 
     for obs, pol_tgt in loader:
         obs = obs.to(device)
         pol_tgt = pol_tgt.to(device)
 
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(obs)
             pol_logits = out[0] if isinstance(out, tuple) else out
             loss = cross_entropy_soft(pol_logits, pol_tgt)
@@ -105,6 +132,13 @@ def main():
     p.add_argument('--save-dir', default='checkpoints/alphatrain')
     p.add_argument('--copy-to', type=str, default=None)
     p.add_argument('--num-workers', type=int, default=8)
+    p.add_argument('--blend-alpha', type=float, default=1.0,
+                   help='Distillation blend: alpha*soft_CE + (1-alpha)*hard_CE '
+                        '(hard CE on teacher argmax). 1.0=pure soft (V12 default), '
+                        '0.7=mostly soft + 30%% hard, 0.5=equal blend.')
+    p.add_argument('--target-temperature', type=float, default=1.0,
+                   help='Sharpen MCTS visit targets via t**(1/T) renormalized. '
+                        '1.0=no change (V12 default), 0.5=peakier targets.')
     p.add_argument('--policy-only', action='store_true',
                    help='Train without value head (V10+ models). Smaller '
                         'checkpoint, ~5-10% faster forward. Backbone and '
@@ -211,10 +245,23 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
     use_amp = args.amp and device.type == 'cuda'
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    # Prefer bf16 on Hopper/Ampere (better numerical range, same speed as fp16).
+    # Falls back to fp16 on older CUDA. bf16 doesn't need GradScaler.
+    if use_amp and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+        scaler = None
+    elif use_amp:
+        amp_dtype = torch.float16
+        scaler = torch.amp.GradScaler('cuda')
+    else:
+        amp_dtype = torch.float32
+        scaler = None
     if use_amp:
-        print("AMP enabled", flush=True)
+        print(f"AMP enabled (dtype={amp_dtype})", flush=True)
 
+    if args.blend_alpha != 1.0 or args.target_temperature != 1.0:
+        print(f"Distillation: blend_alpha={args.blend_alpha}, "
+              f"target_temperature={args.target_temperature}", flush=True)
     print(f"\n=== Training {args.epochs} epochs ===", flush=True)
     t0 = time.time()
 
@@ -223,8 +270,11 @@ def main():
         lr = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {epoch+1}/{args.epochs} (lr={lr:.2e})", flush=True)
 
-        tl = train_epoch(model, train_loader, optimizer, device, scaler=scaler)
-        vl = validate(model, val_loader, device, use_amp=use_amp)
+        tl = train_epoch(model, train_loader, optimizer, device, scaler=scaler,
+                         blend_alpha=args.blend_alpha,
+                         target_temperature=args.target_temperature,
+                         amp_dtype=amp_dtype)
+        vl = validate(model, val_loader, device, amp_dtype=amp_dtype)
         scheduler.step()
 
         print(f"  Train: loss={tl:.4f}", flush=True)

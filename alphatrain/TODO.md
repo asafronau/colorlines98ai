@@ -112,6 +112,61 @@ linear evaluator*. Diagnose before retraining anything.
   (MCTS+oracle); validation rollouts are policy-only greedy. Different
   policies — diagnostic mismatch baked in.
 
+### Phase 4.5: Distillation-objective ablations on V12 (BEFORE iter 2)
+
+Test cheap objective/loss-shape changes on the **existing V12 tensor** before
+committing to V13 self-play generation (which costs ~5 days wall on M5).
+Each variant trains 20 epochs from pillar2y2 warm-start. ~6h H100 each
+(~$15-20). If a variant improves pol-only mean ≥5%, fold into iter 2.
+
+**Variants (only 2 per user request):**
+
+- [ ] **2za — hard/soft blend.** Train with `--blend-alpha 0.7`:
+  `loss = 0.7·CE(soft_visits) + 0.3·CE(argmax)`. Addresses the
+  "policy matches distribution shape but picks 2nd-best at argmax"
+  failure mode by directly penalizing top-1 disagreement.
+- [ ] **2zb — target sharpening.** Train with `--target-temperature 0.5`:
+  `targets**(1/T)` renormalized before CE. Peakier teacher targets force
+  the student to commit. Risk: amplifies teacher noise on close calls.
+
+**Skipped variant — top-K=15 visits:**
+Would require regenerating V12 game data — selfplay.py + crisis_mining.py
+hardcode top_k_save=5 in JSON output. For V13 generation, bump
+top_k_save to 15 in both scripts so this variant becomes testable later
+without further regen.
+
+**Code already in place:**
+- `train.py` has `--blend-alpha` and `--target-temperature` flags
+  (defaults 1.0/1.0 = V12 baseline). `distillation_loss()` implements
+  both. Tests pass.
+
+**Eval plan per variant:**
+- 1000-game policy-only eval on M5 (~1h)
+- 50-game MCTS @ q=2.0, 400 sims, 10K cap on M5 (~3h)
+- Compare to pillar2z baseline (pol mean 7,460 / MCTS mean 15,465)
+
+### Phase 4.6: H100 throughput speedup (optional, after 4.5)
+
+Current H100 throughput is ~75K samples/sec @ batch 32768 → ~17 min/epoch.
+That's ~11% of theoretical peak (94 TFLOPs/step × 2.3 steps/sec = 107 TFLOPS
+achieved vs H100's 990 TFLOPS peak). Bottleneck is small spatial dim (9×9)
+inefficient for cuDNN convolutions + per-batch observation building in
+collate.
+
+**Speedup options (ordered by expected ROI):**
+
+- [ ] **Batch 65536 on H100** — should fit (80GB VRAM). 2× batch
+  amortizes kernel-launch overhead. Expected: 1.3-1.7× throughput.
+  Cost: ~1 line change. May need lr re-tune (sqrt scaling → 4.2e-4).
+- [ ] **Precompute observations** in `build_expert_v2_tensor.py` — store
+  18-channel obs directly. Eliminates per-batch obs building (the 20-iter
+  component-labeling loop in `dataset.py:298`). Tensor grows from 5.8GB
+  to ~28GB (fp16) or ~57GB (fp32). Expected: 30-50% throughput gain.
+- [ ] **Explicit bf16 autocast** — confirm `--amp` on H100 picks bf16.
+  Add `dtype=torch.bfloat16` to autocast call if not. ~5% gain.
+- [ ] **Profile** with `torch.profiler` to confirm bottleneck before
+  doing the precompute work.
+
 ### Known Issues
 
 - [ ] **GPU server mode -14% quality gap with multi-worker**: 16-worker MCTS scores
