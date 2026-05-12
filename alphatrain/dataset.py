@@ -194,6 +194,16 @@ class TensorDatasetGPU(Dataset):
         self.pol_values = data['pol_values'].to(self.device)
         self.max_score = float(data['max_score'])
 
+        # Precomputed 18-channel obs (fp16) skips the costly per-batch
+        # _build_obs_core call. ~14GB on VRAM at 9.77M states.
+        if 'obs_precomputed' in data:
+            self.obs_precomputed = data['obs_precomputed'].to(self.device)
+            print(f"  Loaded obs_precomputed: "
+                  f"{self.obs_precomputed.numel() * self.obs_precomputed.element_size() / 1e9:.1f}GB",
+                  flush=True)
+        else:
+            self.obs_precomputed = None
+
         self.augment = augment
         self.augment_factor = 8 if augment else 1
         n = self.boards.shape[0]
@@ -237,8 +247,11 @@ class TensorDatasetGPU(Dataset):
         B = len(indices)
         boards = self.boards[base_indices]  # (B, 9, 9)
 
-        # Build 18-channel observations on GPU
-        obs = self._build_obs_gpu(boards, base_indices)
+        # Build 18-channel observations on GPU (or use precomputed if available).
+        if self.obs_precomputed is not None:
+            obs = self.obs_precomputed[base_indices].float()
+        else:
+            obs = self._build_obs_gpu(boards, base_indices)
 
         # Sparse -> dense policy
         policy = torch.zeros(B, NUM_MOVES, device=self.device)
