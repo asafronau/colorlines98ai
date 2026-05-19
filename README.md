@@ -6,16 +6,20 @@ An AlphaZero-inspired AI for [Color Lines 98](https://en.wikipedia.org/wiki/Line
 
 ## Results
 
-| Player | Mean | Median | P10 | Cap-hit | Search |
+| Player | Mean | Median | P95 | %<1000 | Search |
 |--------|---:|---:|---:|---:|--------|
-| Heuristic (tournament bracket, 200 rollouts) | 5,700 | — | — | n/a | CPU rollouts (no cap) |
-| **Neural policy standalone — pillar2y_epoch_15** (500 seeds) | **5,102** | 3,509 | 988 | n/a | None (single forward pass) |
-| **Neural MCTS @ 400 sims — pillar2x2_epoch_10** (50 seeds) | **7,825** | 10,230 | 2,862 | 56% | feature-value MCTS |
-| **Neural MCTS @ 600 sims — pillar2x2_epoch_10** (50 seeds) | **8,337** | 10,354 | 2,363 | 64% | feature-value MCTS |
+| Heuristic (tournament bracket, 200 rollouts) | 5,700 | — | — | — | CPU rollouts (no cap) |
+| **Policy standalone — pillar2z_epoch_19** (1,000 seeds) | **7,460** | 5,052 | 20,754 | 6.8% | None |
+| **Policy standalone — B_smoke_epoch_12** (500 seeds) | **8,043** | 5,736 | 21,495 | 5.0% | None ← **new best** |
+| **Policy standalone — B_smoke_epoch_12** (100 seeds) | **9,051** | 6,670 | 24,965 | 3.0% | None |
+| **MCTS @ 400 sims — pillar2z_epoch_19** (50 seeds) | **15,465** | 20,004 (cap) | — | 0% | feature-value MCTS, value_head_v12, q=2.0 |
+| **MCTS @ 100 sims — B_smoke_epoch_12** (100 seeds) | **8,700** | 8,178 | 16,510 (cap) | 6.0% | value_head_v12 — **MCTS now hurts B by 4%** |
 
-MCTS evaluations run with a 5,000-turn cap (~10,500-point ceiling); when a game survives the cap it's truncated, so reported `Mean` is compressed and `Max` would be misleading (a hypothetical uncapped game scores arbitrarily higher). `Median` + `P10` + `Cap-hit %` describe the distribution more honestly. The 1,600-sim bucket is dropped — at this player strength 600 sims matches or exceeds 1,600 (HISTORY lessons 124–126), and the standalone policy alone reaches 43,656 max on uncapped games.
+The B_smoke_epoch_12 standalone policy is the current best deployable. Notably, MCTS at 100 sims with the existing value head *hurts* B's mean by 4% (P95 capped at the 8K-turn limit while policy P95 reaches 24,965 uncapped). The value head, which is bounded by `max_score≈30K`, saturates once the policy can score above that — see HISTORY lessons 148-149. The next value head must use a non-saturating target (pairwise BPR, survival probability, or discounted TD).
 
-Neural MCTS @ 600 exceeds the heuristic mean by 46%; standalone policy alone is now within 10% of the heuristic without any search. Score progression across training iterations:
+MCTS evaluations have used 5K to 10K turn caps; reported `Median` is often cap-pinned (HISTORY lesson 140). At each iteration the cap moves with player strength.
+
+Score progression across training iterations:
 
 | Iteration | Policy Mean | Key Change |
 |-----------|------------|------------|
@@ -26,7 +30,12 @@ Neural MCTS @ 600 exceeds the heuristic mean by 46%; standalone policy alone is 
 | 2X | 3,450 | First V10 run (feature-value MCTS data, lr=1e-4, policy-only model) |
 | 2X2 | **4,110** | V10 with lr=3e-4 — same data, +19% over 2X |
 | 2Y | **5,102** | V11 corpus (7.78M states, feature-value MCTS @ 600 sims), 15 epochs, lr=3e-4 — +24% over 2X2 |
-| 2Y2 | (training) | Same V11 corpus, 40-epoch retrain to fix early cosine cooldown |
+| 2Y2 (ep40) | **5,586** | Same V11 corpus, 40-epoch retrain — feeds V12 generation |
+| 2Z (ep19) | **7,460** | V12 corpus (9.77M states, pillar2y2 + value_head_v11 NN-MCTS @ 400 sims, q=2.0) — first NN-driven AlphaZero loop |
+| Path B v1 — A | **7,752** | V12 distill + clean train/val split + warmup=1 + sample-time aug (no oracle) — pipeline-only fix gave +9% over 2z |
+| Path B v1 — B | **8,043** | A + `--color-augment` (7! color symmetry) — +4% over A. **Current best.** |
+| Path B v1 — C/D (oracle) | 7,060 / 7,396 | A + B + oracle as soft-KL aux loss at λ=0.05/0.10 — empirically harmful at convergence (HISTORY 143-145). Killed branch. |
+| Path B v2 (next) | TBD | Oracle-style mining on B-distribution, K=128 common-RNG, hard CE on rollout-winner. Decision criterion: ≥+8% over B (≥8,700) |
 
 ## Architecture
 

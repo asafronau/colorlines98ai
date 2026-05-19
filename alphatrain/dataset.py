@@ -173,40 +173,92 @@ def _build_dihedral_luts():
 _OBS_LUTS, _POL_LUTS = _build_dihedral_luts()
 
 
+# Shared tensor cache: load same tensor file once, share across train/val
+# datasets so we don't duplicate GPU memory for the heavy fields.
+_BACKING_CACHE = {}
+
+
+def _load_backing(tensor_path, device):
+    key = (tensor_path, str(device))
+    cached = _BACKING_CACHE.get(key)
+    if cached is not None:
+        return cached
+    print(f"Loading tensors to {device}...", flush=True)
+    t0 = time.time()
+    data = torch.load(tensor_path, weights_only=True)
+    dev = torch.device(device)
+    backing = {
+        'boards': data['boards'].to(dev),
+        'next_pos': data['next_pos'].to(dev),
+        'next_col': data['next_col'].to(dev),
+        'n_next': data['n_next'].to(dev),
+        'pol_indices': data['pol_indices'].to(dev),
+        'pol_values': data['pol_values'].to(dev),
+        'max_score': float(data['max_score']),
+    }
+    if 'obs_precomputed' in data:
+        backing['obs_precomputed'] = data['obs_precomputed'].to(dev)
+    else:
+        backing['obs_precomputed'] = None
+    n = backing['boards'].shape[0]
+    print(f"  Loaded {n:,} base states in {time.time()-t0:.1f}s", flush=True)
+    _BACKING_CACHE[key] = backing
+    return backing
+
+
 class TensorDatasetGPU(Dataset):
     """GPU-resident dataset with on-the-fly 18-channel observation building.
 
     Stores compact board data on GPU. The collate function builds observations,
     applies augmentation, and reconstructs sparse policy targets -- all on GPU.
+
+    Augmentation is sample-time random (not indexed), so train and val can
+    share the same backing tensors with different base_indices. Two
+    symmetries are exploited:
+      - dihedral (8 transforms of the 9x9 board)
+      - color permutation (7! relabelings of the 7 ball colors)
+
+    Both are full symmetries of the game; policy targets are unchanged under
+    color permutation, but dihedral remaps source/target cells via pol_lut.
     """
 
-    def __init__(self, tensor_path, augment=True, device='cuda'):
-        print(f"Loading tensors to {device}...", flush=True)
-        t0 = time.time()
-        data = torch.load(tensor_path, weights_only=True)
-
+    def __init__(self, tensor_path, *, base_indices=None,
+                 augment=True, color_augment=False,
+                 augment_factor=8, device='cuda'):
+        """
+        Args:
+            tensor_path: path to precomputed tensor file
+            base_indices: torch LongTensor selecting which base states this
+                dataset sees (default: all). Train and val must pass disjoint
+                base_indices to avoid leakage.
+            augment: enable random per-sample dihedral transform
+            color_augment: enable random per-sample color permutation
+            augment_factor: epoch length multiplier when augmenting. Random
+                transforms differ each pass over the same base state, so this
+                controls how many augmented views per epoch.
+        """
+        backing = _load_backing(tensor_path, device)
         self.device = torch.device(device)
-        self.boards = data['boards'].to(self.device)
-        self.next_pos = data['next_pos'].to(self.device)
-        self.next_col = data['next_col'].to(self.device)
-        self.n_next = data['n_next'].to(self.device)
-        self.pol_indices = data['pol_indices'].to(self.device)
-        self.pol_values = data['pol_values'].to(self.device)
-        self.max_score = float(data['max_score'])
+        self.boards = backing['boards']
+        self.next_pos = backing['next_pos']
+        self.next_col = backing['next_col']
+        self.n_next = backing['n_next']
+        self.pol_indices = backing['pol_indices']
+        self.pol_values = backing['pol_values']
+        self.max_score = backing['max_score']
+        self.obs_precomputed = backing['obs_precomputed']
 
-        # Precomputed 18-channel obs (fp16) skips the costly per-batch
-        # _build_obs_core call. ~14GB on VRAM at 9.77M states.
-        if 'obs_precomputed' in data:
-            self.obs_precomputed = data['obs_precomputed'].to(self.device)
-            print(f"  Loaded obs_precomputed: "
-                  f"{self.obs_precomputed.numel() * self.obs_precomputed.element_size() / 1e9:.1f}GB",
-                  flush=True)
+        n_total = self.boards.shape[0]
+        if base_indices is None:
+            self.base_indices = torch.arange(n_total, device=self.device,
+                                              dtype=torch.long)
         else:
-            self.obs_precomputed = None
+            self.base_indices = base_indices.to(self.device,
+                                                 dtype=torch.long)
 
         self.augment = augment
-        self.augment_factor = 8 if augment else 1
-        n = self.boards.shape[0]
+        self.color_augment = color_augment
+        self.augment_factor = augment_factor if augment else 1
 
         # Dihedral LUTs on GPU
         self._obs_luts = torch.tensor(
@@ -214,7 +266,7 @@ class TensorDatasetGPU(Dataset):
         self._pol_luts = torch.tensor(
             np.stack(_POL_LUTS), dtype=torch.long, device=self.device)
 
-        # Neighbor table for connected components (cached, not rebuilt per batch)
+        # Neighbor table for connected components
         neighbors = torch.full((81, 4), -1, dtype=torch.long, device=self.device)
         for r in range(9):
             for ci in range(9):
@@ -227,48 +279,109 @@ class TensorDatasetGPU(Dataset):
                         ni += 1
         self._neighbors = neighbors
 
-        print(f"Loaded {n:,} states in {time.time()-t0:.1f}s "
-              f"(x{self.augment_factor} = {n * self.augment_factor:,} effective)",
+        n_base = len(self.base_indices)
+        n_eff = n_base * self.augment_factor
+        print(f"  TensorDataset: base={n_base:,} aug_factor={self.augment_factor} "
+              f"effective={n_eff:,} color_aug={color_augment}",
               flush=True)
 
     def __len__(self):
-        return self.boards.shape[0] * self.augment_factor
+        return len(self.base_indices) * self.augment_factor
 
     def __getitem__(self, idx):
         return idx
 
     @torch.no_grad()
     def collate(self, indices):
-        """Build batch on GPU: observations + policy targets."""
-        indices = torch.tensor(indices, dtype=torch.long, device=self.device)
-        base_indices = indices // self.augment_factor
-        transforms = indices % self.augment_factor
+        """Build batch on GPU: observations + policy targets.
 
-        B = len(indices)
-        boards = self.boards[base_indices]  # (B, 9, 9)
+        Augmentation is randomized per-sample (different each call), so the
+        index modulo augment_factor is unused. Same base state seen multiple
+        times per epoch gets different transforms, which is the point.
+        """
+        items = torch.tensor(indices, dtype=torch.long, device=self.device)
+        B = len(items)
+        # Map sample index -> base index via self.base_indices
+        base_pos = items // self.augment_factor
+        base_idx = self.base_indices[base_pos]
 
-        # Build 18-channel observations on GPU (or use precomputed if available).
-        if self.obs_precomputed is not None:
-            obs = self.obs_precomputed[base_indices].float()
+        boards = self.boards[base_idx]  # (B, 9, 9), int8 in [0,7]
+        next_pos = self.next_pos[base_idx]  # (B, 3, 2)
+        next_col = self.next_col[base_idx]  # (B, 3), int8 in [0,7]
+        n_next = self.n_next[base_idx]  # (B,)
+
+        # ── Color augmentation (before obs build, before precomputed lookup) ──
+        # Per-sample random permutation of color labels {1..7}; 0 (empty) stays 0.
+        # Policy targets are color-invariant (move indices don't depend on color),
+        # so no remapping needed for the policy side.
+        if self.color_augment:
+            # perm[b, c] = new color label for old color c (c in 0..7).
+            # perm[:, 0] = 0 (empty stays empty); perm[:, 1..7] is a random perm of 1..7.
+            perm_1_7 = torch.argsort(torch.rand(B, 7, device=self.device),
+                                       dim=1) + 1  # (B, 7), values 1..7
+            perm = torch.zeros(B, 8, dtype=torch.long, device=self.device)
+            perm[:, 1:8] = perm_1_7
+            # Apply to boards (B, 9, 9): gather per-sample lookup
+            boards_flat = boards.long().view(B, -1)  # (B, 81)
+            boards = torch.gather(perm, 1, boards_flat).view(B, 9, 9).to(torch.int8)
+            # Apply to next_col (B, 3)
+            next_col = torch.gather(perm, 1, next_col.long()).to(torch.int8)
+            # obs_precomputed cache is invalidated under color perm; fall back
+            # to rebuild from permuted board.
+            use_precomputed = False
         else:
-            obs = self._build_obs_gpu(boards, base_indices)
+            use_precomputed = self.obs_precomputed is not None
 
-        # Sparse -> dense policy
+        # ── Build 18-channel observations ──
+        if use_precomputed:
+            obs = self.obs_precomputed[base_idx].float()
+        else:
+            obs = self._build_obs_core(boards, next_pos=next_pos,
+                                         next_col=next_col, n_next=n_next)
+
+        # ── Sparse -> dense policy ──
         policy = torch.zeros(B, NUM_MOVES, device=self.device)
-        pol_idx = self.pol_indices[base_indices]
-        pol_val = self.pol_values[base_indices]
+        pol_idx = self.pol_indices[base_idx]
+        pol_val = self.pol_values[base_idx]
         policy.scatter_(1, pol_idx, pol_val)
 
-        # Apply dihedral augmentation
-        for t in range(1, 8 if self.augment else 1):
-            mask = transforms == t
-            if not mask.any():
-                continue
-            obs[mask] = obs[mask].reshape(-1, NUM_CHANNELS, 81
-                )[:, :, self._obs_luts[t]].reshape(-1, NUM_CHANNELS, 9, 9)
-            policy[mask] = policy[mask][:, self._pol_luts[t]]
+        # ── Dihedral augmentation: per-sample random transform ──
+        if self.augment:
+            transforms = torch.randint(0, 8, (B,), device=self.device,
+                                         dtype=torch.long)
+            for t in range(1, 8):
+                mask = transforms == t
+                if not mask.any():
+                    continue
+                obs[mask] = obs[mask].reshape(-1, NUM_CHANNELS, 81
+                    )[:, :, self._obs_luts[t]].reshape(-1, NUM_CHANNELS, 9, 9)
+                policy[mask] = policy[mask][:, self._pol_luts[t]]
 
         return obs, policy
+
+    @classmethod
+    def make_train_val_split(cls, tensor_path, *, val_split=0.05,
+                              augment=True, color_augment=True,
+                              augment_factor=8, device='cuda', seed=42):
+        """Build train/val datasets with disjoint base_indices and shared backing.
+
+        Returns (train_set, val_set). Train uses both augmentations;
+        val is unaugmented for honest validation loss.
+        """
+        backing = _load_backing(tensor_path, device)
+        n = backing['boards'].shape[0]
+        g = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(n, generator=g)
+        n_val = max(1, int(n * val_split))
+        val_base = perm[:n_val]
+        train_base = perm[n_val:]
+        train = cls(tensor_path, base_indices=train_base,
+                     augment=augment, color_augment=color_augment,
+                     augment_factor=augment_factor, device=device)
+        val = cls(tensor_path, base_indices=val_base,
+                   augment=False, color_augment=False,
+                   augment_factor=1, device=device)
+        return train, val
 
     def _build_obs_core(self, boards, next_pos=None, next_col=None, n_next=None):
         """Build (B, 18, 9, 9) observations on GPU.

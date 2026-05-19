@@ -2381,3 +2381,145 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      said "stop." For distillation tasks, gameplay eval at 5-epoch
      intervals is the right plateau detector. Don't burn 20 extra
      epochs chasing val_loss reductions that don't translate to score.
+
+142. **Phase 1 oracle mining: 16,897 K=32 rollout-judged crisis anchors.**
+     Built `phase1_oracle_fleet.py` (numba JIT, M5 baseline) and
+     `phase1_oracle_fleet_gpu.py` (PyTorch + cudagraphs, Colab L4). The
+     M5 JIT version reaches 65 rollouts/sec; the L4 GPU version with
+     fixed-horizon batched mining + a single concat-compiled
+     pre+forward+post step reaches ~70 r/s once cudagraphs stabilize.
+     Output: per-anchor top-6 moves × K=32 rollouts × H=300, labeled
+     with cap_rate / mean_turns / mean_score from pillar2y2 anchors.
+
+143. **Path B v1: oracle as soft-KL auxiliary loss. FAILED.** Designed
+     with ChatGPT input: reliability-weighted conditional KL on top-6
+     candidates, β=10, λ ∈ {0.05, 0.10}, warm-start from pillar2y2_ep40,
+     same V12 corpus and recipe as pillar2z but with a new pipeline
+     (clean train/val split + sample-time random augmentation +
+     `--color-augment` + `--warmup-epochs 1`). Four-run ablation
+     A/B/C/D × 12 epochs each, ~3-4h Colab L4 per run:
+
+     | run | recipe | ep12 policy mean |
+     |---|---|---|
+     | pillar2z (reference) | V12 distill, leaky split, warmup=2 | ~7,158 |
+     | A | + new split + warmup=1 | **7,752** |
+     | B | + color aug | **8,043** ← NEW BEST |
+     | C | + oracle λ=0.05 (soft KL) | 7,060 |
+     | D | + oracle λ=0.10 (soft KL) | 7,396 |
+
+     **The oracle path is empirically harmful at convergence.** C/D
+     peaked at epochs 5-7 (similar to B's mid-training) then regressed
+     while B kept improving. By ep12, both oracle arms finished BELOW
+     the no-oracle pipeline. λ=0.10 fades less than λ=0.05 but
+     neither beats no-oracle.
+
+144. **The new pipeline is the real win, not the oracle.** A_ep12
+     beating pillar2z (+8.3%) and B_ep12 beating A (+3.8%) are the
+     entire empirical lift. The deltas are dominated by:
+     (1) clean train/val split (`make_train_val_split`) — previously
+     `random_split` over augmented indices leaked dihedral variants
+     from train into val, smoothing the val curve and selecting
+     mid-training as "best" via val_loss criterion;
+     (2) sample-time random dihedral + color permutation augmentation
+     instead of indexed-deterministic 8× expansion;
+     (3) `--color-augment` flag (7! color-permutation symmetry of the
+     game). The combination probably gets ~5-10% from honest val and
+     5-7% from augmentation variety. Color aug alone (B vs A) is
+     ~+4% with statistical significance ~2σ at 500 seeds.
+
+145. **Soft KL doesn't preserve discrete argmax flips at convergence.**
+     C's oracle metrics through training tell a clean story:
+     `KL_weighted` improved monotonically (1.07 → 1.06, beats pillar2z's
+     1.06 plateau) AND `top1_all` rose 34% → 37%, BUT the discrete
+     `top1≥.15` (model picks oracle's choice on high-margin anchors)
+     peaked at 5.8% (ep7) and regressed to 2.9% (ep11). The model
+     learns *average* oracle distribution but doesn't *commit* to
+     specific corrections. Path B v2 will use hard CE on
+     rollout-winner instead.
+
+146. **BN-contamination hypothesis (from ChatGPT) — diagnostic
+     DISPROVEN.** Hypothesis: concat-batch training updates BN running
+     stats from the 11% crisis-distribution oracle observations, so
+     BN drifts from V12 → mixed; deploying with mixed-BN MCTS pruned
+     B's good moves. We wrote `recalibrate_bn.py` to forward 500
+     V12-only batches through C_ep5/7/11/12 and update BN stats to
+     pure-V12 distribution, then re-evaled gameplay:
+
+     | epoch | C non-recal | C_bn recal | Δ |
+     |---|---|---|---|
+     | 5 | 6,468 | 5,952 | **−8.0%** (~3.8σ) |
+     | 7 | 7,345 | 6,963 | **−5.2%** (~2.9σ) |
+     | 11 | 7,233 | 6,740 | **−6.8%** (~3.7σ) |
+
+     Recalibration *hurt* uniformly, not helped. The mixed-distribution
+     BN running stats were either neutral or positively contributing
+     to gameplay. Lesson: don't over-correct based on theory alone.
+     The diagnostic was easy to write (~150 LOC) and gave a definitive
+     answer in ~15 min M5.
+
+147. **Multi-loss gradient diagnostic must use a SINGLE concat-forward,
+     not two separate forwards.** Our first gradient-norm diagnostic
+     ran V12 and oracle forwards separately on their own batches, then
+     captured g_v12 and g_oracle. Result said:
+     `‖g_v12‖=0.31, ‖g_oracle‖=4.89` at λ=0.05, cos ≈ −0.06 (mild
+     conflict in deep backbone). ChatGPT flagged: training does ONE
+     concat forward, so BN normalizes mixed-batch statistics across
+     both losses. Re-running with proper single-forward +
+     `loss.backward(retain_graph=True)` for both gave:
+     `‖g_v12‖=0.66, ‖g_oracle‖=1.94, cos = +0.51`. Headline reversed:
+     oracle was in "effective range" and POSITIVELY aligned with V12,
+     not orthogonal or conflicting. Generalizable lesson: when
+     measuring component gradients of a multi-loss training, match
+     the actual training forward exactly. BN snapshot/restore across
+     batches keeps the diagnostic non-mutating.
+
+148. **MCTS@100 sims now hurts the strong policy.** Ran B_ep12 through
+     `eval_parallel` with `value_head_v12_v12targets` + q=2.0 + 100
+     sims + 100 seeds:
+
+     | metric | policy-only | MCTS@100 |
+     |---|---|---|
+     | mean | 9,051 | 8,700 (−4%) |
+     | P50 | 6,670 | 8,178 |
+     | P95 | **24,965** | **16,510** (8K-turn cap) |
+
+     The value head saturates at max_score ≈ 30K. B_ep12 routinely
+     reaches 25K+ in long games. MCTS sees `V(state_A) ≈ V(state_B)`
+     because the head can't distinguish "this leads to 25K" from "this
+     leads to 40K" — both clipped at max_score. So MCTS prunes B's
+     best moves. The asymmetric MCTS effect (floor improves, ceiling
+     collapses) is consistent with "value head still discriminates bad
+     states but can't tell good states apart." This finally proves
+     empirically what the project had suspected since Pillar 3a-v3:
+     value head is the bottleneck for further MCTS-driven progress.
+
+149. **Score-regression value targets cannot scale past expert-level
+     policy.** Color Lines is effectively an infinite game for a
+     strong-enough player (board resets via line clears). Any
+     score-based regression target (final score, TD return γ→1,
+     cumulative survival) is bounded by `max_score`. Once the policy
+     reaches scores near that bound (B_ep12 reaches 30K+ in long
+     games), the value head's prediction saturates and the loss
+     landscape provides no gradient distinguishing "good" from
+     "great." All four trained value heads (v11 single-trajectory,
+     v12 V11-targets, density head, spatial ranking head v3-v3a)
+     saturated for the same reason. **The next value head must use a
+     bounded-but-non-saturating target: pairwise/BPR ranking, finite
+     survival probability, or discounted TD with γ ≤ 0.9.** Tracked
+     in memory `project_path_b_v2.md`.
+
+150. **Pivot decision: Path B v2 — oracle mining for POLICY, not value
+     head.** With value head saturated and deployment target being
+     policy-only (30K policy-only median per TODO), the cleanest path
+     forward is direct policy improvement via state-level rollout
+     judgment, applied on B_ep12's own distribution. Two-stage mining:
+     cheap K=16-24 screen on ~6-10K stratified anchors (60% crisis,
+     25% uncertain, 15% diverse-healthy), then K=128 on the ~1-1.5K
+     promising candidates. Train next iteration with hard CE on
+     rollout-winner at high-margin anchors. Decision criterion: ≥+8%
+     over B_ep12 (≥8,700 mean on 500-seed policy eval). If it fails,
+     we've hit the single-iteration ceiling for this corpus and need
+     a structurally different ingredient (bigger model, different
+     observation, retrained non-saturating value head). Scripts staged
+     (`gen_b_selfplay.py`, `sample_b_anchors.py`, audit running);
+     mining + training to follow.

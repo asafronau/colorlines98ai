@@ -163,14 +163,31 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     # combined forward function below.
     value_head = None
     horizon_weights = None
+    value_head_target_type = 'survival'
+    value_head_type = 'value_head'
     if value_head_path is not None:
         from alphatrain.value_head import (
-            load as load_vh, DEFAULT_HORIZON_WEIGHTS)
-        value_head, _ = load_vh(value_head_path, device=device)
+            load_any, DEFAULT_HORIZON_WEIGHTS)
+        value_head, ckpt_meta, value_head_type = load_any(
+            value_head_path, device=device)
         value_head = value_head.half()
-        horizon_weights = torch.tensor(
-            DEFAULT_HORIZON_WEIGHTS, dtype=torch.float16, device=device)
-        print(f"  ValueHead loaded from {value_head_path}", flush=True)
+        value_head_target_type = ckpt_meta.get('target_type', 'survival')
+        if value_head_type == 'spatial':
+            horizon_weights = None
+            print(f"  SpatialValueHead loaded from {value_head_path} "
+                  f"(scalar V, no horizon weighting)", flush=True)
+        elif value_head_target_type == 'density':
+            density_weights = (0.5, 0.3, 0.2)
+            horizon_weights = torch.tensor(
+                density_weights, dtype=torch.float16, device=device)
+            print(f"  ValueHead (DENSITY mode) loaded from {value_head_path}, "
+                  f"horizons={ckpt_meta.get('horizons')}, "
+                  f"weights={density_weights}", flush=True)
+        else:
+            horizon_weights = torch.tensor(
+                DEFAULT_HORIZON_WEIGHTS, dtype=torch.float16, device=device)
+            print(f"  ValueHead (survival mode) loaded from {value_head_path}",
+                  flush=True)
 
     # CUDA-only: convert weights + activations to channels_last (NHWC).
     # ResNets on Ampere/Ada are 1.3-2x faster in NHWC because cuDNN
@@ -189,21 +206,49 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
 
     # Forward callable: either policy-only or fused (policy + scalar V).
     if value_head is not None:
-        class _PolicyValueWrapper(torch.nn.Module):
-            def __init__(self, net, head, hw):
-                super().__init__()
-                self.net = net
-                self.head = head
-                self.register_buffer('hw', hw)
+        # 'spatial' => raw scalar, no horizon weighting.
+        # 'density' => regression outputs, weighted sum.
+        # 'survival' => sigmoid then weighted sum.
+        mode = ('spatial' if value_head_type == 'spatial'
+                else ('density' if value_head_target_type == 'density'
+                      else 'survival'))
 
-            def forward(self, x):
-                pol, feats = self.net.forward_with_features(x)
-                vh_logits = self.head(feats)
-                vh_probs = torch.sigmoid(vh_logits)
-                scalar_V = (vh_probs * self.hw).sum(dim=-1)
-                return pol, scalar_V
+        if mode == 'spatial':
+            class _PolicyValueWrapper(torch.nn.Module):
+                def __init__(self, net, head):
+                    super().__init__()
+                    self.net = net
+                    self.head = head
 
-        forward_module = _PolicyValueWrapper(net, value_head, horizon_weights)
+                def forward(self, x):
+                    pol, feats = self.net.forward_with_features(x)
+                    scalar_V = self.head(feats).squeeze(-1)
+                    return pol, scalar_V
+
+            forward_module = _PolicyValueWrapper(net, value_head)
+        else:
+            is_density = (mode == 'density')
+
+            class _PolicyValueWrapper(torch.nn.Module):
+                def __init__(self, net, head, hw, density):
+                    super().__init__()
+                    self.net = net
+                    self.head = head
+                    self.register_buffer('hw', hw)
+                    self.density = density
+
+                def forward(self, x):
+                    pol, feats = self.net.forward_with_features(x)
+                    vh_out = self.head(feats)
+                    if self.density:
+                        scalar_V = (vh_out * self.hw).sum(dim=-1)
+                    else:
+                        vh_probs = torch.sigmoid(vh_out)
+                        scalar_V = (vh_probs * self.hw).sum(dim=-1)
+                    return pol, scalar_V
+
+            forward_module = _PolicyValueWrapper(net, value_head,
+                                                  horizon_weights, is_density)
         forward_module = forward_module.to(device).half().eval()
         returns_value = True
     else:
