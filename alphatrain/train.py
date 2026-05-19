@@ -10,7 +10,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 from alphatrain.model import AlphaTrainNet, count_parameters
 from alphatrain.dataset import TensorDatasetGPU
@@ -123,6 +123,16 @@ def main():
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
     p.add_argument('--val-split', type=float, default=0.05)
+    p.add_argument('--color-augment', action='store_true',
+                   help='Random color permutation augmentation (exploits 7! '
+                        'color-label symmetry of the game). Train only; val is '
+                        'always unaugmented.')
+    p.add_argument('--no-dihedral-augment', action='store_true',
+                   help='Disable the 8x dihedral augmentation.')
+    p.add_argument('--augment-factor', type=int, default=8,
+                   help='Epoch length multiplier when augmenting. Each "extra" '
+                        'pass over the same base state gets a different random '
+                        'transform.')
     p.add_argument('--amp', action='store_true')
     p.add_argument('--compile', action='store_true',
                    help='Use torch.compile for faster forward/backward')
@@ -153,19 +163,27 @@ def main():
         device = torch.device('cpu')
     print(f"Device: {device}", flush=True)
 
-    dataset = TensorDatasetGPU(args.tensor_file, augment=True, device=str(device))
-
-    n_val = int(len(dataset) * args.val_split)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val],
-                                       generator=torch.Generator().manual_seed(42))
+    # Split train/val by base state index so augmented variants of the same
+    # base state never cross the split. Old `random_split(dataset)` worked at
+    # the augmented-index level, leaking dihedral variants from train into val.
+    train_set, val_set = TensorDatasetGPU.make_train_val_split(
+        args.tensor_file,
+        val_split=args.val_split,
+        augment=not args.no_dihedral_augment,
+        color_augment=args.color_augment,
+        augment_factor=args.augment_factor,
+        device=str(device),
+        seed=42,
+    )
+    n_val = len(val_set)
+    n_train = len(train_set)
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=0, collate_fn=dataset.collate)
+                              num_workers=0, collate_fn=train_set.collate)
     val_loader = DataLoader(val_set, batch_size=args.batch_size * 2, shuffle=False,
-                            num_workers=0, collate_fn=dataset.collate)
+                            num_workers=0, collate_fn=val_set.collate)
 
-    max_score = dataset.max_score
+    max_score = train_set.max_score
     print(f"Train: {n_train:,}, Val: {n_val:,}, max_score: {max_score:.0f}",
           flush=True)
 

@@ -167,6 +167,92 @@ collate.
 - [ ] **Profile** with `torch.profiler` to confirm bottleneck before
   doing the precompute work.
 
+### Pillar 3a-v2: Spatial ranking head + separability miner ← ACTIVE (2026-05-13)
+
+**Why:** All survival-target value heads saturated (cumulative 99%+ labels = 1, Q-bootstrap
+inherits saturation with margin 0.0001, pairwise rollouts on uniform anchors gave 9-pt
+mean score diff). Empty-count target was just another hand-picked heuristic (killed).
+Diagnosis: data distribution is the bug, not target form. Strong policy filters out the
+states where moves matter. Fix: separability-driven mining + rollouts-as-judge + spatial
+head that preserves geometry.
+
+**Approved plan (full detail in `memory/project_pillar3a_v2_plan.md`):**
+
+#### Stage 1: separability smoke miner (~20 min M5 wall)
+
+- [ ] **500 candidate anchors** from buckets:
+  - 70% (350): `data/crisis_v12/` (recovery + prevention snapshots)
+  - 20% (100): fresh pillar2z policy-only probe rewinds (turn = death − {30,50,80})
+  - 10% (50): healthy mid-game from `data/selfplay_v12/`
+- [ ] Per anchor: top-4 raw policy moves × K=4 policy-only rollouts × H=150, **shared RNG**
+- [ ] Filter (loose): `Δcap_rate ≥ 0.25` OR `Δturns ≥ 25` OR `Δscore ≥ 150`
+- [ ] **16-worker parallelism** via existing `InferenceServer + N workers` pattern
+
+#### Decision gate
+
+- [ ] Verify **≥20-30% of anchors yield ≥1 high-confidence pair**. If under 20%: STOP —
+  problem is rollout judge or anchors, not architecture.
+- [ ] Stability check: rerun 50-anchor subset with new RNG; ≥80% pairs preserve winner.
+
+#### Stage 2: full pairwise labels on separable anchors (~1-2h M5 wall)
+
+- [ ] Filtered anchors only (~150 expected of 500)
+- [ ] Per anchor: top-4 × K=8 × H=300 **policy-only** (judge: cheap, aligned)
+- [ ] Tighter filter: `Δcap_rate ≥ 0.375` OR `Δturns ≥ 50` OR `Δscore ≥ 300-500`
+- [ ] **Discard near-ties** — they poison the head
+- [ ] Output: pairwise tensor with margin metadata for margin-weighted loss
+
+#### SpatialValueHead (~150K params)
+
+```
+backbone features (256, 9, 9)  # frozen, global context already
+  ↓ 1×1 conv 256→64, BN, ReLU
+  ↓ ResBlock 3×3 (64→64), BN, ReLU
+  ↓ ResBlock 3×3 (64→64), BN, ReLU
+  ↓ [global mean pool, global max pool] → concat (128)
+  ↓ Linear 128→64, ReLU
+  ↓ Linear 64→1                # scalar V
+```
+
+20× current head. Backbone has global context — head's job is preserve+reweight.
+
+- [ ] Add `SpatialValueHead` class to `alphatrain/value_head.py`
+- [ ] Margin-weighted BPR loss: `margin × -log_sigmoid(V_w - V_l)`
+- [ ] **Val split BY source game/seed**, NOT by pair (sibling leakage)
+- [ ] 10-15 epochs, batch 1024, lr 1e-3, AdamW. M5 MPS.
+
+#### MCTS integration
+
+- [ ] Scalar V (`num_outputs=1`) — partially wired from abandoned Q-bootstrap work
+- [ ] Confirm mcts.py and inference_server.py handle scalar-output head correctly
+- [ ] **Mandatory q-sweep:** `q ∈ {0.25, 0.5, 1.0, 1.5, 2.0, 3.0}` × 100 sims × 100 seeds
+
+#### A/B baseline (target to beat)
+
+pillar2z + v11-targets head + q=2.0 @ 100 sims, 100 seeds:
+**mean 9,138 / P10 1,934 / P25 4,512 / %≥10K 50%**
+
+Report P10/P25/%<1K (not just mean — cap-clean metrics).
+
+#### Parallelism design
+
+All stages reuse existing `InferenceServer + N CPU workers` pattern (`crisis_mining.py`,
+`eval_parallel.py`):
+- 1 GPU process owns policy net, batches across workers via shared memory
+- 16 worker processes each handle one anchor at a time, run rollouts serially within
+- Server batches forwards at ~70 obs at a time
+- M5 MAX 18-core capacity: 16 worker + 1 server + 1 master headroom
+
+#### Files to create
+- `alphatrain/scripts/mine_separable_anchors.py` — Stage 1 + Stage 2 share code
+- `alphatrain/scripts/build_pairwise_dataset.py` — filter + tensor build
+- `alphatrain/scripts/train_ranking_head.py` — BPR training
+
+#### Files to modify
+- `alphatrain/value_head.py` — add `SpatialValueHead`
+- `alphatrain/mcts.py` — verify scalar V path
+- `alphatrain/inference_server.py` — verify scalar V path
+
 ### Known Issues
 
 - [ ] **GPU server mode -14% quality gap with multi-worker**: 16-worker MCTS scores

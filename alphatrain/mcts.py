@@ -499,16 +499,19 @@ class MCTS:
         #     computing V from features.
         self.value_head = None
         self.value_head_via_server = False
+        self.value_head_target_type = 'survival'  # density heads use no sigmoid
+        self.value_head_type = 'value_head'       # 'spatial' uses raw scalar
         if value_head_path is not None:
             if feature_weights_path is not None:
                 raise ValueError(
                     "value_head_path and feature_weights_path are "
                     "mutually exclusive. Pick one.")
+            from alphatrain.value_head import (
+                load_any as _load_any, DEFAULT_HORIZON_WEIGHTS as _DEFAULT_W)
             if inference_client is not None:
-                # Server runs the head; MCTS just reads val_np from val_buf.
+                # Server runs the head and computes scalar V. MCTS reads
+                # val_np from val_buf.
                 self.value_head_via_server = True
-                from alphatrain.value_head import (
-                    DEFAULT_HORIZON_WEIGHTS as _DEFAULT_W)
                 self._horizon_weights = torch.tensor(
                     _DEFAULT_W, dtype=torch.float32,
                     device=device if device is not None else 'cpu')
@@ -517,12 +520,20 @@ class MCTS:
                     raise ValueError(
                         "value_head_path requires net to be set "
                         "(value head reuses the policy backbone features).")
-                from alphatrain.value_head import (
-                    load as _load_vh,
-                    DEFAULT_HORIZON_WEIGHTS as _DEFAULT_W)
-                self.value_head, _ = _load_vh(value_head_path, device=device)
-                self._horizon_weights = torch.tensor(
-                    _DEFAULT_W, dtype=torch.float32, device=device)
+                self.value_head, ckpt, head_type = _load_any(
+                    value_head_path, device=device)
+                self.value_head_type = head_type
+                self.value_head_target_type = ckpt.get('target_type', 'survival')
+                if head_type == 'spatial':
+                    # Single scalar output; no horizon weighting at inference.
+                    self._horizon_weights = None
+                elif self.value_head_target_type == 'density':
+                    density_weights = (0.5, 0.3, 0.2)
+                    self._horizon_weights = torch.tensor(
+                        density_weights, dtype=torch.float32, device=device)
+                else:
+                    self._horizon_weights = torch.tensor(
+                        _DEFAULT_W, dtype=torch.float32, device=device)
 
         # Pre-allocate obs buffer for server mode (reused across searches)
         if inference_client is not None:
@@ -552,9 +563,14 @@ class MCTS:
             device=self.device, dtype=net_dtype)
         with torch.inference_mode():
             feats = self.net.backbone_features(obs)
-            vh_logits = self.value_head(feats.float())
-            probs = torch.sigmoid(vh_logits)
-            scalar = (probs * self._horizon_weights).sum(dim=-1)
+            vh_out = self.value_head(feats.float())
+            if self.value_head_type == 'spatial':
+                scalar = vh_out.squeeze(-1)
+            elif self.value_head_target_type == 'density':
+                scalar = (vh_out * self._horizon_weights).sum(dim=-1)
+            else:
+                probs = torch.sigmoid(vh_out)
+                scalar = (probs * self._horizon_weights).sum(dim=-1)
         return float(scalar.item())
 
     def _fill_next_ball_buffers(self, game):
@@ -874,10 +890,16 @@ class MCTS:
                             pol_logits, feats = \
                                 self.net.forward_with_features(
                                     self._obs_buf[:obs_count])
-                            vh_logits = self.value_head(feats.float())
-                            vh_probs = torch.sigmoid(vh_logits)
-                            vh_scalars = (vh_probs *
-                                          self._horizon_weights).sum(dim=-1)
+                            vh_out = self.value_head(feats.float())
+                            if self.value_head_type == 'spatial':
+                                vh_scalars = vh_out.squeeze(-1)
+                            elif self.value_head_target_type == 'density':
+                                vh_scalars = (vh_out *
+                                              self._horizon_weights).sum(dim=-1)
+                            else:
+                                vh_probs = torch.sigmoid(vh_out)
+                                vh_scalars = (vh_probs *
+                                              self._horizon_weights).sum(dim=-1)
                             vh_np = vh_scalars.float().cpu().numpy()
                             val_logits = None
                         else:

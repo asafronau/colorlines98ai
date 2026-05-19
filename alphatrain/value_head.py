@@ -44,27 +44,32 @@ class ValueHead(nn.Module):
 
     Input: backbone features (B, channels, 9, 9) — what
     `PolicyNet.backbone_features()` returns.
-    Output: (B, NUM_HORIZONS) logits (apply sigmoid for probabilities).
+    Output: (B, num_outputs) logits.
+      - num_outputs=NUM_HORIZONS (default, 4): per-horizon survival logits.
+        Apply sigmoid for probabilities, combine via survival_to_scalar().
+      - num_outputs=1: scalar V directly. Used for pairwise-ranking heads
+        (BPR loss during training). Inference reads the raw scalar.
 
     Architecture:
-        conv(channels → hidden, 1×1) → BN → ReLU → GAP → linear(hidden → 4)
+        conv(channels → hidden, 1×1) → BN → ReLU → GAP → linear(hidden → num_outputs)
 
-    Parameter count: ~8K (negligible vs the 12M-param frozen backbone).
+    Parameter count: ~8K at hidden=32 (negligible vs 12M-param frozen backbone).
     """
 
-    def __init__(self, in_channels=256, hidden=32):
+    def __init__(self, in_channels=256, hidden=32, num_outputs=NUM_HORIZONS):
         super().__init__()
         self.in_channels = in_channels
         self.hidden = hidden
+        self.num_outputs = num_outputs
         self.conv = nn.Conv2d(in_channels, hidden, kernel_size=1, bias=False)
         self.bn = nn.BatchNorm2d(hidden)
-        self.fc = nn.Linear(hidden, NUM_HORIZONS)
+        self.fc = nn.Linear(hidden, num_outputs)
 
     def forward(self, backbone_features):
-        """backbone_features: (B, channels, 9, 9). Returns (B, NUM_HORIZONS) logits."""
+        """backbone_features: (B, channels, 9, 9). Returns (B, num_outputs)."""
         x = F.relu(self.bn(self.conv(backbone_features)))
         x = x.mean(dim=(2, 3))         # GAP over spatial dims → (B, hidden)
-        return self.fc(x)              # (B, NUM_HORIZONS) logits
+        return self.fc(x)              # (B, num_outputs) logits or scalars
 
 
 def survival_to_scalar(probs, horizon_weights=DEFAULT_HORIZON_WEIGHTS):
@@ -82,18 +87,20 @@ def survival_to_scalar(probs, horizon_weights=DEFAULT_HORIZON_WEIGHTS):
 
 
 def save(value_head, path, *, backbone_path, train_args=None,
-         val_metrics=None, horizons=SURVIVAL_HORIZONS):
+         val_metrics=None, horizons=SURVIVAL_HORIZONS, target_type='survival'):
     """Serialize a trained ValueHead.
 
     Stores enough metadata to fully reconstruct: backbone reference
     (so MCTS knows which PolicyNet to attach it to), horizon list,
-    optional training/val metadata.
+    target_type (survival vs density), optional training/val metadata.
     """
     torch.save({
         'state_dict': value_head.state_dict(),
         'in_channels': value_head.in_channels,
         'hidden': value_head.hidden,
+        'num_outputs': value_head.num_outputs,
         'horizons': list(horizons),
+        'target_type': target_type,
         'backbone_path': backbone_path,
         'train_args': train_args,
         'val_metrics': val_metrics,
@@ -109,11 +116,20 @@ def load(path, device=None):
     """
     map_loc = device if device is not None else 'cpu'
     ckpt = torch.load(path, map_location=map_loc, weights_only=False)
-    head = ValueHead(in_channels=ckpt['in_channels'], hidden=ckpt['hidden'])
+    num_outputs = ckpt.get('num_outputs', NUM_HORIZONS)  # backward compat
+    head = ValueHead(in_channels=ckpt['in_channels'], hidden=ckpt['hidden'],
+                     num_outputs=num_outputs)
     head.load_state_dict(ckpt['state_dict'])
     if device is not None:
         head = head.to(device)
     head.train(False)  # inference mode (avoid named-call false-positive)
+    if num_outputs == 1:
+        # Scalar-output head (pairwise-ranking). No horizon check.
+        return head, ckpt
+    target_type = ckpt.get('target_type', 'survival')
+    if target_type == 'density':
+        # Density heads use different horizons (e.g., {5, 15, 50}). Skip check.
+        return head, ckpt
     horizons = tuple(ckpt['horizons'])
     if horizons != SURVIVAL_HORIZONS:
         raise ValueError(
@@ -121,3 +137,111 @@ def load(path, device=None):
             f"SURVIVAL_HORIZONS {SURVIVAL_HORIZONS}. Either retrain or "
             f"update the constant.")
     return head, ckpt
+
+
+class SpatialValueHead(nn.Module):
+    """Spatial-preserving value head for pairwise ranking (Pillar 3a-v2).
+
+    ~170K params. Preserves the 9×9 board geometry through residual conv
+    blocks before pooling. Uses both mean and max pool to capture average
+    and extreme features. Scalar output for pairwise ranking via BPR loss.
+
+    Architecture:
+        backbone features (B, 256, 9, 9)
+        → 1×1 conv 256→64, BN, ReLU
+        → ResBlock 3×3 (64→64), BN, ReLU
+        → ResBlock 3×3 (64→64), BN, ReLU
+        → [global mean pool, global max pool] → concat (128)
+        → Linear 128→64, ReLU
+        → Linear 64→num_outputs
+    """
+
+    def __init__(self, in_channels=256, mid_channels=64, num_outputs=1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.mid_channels = mid_channels
+        self.num_outputs = num_outputs
+
+        self.conv0 = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
+        self.bn0 = nn.BatchNorm2d(mid_channels)
+
+        # ResBlock 1
+        self.res1_conv1 = nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False)
+        self.res1_bn1 = nn.BatchNorm2d(mid_channels)
+        self.res1_conv2 = nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False)
+        self.res1_bn2 = nn.BatchNorm2d(mid_channels)
+
+        # ResBlock 2
+        self.res2_conv1 = nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False)
+        self.res2_bn1 = nn.BatchNorm2d(mid_channels)
+        self.res2_conv2 = nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False)
+        self.res2_bn2 = nn.BatchNorm2d(mid_channels)
+
+        self.fc1 = nn.Linear(mid_channels * 2, 64)
+        self.fc2 = nn.Linear(64, num_outputs)
+
+    def forward(self, x):
+        x = F.relu(self.bn0(self.conv0(x)))
+        h = F.relu(self.res1_bn1(self.res1_conv1(x)))
+        h = self.res1_bn2(self.res1_conv2(h))
+        x = F.relu(x + h)
+        h = F.relu(self.res2_bn1(self.res2_conv1(x)))
+        h = self.res2_bn2(self.res2_conv2(h))
+        x = F.relu(x + h)
+        mean_pool = x.mean(dim=(2, 3))
+        max_pool = x.amax(dim=(2, 3))
+        pooled = torch.cat([mean_pool, max_pool], dim=-1)
+        h = F.relu(self.fc1(pooled))
+        return self.fc2(h)
+
+
+def save_spatial(head, path, *, backbone_path, train_args=None,
+                 val_metrics=None):
+    """Serialize a SpatialValueHead checkpoint."""
+    torch.save({
+        'head_type': 'spatial',
+        'state_dict': head.state_dict(),
+        'in_channels': head.in_channels,
+        'mid_channels': head.mid_channels,
+        'num_outputs': head.num_outputs,
+        'target_type': 'pairwise_ranking',
+        'backbone_path': backbone_path,
+        'train_args': train_args,
+        'val_metrics': val_metrics,
+    }, path)
+
+
+def load_spatial(path, device=None):
+    """Load a SpatialValueHead checkpoint. Raises if not a spatial head."""
+    map_loc = device if device is not None else 'cpu'
+    ckpt = torch.load(path, map_location=map_loc, weights_only=False)
+    head_type = ckpt.get('head_type', 'value_head')
+    if head_type != 'spatial':
+        raise ValueError(
+            f"Expected head_type='spatial', got {head_type!r}. "
+            f"Use load() for survival/density heads.")
+    head = SpatialValueHead(
+        in_channels=ckpt['in_channels'],
+        mid_channels=ckpt['mid_channels'],
+        num_outputs=ckpt['num_outputs'],
+    )
+    head.load_state_dict(ckpt['state_dict'])
+    if device is not None:
+        head = head.to(device)
+    head.train(False)
+    return head, ckpt
+
+
+def load_any(path, device=None):
+    """Load any value-head checkpoint (ValueHead or SpatialValueHead).
+
+    Returns (head, ckpt, head_type) where head_type is 'value_head' or 'spatial'.
+    """
+    map_loc = device if device is not None else 'cpu'
+    peek = torch.load(path, map_location=map_loc, weights_only=False)
+    head_type = peek.get('head_type', 'value_head')
+    if head_type == 'spatial':
+        head, ckpt = load_spatial(path, device=device)
+    else:
+        head, ckpt = load(path, device=device)
+    return head, ckpt, head_type

@@ -94,6 +94,22 @@ def _bce_per_horizon(logits, labels, masks):
     return overall, per_horizon
 
 
+def _mse_per_horizon(preds, targets):
+    """MSE loss per horizon and across horizons (no masking — every target valid).
+
+    Args:
+        preds: (B, H) float — raw regression outputs (no sigmoid)
+        targets: (B, H) float — continuous [0, 1] targets
+
+    Returns:
+        scalar loss, per-horizon loss array.
+    """
+    sq = (preds - targets).pow(2)            # (B, H)
+    per_horizon = sq.mean(dim=0)             # (H,)
+    overall = sq.mean()
+    return overall, per_horizon
+
+
 def _calibration_metrics(probs, p_hat, n_bins=10):
     """Rough calibration: bucket predicted probs, compare to mean p_hat
     in each bucket. Returns max abs gap across buckets."""
@@ -160,7 +176,7 @@ def main():
                    help='Path to PolicyNet checkpoint (frozen during training)')
     p.add_argument('--train-data', required=True,
                    help='Path to value_targets_v11.pt from build_value_targets.py')
-    p.add_argument('--val-data', required=True,
+    p.add_argument('--val-data', required=False, default=None,
                    help='Path to K-rollout val set from build_validation_set.py')
     p.add_argument('--out', required=True,
                    help='Path to write the trained ValueHead checkpoint')
@@ -197,23 +213,38 @@ def main():
     net.train(False)
     backbone_channels = net.channels
 
-    # ── Build value head ──
-    head = ValueHead(in_channels=backbone_channels, hidden=args.hidden)
-    head = head.to(device)
-    n_head_params = sum(p.numel() for p in head.parameters())
-    print(f"ValueHead: {n_head_params:,} params, hidden={args.hidden}, "
-          f"horizons={SURVIVAL_HORIZONS}", flush=True)
-
-    # ── Load training data ──
+    # ── Load training data (peek for target_type before building head) ──
     print(f"\nLoading training data {args.train_data}...", flush=True)
     train_data = torch.load(args.train_data, weights_only=False)
+    target_type = train_data.get('target_type', 'survival')
+    print(f"  target_type={target_type}", flush=True)
+
     boards = train_data['boards']
     npos = train_data['next_pos']
     ncol = train_data['next_col']
     nn_arr = train_data['n_next']
-    labels = train_data['survive_labels']
-    masks = train_data['survive_masks']
     is_train = train_data['is_train'].numpy()
+
+    if target_type == 'density':
+        targets_field = train_data['density_targets']
+        masks_field = None
+        horizons = tuple(train_data['horizons'])
+        num_outputs = len(horizons)
+    elif target_type == 'survival':
+        targets_field = train_data['survive_labels']
+        masks_field = train_data['survive_masks']
+        horizons = SURVIVAL_HORIZONS
+        num_outputs = NUM_HORIZONS
+    else:
+        raise ValueError(f"Unknown target_type: {target_type}")
+
+    # ── Build value head (sized by target type) ──
+    head = ValueHead(in_channels=backbone_channels, hidden=args.hidden,
+                     num_outputs=num_outputs)
+    head = head.to(device)
+    n_head_params = sum(p.numel() for p in head.parameters())
+    print(f"ValueHead: {n_head_params:,} params, hidden={args.hidden}, "
+          f"num_outputs={num_outputs}, horizons={horizons}", flush=True)
 
     # Train/val split (val here is just for loss tracking — calibration
     # comes from the separate K-rollout val set).
@@ -226,10 +257,13 @@ def main():
           flush=True)
 
     # ── Load K-rollout val set (calibration ground truth) ──
-    print(f"Loading K-rollout val set {args.val_data}...", flush=True)
-    val_data = torch.load(args.val_data, weights_only=False)
-    print(f"  {val_data['boards'].shape[0]} states × K={val_data['rollout_K']} "
-          f"rollouts, horizons={val_data['horizons']}", flush=True)
+    # Skipped for 'density' mode (calibration metrics built for survival probs)
+    val_data = None
+    if target_type == 'survival' and args.val_data:
+        print(f"Loading K-rollout val set {args.val_data}...", flush=True)
+        val_data = torch.load(args.val_data, weights_only=False)
+        print(f"  {val_data['boards'].shape[0]} states × K={val_data['rollout_K']} "
+              f"rollouts, horizons={val_data['horizons']}", flush=True)
 
     # ── Optimizer ──
     optimizer = torch.optim.AdamW(
@@ -249,7 +283,7 @@ def main():
         n_batches = math.ceil(len(train_idxs_ep) / args.batch_size)
 
         running_loss = 0.0
-        running_per_h = np.zeros(NUM_HORIZONS)
+        running_per_h = np.zeros(num_outputs)
         running_n = 0
         for bi in range(n_batches):
             slc = train_idxs_ep[bi * args.batch_size:(bi + 1) * args.batch_size]
@@ -261,11 +295,15 @@ def main():
                 feats = net.backbone_features(obs_t)
 
             feats = feats.float().detach()  # detach: backbone is frozen
-            labels_t = labels[slc].to(device).long()
-            masks_t = masks[slc].to(device).float()
-
             logits = head(feats)
-            loss, per_h = _bce_per_horizon(logits, labels_t, masks_t)
+
+            if target_type == 'density':
+                targets_t = targets_field[slc].to(device).float()
+                loss, per_h = _mse_per_horizon(logits, targets_t)
+            else:
+                labels_t = targets_field[slc].to(device).long()
+                masks_t = masks_field[slc].to(device).float()
+                loss, per_h = _bce_per_horizon(logits, labels_t, masks_t)
 
             optimizer.zero_grad()
             loss.backward()
@@ -280,16 +318,16 @@ def main():
                 avg_h = running_per_h / running_n
                 elapsed = time.time() - t0
                 rate = running_n / max(elapsed, 1e-3)
+                h_str = ' '.join(f"{v:.3f}" for v in avg_h)
                 print(f"  [{bi+1}/{n_batches}] loss={avg:.4f}  "
-                      f"per-H=[{avg_h[0]:.3f} {avg_h[1]:.3f} "
-                      f"{avg_h[2]:.3f} {avg_h[3]:.3f}]  "
+                      f"per-H=[{h_str}]  "
                       f"{rate:.0f} samples/s ({elapsed:.0f}s)", flush=True)
 
         # Inner val (single-trajectory, noisy)
         head.train(False)
         with torch.inference_mode():
             iv_loss = 0.0
-            iv_per_h = np.zeros(NUM_HORIZONS)
+            iv_per_h = np.zeros(num_outputs)
             iv_n = 0
             for bi in range(0, len(inner_val_idxs), args.batch_size):
                 slc = inner_val_idxs[bi:bi + args.batch_size]
@@ -299,32 +337,42 @@ def main():
                     device=device,
                     dtype=torch.float16 if fp16 else torch.float32)
                 feats = net.backbone_features(obs_t).float()
-                labels_t = labels[slc].to(device).long()
-                masks_t = masks[slc].to(device).float()
                 logits = head(feats)
-                l, p_h = _bce_per_horizon(logits, labels_t, masks_t)
+                if target_type == 'density':
+                    targets_t = targets_field[slc].to(device).float()
+                    l, p_h = _mse_per_horizon(logits, targets_t)
+                else:
+                    labels_t = targets_field[slc].to(device).long()
+                    masks_t = masks_field[slc].to(device).float()
+                    l, p_h = _bce_per_horizon(logits, labels_t, masks_t)
                 iv_loss += l.item() * len(slc)
                 iv_per_h += p_h.cpu().numpy() * len(slc)
                 iv_n += len(slc)
             iv_loss /= max(iv_n, 1)
             iv_per_h /= max(iv_n, 1)
 
-        # K-rollout calibration metrics
-        cal_metrics, _ = _eval_on_val_set(
-            net, head, val_data, device, fp16)
+        # K-rollout calibration metrics (survival mode only)
+        cal_metrics = {}
+        if target_type == 'survival' and val_data is not None:
+            cal_metrics, _ = _eval_on_val_set(
+                net, head, val_data, device, fp16)
         print(f"\nEpoch {epoch+1}/{args.epochs}: "
               f"train_loss={running_loss/running_n:.4f}  "
               f"inner_val_loss={iv_loss:.4f}", flush=True)
-        for hi, h in enumerate(SURVIVAL_HORIZONS):
-            print(f"  H={h}: r={cal_metrics[f'H{h}_r']:.3f}  "
-                  f"mae={cal_metrics[f'H{h}_mae']:.3f}  "
-                  f"cal_gap={cal_metrics[f'H{h}_cal_gap']:.3f}", flush=True)
+        iv_h_str = ' '.join(f"{v:.4f}" for v in iv_per_h)
+        print(f"  per-H val MSE/BCE: [{iv_h_str}]", flush=True)
+        if cal_metrics:
+            for hi, h in enumerate(horizons):
+                print(f"  H={h}: r={cal_metrics[f'H{h}_r']:.3f}  "
+                      f"mae={cal_metrics[f'H{h}_mae']:.3f}  "
+                      f"cal_gap={cal_metrics[f'H{h}_cal_gap']:.3f}", flush=True)
 
         if iv_loss < best_val_loss:
             best_val_loss = iv_loss
             save_value_head(
                 head, args.out, backbone_path=args.backbone,
-                train_args=vars(args),
+                train_args=vars(args), horizons=horizons,
+                target_type=target_type,
                 val_metrics={
                     'inner_val_loss': iv_loss,
                     'calibration': cal_metrics,
