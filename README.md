@@ -11,14 +11,20 @@ An AlphaZero-inspired AI for [Color Lines 98](https://en.wikipedia.org/wiki/Line
 | Heuristic (tournament bracket, 200 rollouts) | 5,700 | — | — | — | CPU rollouts (no cap) |
 | **Policy standalone — pillar2z_epoch_19** (1,000 seeds) | **7,460** | 5,052 | 20,754 | 6.8% | None |
 | **Policy standalone — B_smoke_epoch_12** (500 seeds) | **8,043** | 5,736 | 21,495 | 5.0% | None |
-| **Policy standalone — sharp_50_epoch_12** (500 seeds) | **12,622** | 8,848 | **37,071** | **2.8%** | None ← **new best** |
-| **MCTS @ 100 sims — sharp_50_epoch_12** (100 seeds, cap 20K) | **14,602** | 12,080 | 41,208 | 1.0% | value_head_v12, q=2.0 |
-| MCTS @ 400 sims — pillar2z_epoch_19 (50 seeds) | 15,465 | 20,004 (cap) | — | 0% | value_head_v12 — older reference |
-| MCTS @ 100 sims — B_smoke_epoch_12 (100 seeds) | 8,700 | 8,178 | 16,510 (cap) | 6.0% | (MCTS hurts B by 4% — value head saturates against the stronger policy) |
+| Policy standalone — sharp_50_epoch_12 (500 seeds) | 12,622 | 8,848 | 37,071 | 2.8% | None |
+| **Policy standalone — sharp_25_epoch_12 / pillar3a** (100 seeds, cap 25K) | **14,294** | 10,459 | 34,564 | 1.0% | None ← **new best policy** |
+| MCTS@100 — sharp_25_ep12 + OLD value_head_v12 (100 seeds, cap 25K) | 16,340 | 12,859 | 51,595 | 7.0% | reference: shows OLD head was hurting floor |
+| **MCTS@100 — pillar3a + NEW value_head_pillar3a** (100 seeds, cap 25K) | **21,310** | **17,644** | 51,612 (cap) | **1.0%** | retrained head; **+30% mean / +37% P50 / floor cut from 7% to 1%** vs old head ← **new SOA** |
+| MCTS@400 — pillar2z_epoch_19 (50 seeds, older reference) | 15,465 | 20,004 (cap) | — | 0% | value_head_v12 |
 
-**sharp_50_epoch_12** (V12 distill warm-started from B with `--target-temperature 0.5`) is the current best deployable policy: standalone mean 12,622 (+57% over B) and P95 reaching 37,071. With MCTS@100 (cap 20K) it climbs to mean 14,602 and P10/P50 dramatically improve (P10 +80%, P50 +35%, floor cut by 75%). Individual games reached 89,508 score; the 30K policy-only median target is in reach.
+**Pillar3a = sharp_25_epoch_12** (V12 distill warm-started from sharp_50 with `--target-temperature 0.25`). Combined with **value_head_pillar3a** (retrained on pillar3a's frozen backbone per HISTORY 138), MCTS@100 reaches mean 21,310 and P50 17,644 — putting 25% of games above the project's 30K policy-only median target (P75 = 32,231) and P95 cap-bound at 51,612 (25K-turn limit).
 
-The breakthrough was a **single hyperparameter** (`--target-temperature 0.5`) applied to existing V12 distillation. Mechanism: V12 MCTS visit-distribution targets were soft (top1≈0.26), training on them produced a policy that distributed mass over ~30 legal moves nearly uniformly (top1_legal ≈ 0.046). Sharpening the targets just before the CE loss forced the model to commit. See HISTORY lessons 153-156.
+Two compounding mechanisms drove the lift from pillar2z's 15,465 MCTS@400 to pillar3a's 21,310 MCTS@100:
+
+1. **Target sharpening** (HISTORY 153-156): `--target-temperature 0.25` forces the model to commit when V12 MCTS visit-distribution targets were too soft. Pillar3a policy alone is 14,294 vs pillar2z's 7,460 (+92%).
+2. **Value head retraining** (HISTORY 158): The value head MUST be retrained when the backbone moves. The OLD value_head_v12_v12targets was net-negative on floor (saturated max_score predictions pruned pillar3a's crisis-escape moves). The retrained head restores correct guidance: +30% MCTS mean over the OLD head's already-strong number.
+
+Individual single-game scores have reached 114,676 (sharp_25_ep6 seed 448) — multiple times the long-standing 40K expert-human ceiling.
 
 MCTS evaluations have used 5K to 10K turn caps; reported `Median` is often cap-pinned (HISTORY lesson 140). At each iteration the cap moves with player strength.
 
@@ -42,7 +48,9 @@ Score progression across training iterations:
 | **sharp_75** | **8,817** | B + `--target-temperature 0.75` — V12 distillation targets sharpened. +10% over B. |
 | **sharp_50** | **12,622** | B + `--target-temperature 0.5` — **+57% over B**. P95 = 37,071. Single game reached 89,508. (HISTORY 153-156) |
 | sharp_50 + MCTS@100 cap=20K | **14,602** | Same checkpoint with MCTS@100; +24% over policy alone. MCTS regime restored at this policy strength. |
-| sharp_25 / pillar3 | (training) | T=0.25 + V13 corpus generation in progress. |
+| **pillar3a = sharp_25_epoch_12** | **14,294** | + T=0.25 — extends the sharpening curve. +12% over sharp_50. Picked as new project baseline. (HISTORY 157) |
+| **pillar3a + MCTS@100 + value_head_pillar3a** | **21,310** | Retrained value head per HISTORY 158: +30% mean over OLD head. P50=17,644, P75=32,231 (25% of games above 30K target). New SOA. |
+| pillar4a (next) | TBD | Train on V13 corpus from pillar3a + MCTS@200 + new value head. Target: ≥+30% over pillar3a (≥18,500 policy). |
 
 ## Architecture
 
