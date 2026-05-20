@@ -131,6 +131,10 @@ def main():
     rank_target_top1 = np.zeros(len(sel), dtype=np.int32)
     target_set_ce = np.zeros(len(sel), dtype=np.float32)
     target_top1_in_legal = np.zeros(len(sel), dtype=bool)
+    # NEW: decisiveness metrics (independent of target alignment)
+    model_top1_renorm = np.zeros(len(sel), dtype=np.float32)
+    model_top1_top2_gap = np.zeros(len(sel), dtype=np.float32)
+    legal_entropy = np.zeros(len(sel), dtype=np.float32)
 
     for start in range(0, len(sel), args.batch_size):
         sub_idx = sel[start:start + args.batch_size]
@@ -171,6 +175,20 @@ def main():
                 continue
             # Renormalize over legal
             legal_renorm = {a: v / total for a, v in priors.items()}
+
+            # NEW: model decisiveness metrics (target-independent)
+            sorted_legal_vals = sorted(legal_renorm.values(), reverse=True)
+            model_top1_renorm[out_idx] = float(sorted_legal_vals[0])
+            if len(sorted_legal_vals) >= 2:
+                model_top1_top2_gap[out_idx] = (
+                    float(sorted_legal_vals[0] - sorted_legal_vals[1]))
+            else:
+                model_top1_top2_gap[out_idx] = float(sorted_legal_vals[0])
+            ent = 0.0
+            for v in legal_renorm.values():
+                if v > 0:
+                    ent -= float(v) * float(np.log(v))
+            legal_entropy[out_idx] = ent
 
             # Model's prob at target_top1
             target_top1_in_legal[out_idx] = (t_top1_action in legal_renorm)
@@ -235,15 +253,28 @@ def main():
           f"P50 {np.median(target_set_ce[valid]):.4f}  "
           f"min {target_set_ce[valid].min():.4f}")
 
-    print(f"\nInterpretation key:")
-    print(f"  If model prob @ target_top1 ≈ target top1_prob:")
-    print(f"      → B faithfully fits training targets on target set.")
-    print(f"      → 'Flat over legal' was a measurement artifact.")
-    print(f"  If model prob @ target_top1 << target top1_prob:")
-    print(f"      → B is under-committed; sharpening should help.")
-    print(f"  If model mass on target set < 0.5:")
-    print(f"      → B redistributes mass to non-target legal moves;")
-    print(f"        sharpening targets should reclaim that mass.")
+    # ── NEW: decisiveness metrics (target-independent) ──
+    print(f"\n=== Model decisiveness (target-INDEPENDENT) ===")
+    print(f"  model_top1_renorm:             "
+          f"mean {model_top1_renorm[valid].mean():.3f}  "
+          f"P10 {np.percentile(model_top1_renorm[valid], 10):.3f}  "
+          f"P50 {np.median(model_top1_renorm[valid]):.3f}  "
+          f"P90 {np.percentile(model_top1_renorm[valid], 90):.3f}")
+    print(f"  model top1-top2 gap:           "
+          f"mean {model_top1_top2_gap[valid].mean():.3f}  "
+          f"P50 {np.median(model_top1_top2_gap[valid]):.3f}  "
+          f"P90 {np.percentile(model_top1_top2_gap[valid], 90):.3f}")
+    print(f"  legal entropy:                 "
+          f"mean {legal_entropy[valid].mean():.3f}  "
+          f"P50 {np.median(legal_entropy[valid]):.3f}  "
+          f"max-uniform-30 {float(np.log(30)):.3f}")
+
+    print(f"\nInterpretation:")
+    print(f"  model_top1_renorm measures the model's confidence in its")
+    print(f"  OWN top pick (not target's). This is what matters for")
+    print(f"  sharpening — even if model picks different actions than")
+    print(f"  V12's labeled target, what matters is whether it commits.")
+    print(f"  Higher = more decisive. legal_entropy decreasing = sharper.")
 
 
 if __name__ == '__main__':

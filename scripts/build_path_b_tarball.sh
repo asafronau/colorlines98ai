@@ -43,6 +43,10 @@ tar czf $OUT \
     alphatrain/scripts/analyze_path_b_checkpoint.py \
     alphatrain/scripts/overnight_analysis.py \
     alphatrain/scripts/eval_parallel.py \
+    alphatrain/scripts/selfplay.py \
+    alphatrain/scripts/crisis_mining.py \
+    alphatrain/scripts/build_expert_v2_tensor.py \
+    alphatrain/scripts/fit_feature_value.py \
     alphatrain/tests/__init__.py \
     alphatrain/tests/test_train_path_b.py \
     alphatrain/data/phase1_oracle_path_b.pt \
