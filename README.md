@@ -10,12 +10,15 @@ An AlphaZero-inspired AI for [Color Lines 98](https://en.wikipedia.org/wiki/Line
 |--------|---:|---:|---:|---:|--------|
 | Heuristic (tournament bracket, 200 rollouts) | 5,700 | — | — | — | CPU rollouts (no cap) |
 | **Policy standalone — pillar2z_epoch_19** (1,000 seeds) | **7,460** | 5,052 | 20,754 | 6.8% | None |
-| **Policy standalone — B_smoke_epoch_12** (500 seeds) | **8,043** | 5,736 | 21,495 | 5.0% | None ← **new best** |
-| **Policy standalone — B_smoke_epoch_12** (100 seeds) | **9,051** | 6,670 | 24,965 | 3.0% | None |
-| **MCTS @ 400 sims — pillar2z_epoch_19** (50 seeds) | **15,465** | 20,004 (cap) | — | 0% | feature-value MCTS, value_head_v12, q=2.0 |
-| **MCTS @ 100 sims — B_smoke_epoch_12** (100 seeds) | **8,700** | 8,178 | 16,510 (cap) | 6.0% | value_head_v12 — **MCTS now hurts B by 4%** |
+| **Policy standalone — B_smoke_epoch_12** (500 seeds) | **8,043** | 5,736 | 21,495 | 5.0% | None |
+| **Policy standalone — sharp_50_epoch_12** (500 seeds) | **12,622** | 8,848 | **37,071** | **2.8%** | None ← **new best** |
+| **MCTS @ 100 sims — sharp_50_epoch_12** (100 seeds, cap 20K) | **14,602** | 12,080 | 41,208 | 1.0% | value_head_v12, q=2.0 |
+| MCTS @ 400 sims — pillar2z_epoch_19 (50 seeds) | 15,465 | 20,004 (cap) | — | 0% | value_head_v12 — older reference |
+| MCTS @ 100 sims — B_smoke_epoch_12 (100 seeds) | 8,700 | 8,178 | 16,510 (cap) | 6.0% | (MCTS hurts B by 4% — value head saturates against the stronger policy) |
 
-The B_smoke_epoch_12 standalone policy is the current best deployable. Notably, MCTS at 100 sims with the existing value head *hurts* B's mean by 4% (P95 capped at the 8K-turn limit while policy P95 reaches 24,965 uncapped). The value head, which is bounded by `max_score≈30K`, saturates once the policy can score above that — see HISTORY lessons 148-149. The next value head must use a non-saturating target (pairwise BPR, survival probability, or discounted TD).
+**sharp_50_epoch_12** (V12 distill warm-started from B with `--target-temperature 0.5`) is the current best deployable policy: standalone mean 12,622 (+57% over B) and P95 reaching 37,071. With MCTS@100 (cap 20K) it climbs to mean 14,602 and P10/P50 dramatically improve (P10 +80%, P50 +35%, floor cut by 75%). Individual games reached 89,508 score; the 30K policy-only median target is in reach.
+
+The breakthrough was a **single hyperparameter** (`--target-temperature 0.5`) applied to existing V12 distillation. Mechanism: V12 MCTS visit-distribution targets were soft (top1≈0.26), training on them produced a policy that distributed mass over ~30 legal moves nearly uniformly (top1_legal ≈ 0.046). Sharpening the targets just before the CE loss forced the model to commit. See HISTORY lessons 153-156.
 
 MCTS evaluations have used 5K to 10K turn caps; reported `Median` is often cap-pinned (HISTORY lesson 140). At each iteration the cap moves with player strength.
 
@@ -33,9 +36,13 @@ Score progression across training iterations:
 | 2Y2 (ep40) | **5,586** | Same V11 corpus, 40-epoch retrain — feeds V12 generation |
 | 2Z (ep19) | **7,460** | V12 corpus (9.77M states, pillar2y2 + value_head_v11 NN-MCTS @ 400 sims, q=2.0) — first NN-driven AlphaZero loop |
 | Path B v1 — A | **7,752** | V12 distill + clean train/val split + warmup=1 + sample-time aug (no oracle) — pipeline-only fix gave +9% over 2z |
-| Path B v1 — B | **8,043** | A + `--color-augment` (7! color symmetry) — +4% over A. **Current best.** |
+| Path B v1 — B | **8,043** | A + `--color-augment` (7! color symmetry) — +4% over A. |
 | Path B v1 — C/D (oracle) | 7,060 / 7,396 | A + B + oracle as soft-KL aux loss at λ=0.05/0.10 — empirically harmful at convergence (HISTORY 143-145). Killed branch. |
-| Path B v2 (next) | TBD | Oracle-style mining on B-distribution, K=128 common-RNG, hard CE on rollout-winner. Decision criterion: ≥+8% over B (≥8,700) |
+| Path B v2 — oracle mining | abandoned | K=128 audit showed K=32 oracle labels were sampling noise. Fresh K=128 calibration on B-distribution states yielded only 4% stable separable pairs (gate was ≥10%). Closed (HISTORY 151-152). |
+| **sharp_75** | **8,817** | B + `--target-temperature 0.75` — V12 distillation targets sharpened. +10% over B. |
+| **sharp_50** | **12,622** | B + `--target-temperature 0.5` — **+57% over B**. P95 = 37,071. Single game reached 89,508. (HISTORY 153-156) |
+| sharp_50 + MCTS@100 cap=20K | **14,602** | Same checkpoint with MCTS@100; +24% over policy alone. MCTS regime restored at this policy strength. |
+| sharp_25 / pillar3 | (training) | T=0.25 + V13 corpus generation in progress. |
 
 ## Architecture
 
