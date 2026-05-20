@@ -2626,3 +2626,48 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      isn't committing." Sharpening was the cheapest possible fix and
      it engaged in the way ChatGPT had warned might happen: not via
      the diagnostic-visible metric, but via the actual play quality.
+
+157. **Pillar3a = sharp_25_epoch_12.** T=0.25 sharpening completed
+     (12 epochs on Colab G4-Blackwell, ~8h). Standalone policy mean
+     **14,294** on 100 seeds (1,000-seed run on sharp_25_ep9 was 14,186;
+     ep12 numbers consistent). +12% over sharp_50_ep12 (12,622) at
+     the same compute. Picked as pillar3a — the new project baseline.
+
+158. **Value head retrain on pillar3a backbone: +30% MCTS lift.** Per
+     HISTORY 138's "retrain when backbone moves" rule, trained a new
+     value head on pillar3a's frozen backbone using V11 survival
+     targets (~48 min on M5 with channels-last + bf16 AMP). Recipe:
+     `train_value_head.py --epochs 5 --batch-size 4096 --lr 1e-3`.
+     A/B test on identical 100 seeds, MCTS@100, cap=25K:
+
+     | head | mean | P50 | %<1000 | %>10K |
+     |---|---|---|---|---|
+     | OLD (value_head_v12_v12targets) | 16,340 | 12,859 | **7.0%** | 59% |
+     | **NEW (value_head_sharp25_ep12)** | **21,310** | **17,644** | **1.0%** | **63%** |
+
+     +30% mean, +37% P50, **floor cut by 86%**. The old head was
+     actively HURTING on crisis states — its saturated max_score
+     value estimates over sharp_25's stronger play space pruned
+     B's crisis-escape moves. The retrained head shares pillar3a's
+     backbone features and stops pruning correct play. Generalizable
+     lesson: any iteration that changes the backbone (even mild
+     distillation refinement, let alone a sharpening regime change)
+     should mandatorily include a value-head retrain BEFORE deploying
+     MCTS-based evaluation OR using that combo as a teacher.
+
+159. **30K policy-only median is now within 1.7× reach.**
+     pillar3a + MCTS@100 + new_head: P50 = 17,644, P75 = 32,231
+     (25% of games already above target), P90/P95 ≥ 51K (cap-bound
+     at 25K turns).
+
+     | iter | policy mean | + MCTS@100 mean | gain |
+     |---|---|---|---|
+     | pillar2z | 7,460 | 9,138 (old head) | — |
+     | sharp_50 | 12,622 | 14,602 (old head) | +57% policy |
+     | **pillar3a** | **14,294** | **21,310** (new head) | **+49% MCTS** |
+
+     One iteration on V12 (sharpening + value-head retrain) lifted
+     MCTS from 15K → 21K. If pillar4a (V13 corpus + sharpening) gives
+     another +30-50% via the now-properly-paired teacher signal,
+     we land at 27-31K mean — at project target. The "2-3 more
+     iterations" estimate looks conservative now.
