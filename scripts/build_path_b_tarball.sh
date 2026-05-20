@@ -29,9 +29,20 @@ tar czf $OUT \
     alphatrain/observation.py \
     alphatrain/train.py \
     alphatrain/train_path_b.py \
+    alphatrain/mcts.py \
+    alphatrain/inference_server.py \
+    alphatrain/value_head.py \
+    alphatrain/evaluate.py \
     alphatrain/scripts/__init__.py \
+    alphatrain/scripts/mine_death_features.py \
     alphatrain/scripts/build_path_b_tensor.py \
     alphatrain/scripts/combine_oracle_datasets.py \
+    alphatrain/scripts/analyze_target_alignment.py \
+    alphatrain/scripts/analyze_legal_distribution.py \
+    alphatrain/scripts/analyze_v12_target_entropy.py \
+    alphatrain/scripts/analyze_path_b_checkpoint.py \
+    alphatrain/scripts/overnight_analysis.py \
+    alphatrain/scripts/eval_parallel.py \
     alphatrain/tests/__init__.py \
     alphatrain/tests/test_train_path_b.py \
     alphatrain/data/phase1_oracle_path_b.pt \

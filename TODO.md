@@ -1,28 +1,45 @@
 # Color Lines 98 — TODO
 
 **Target**: 30K policy-only median (browser/WASM deployment).
-**Project goal**: Achievable through 4-6 iterations of DAgger + architecture upgrades.
+**Project goal**: Achievable through 2-3 more iterations of sharpened V-corpus distillation.
 
 ---
 
-## Current state (2026-05-15)
+## Current state (2026-05-19)
 
-| metric | value |
-|---|---|
-| **pillar2z policy-only** | mean 6,952 |
-| **pillar2z + v11-targets head, q=2.0, 100 sims** | mean 9,138 |
-| pillar2z + v11-targets head, 400 sims | regresses (value head ceiling) |
-| pillar2z + pure-prior MCTS, q=0, 100 sims | mean 7,045 |
-| New SpatialValueHead (Pillar 3a-v3) | all q values **below** pure-prior → abandoned |
-| **Project target (browser/WASM)** | **30K policy-only median** |
+| metric | value | notes |
+|---|---|---|
+| **sharp_50_epoch_12 policy** (500 seeds) | **mean 12,622** | new SOA. V12 + `--target-temperature 0.5` + `--color-augment` (HISTORY 153-156) |
+| sharp_50 P50 / P75 / P95 (policy) | 8,848 / 17,356 / **37,071** | individual game record: **89,508** |
+| sharp_50 + MCTS@100, cap=20K | **mean 14,602** | +24% over policy. MCTS regime restored. P10/P50/floor all dramatically better. |
+| sharp_75_epoch_12 policy (500 seeds) | mean 8,817 (+10%) | T=0.75 — mild sharpening, mild gain. Confirms dose-response. |
+| sharp_25 (T=0.25) | training | answers: more sharpening helps or saturates? |
+| (older) pillar2z policy_only | 7,460 | superseded |
+| (older) pillar2z + MCTS@400 | 15,465 | matched at 1/4 sim cost by sharp_50+MCTS@100 |
+| **Project target** | **30K policy-only median** | sharp_50 P50 = 8,848. ~3.4× needed on median. |
 
-**Diagnosis**: value-head-based MCTS plateaued at 2z scale. Policy keeps improving; value head can't keep up. Pivoting to direct policy improvement via DAgger.
-
-**Phase 0 confirmed (2026-05-15)**: in 15% of crisis states, policy_top_1 is oracle-suboptimal by huge margins (+0.44 cap_rate or +56 turns). Strong actionable signal for DAgger.
+**Current diagnosis**: V12 visit-distribution targets were too soft (top1=0.26 mean). Training on them with cross-entropy + 8× dihedral + color augmentation produced a model with legal-top1 mean only 0.046 — barely above uniform. Sharpening targets at training time (T=0.5) forced policy commitment. The under-commitment was the bottleneck that the whole oracle / value-head detour was a symptom of. Sharpening is the unlock; iteration on a sharpened pipeline is the path to target.
 
 ---
 
-## Active path: TEACHER TOURNAMENT (causal audit before more training)
+## Active work
+
+1. **sharp_25 training** — testing T=0.25 (Colab G4, ~8h). Decides if T=0.5 saturated the gain or we have more headroom.
+2. **V13 corpus generation** — once sharp_X chosen as pillar3 baseline, generate self-play with MCTS@200 or @400, cap ≥ 25K (sharp_50 already routinely scores > 20K).
+3. **Pillar4 distillation** — train next student on V13 with target-temperature sharpening built in. Decision criterion: ≥+30% over pillar3.
+
+---
+
+## Closed paths (kept for reference)
+
+- **Oracle mining (Path B v1)** — soft KL on top-6, ran A/B/C/D × 12 epochs. Oracle harmful at convergence (C/D ep12 < B ep12). K=128 audit confirmed K=32 labels were sampling noise. (HISTORY 143-145, 151)
+- **Oracle mining (Path B v2)** — abandoned at calibration. K=128 on 100 fresh B-distribution anchors gave only 4% stable separable pairs at Δcap≥0.25 (gate was ≥10%). Structural infeasibility, not implementation bug. (HISTORY 152)
+- **Pillar 3a-v3 SpatialValueHead** — all q-values below pure-prior. Pre-current-effort dead branch.
+- **DAgger fine-tunes** — 9 attempts on pillar2z all regressed (HISTORY late-pillar2z era).
+
+---
+
+## Original active path (historical — kept for context): TEACHER TOURNAMENT
 
 **Status 2026-05-15 night**: 9 DAgger fine-tune attempts on pillar2z all regressed
 (best v9 at 4,435 vs baseline 6,952). The K=32 rollout oracle is real signal

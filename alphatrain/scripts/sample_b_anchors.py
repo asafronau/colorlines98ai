@@ -187,14 +187,24 @@ def main():
                     diverse_pool.append(rec)
                     uncertain_candidates.append(rec)
 
-    print(f"\nPool sizes (pre-uncertain-filter):", flush=True)
+    print(f"\nPool sizes (full):", flush=True)
     print(f"  crisis pool: {len(crisis_pool)}", flush=True)
     print(f"  diverse pool: {len(diverse_pool)}", flush=True)
-    print(f"  uncertain candidates (crisis ∪ diverse): "
-          f"{len(uncertain_candidates)}", flush=True)
 
-    # ── Uncertain bucket: B forward to compute legal-move top1_prob ──
-    uncertain_pool = []
+    # Sample crisis and diverse INDEPENDENTLY (no cannibalization).
+    def _sample(pool, n):
+        if len(pool) <= n:
+            return list(pool)
+        idx = rng.choice(len(pool), size=n, replace=False)
+        return [pool[i] for i in idx]
+
+    crisis = _sample(crisis_pool, args.n_crisis)
+    diverse = _sample(diverse_pool, args.n_diverse)
+
+    # ── Uncertain bucket: forward B on a SUBSAMPLE of union and pick
+    # the top-N most uncertain by top1-legal-prob (rank-based, robust
+    # to distribution shape). ──
+    uncertain = []
     if args.n_uncertain > 0:
         import time
         from alphatrain.mcts import _get_legal_priors_flat
@@ -226,17 +236,24 @@ def main():
                 out = out[0]
             return torch.softmax(out.float(), dim=-1).cpu().numpy()
 
-        # Score every uncertain candidate by top1-legal-prob (smaller = more
-        # uncertain). Batched forward.
-        print(f"  forwarding {len(uncertain_candidates)} states...",
-              flush=True)
+        # Subsample to keep forward cost bounded. We don't need to
+        # screen all 2M states — 50K random samples give us plenty of
+        # variety to pick the N most uncertain.
+        n_screen = max(args.n_uncertain * 30, 20_000)
+        if n_screen >= len(uncertain_candidates):
+            screen_set = uncertain_candidates
+        else:
+            idx = rng.choice(len(uncertain_candidates),
+                              size=n_screen, replace=False)
+            screen_set = [uncertain_candidates[i] for i in idx]
+        print(f"  uncertainty screen: forwarding "
+              f"{len(screen_set)} states (subsampled from "
+              f"{len(uncertain_candidates)})...", flush=True)
         t0 = time.time()
-        top1_probs = np.full(len(uncertain_candidates), 1.0,
-                              dtype=np.float32)
-        for start in range(0, len(uncertain_candidates),
+        top1_probs = np.full(len(screen_set), 1.0, dtype=np.float32)
+        for start in range(0, len(screen_set),
                             args.uncertain_batch_size):
-            sub = uncertain_candidates[start:start +
-                                          args.uncertain_batch_size]
+            sub = screen_set[start:start + args.uncertain_batch_size]
             obs_batch = np.stack([
                 build_observation(
                     rec['board'],
@@ -254,46 +271,48 @@ def main():
             for k, rec in enumerate(sub):
                 priors = _get_legal_priors_flat(rec['board'], pol[k], 30)
                 if priors:
-                    top1_probs[start + k] = max(priors.values())
-                # else: leave at 1.0 (won't qualify as uncertain)
+                    total = sum(priors.values())
+                    if total > 0:
+                        top1_probs[start + k] = max(priors.values()) / total
         print(f"  done in {time.time()-t0:.0f}s", flush=True)
 
-        # Tag each candidate with its top1_prob and select uncertain
-        for k, rec in enumerate(uncertain_candidates):
-            rec['_top1_prob'] = float(top1_probs[k])
-        # uncertain = top1_prob < threshold
-        uncertain_pool = [rec for rec in uncertain_candidates
-                            if rec['_top1_prob'] < args.uncertain_top1_thresh]
-        print(f"  uncertain pool "
-              f"(top1_prob < {args.uncertain_top1_thresh}): "
-              f"{len(uncertain_pool)}", flush=True)
-
-        # Re-label these as 'uncertain' (overrides crisis/diverse) and
-        # remove them from their original pool so we don't double-count.
-        uncertain_ids = {id(rec) for rec in uncertain_pool}
-        crisis_pool = [rec for rec in crisis_pool
-                        if id(rec) not in uncertain_ids]
-        diverse_pool = [rec for rec in diverse_pool
-                         if id(rec) not in uncertain_ids]
-        for rec in uncertain_pool:
-            rec['source_label'] = 'uncertain'
-        print(f"\nPool sizes (after uncertain extraction):", flush=True)
-        print(f"  crisis: {len(crisis_pool)}  uncertain: "
-              f"{len(uncertain_pool)}  diverse: {len(diverse_pool)}",
+        # Distribution diagnostics
+        print(f"  top1_prob (renormalized legal): "
+              f"mean={top1_probs.mean():.3f} "
+              f"P10={np.percentile(top1_probs, 10):.3f} "
+              f"P25={np.percentile(top1_probs, 25):.3f} "
+              f"P50={np.percentile(top1_probs, 50):.3f} "
+              f"P75={np.percentile(top1_probs, 75):.3f}",
               flush=True)
 
-    # Sample stratified per target counts
-    def _sample(pool, n):
-        if len(pool) <= n:
-            return list(pool)
-        idx = rng.choice(len(pool), size=n, replace=False)
-        return [pool[i] for i in idx]
+        # Pick the n_uncertain most uncertain (lowest top1_prob). This is
+        # rank-based: robust to whatever distribution shape B's policy
+        # has.
+        order = np.argsort(top1_probs)
+        picked = order[:args.n_uncertain]
+        for k_idx in picked:
+            rec = dict(screen_set[k_idx])  # shallow copy to override label
+            rec['_top1_prob'] = float(top1_probs[k_idx])
+            rec['source_label'] = 'uncertain'
+            uncertain.append(rec)
+        if uncertain:
+            top1_uncertain = np.array([r['_top1_prob']
+                                         for r in uncertain])
+            print(f"  uncertain bucket top1_prob: "
+                  f"max={top1_uncertain.max():.3f} "
+                  f"(rank-based selection — most uncertain)",
+                  flush=True)
 
-    crisis = _sample(crisis_pool, args.n_crisis)
-    uncertain = _sample(uncertain_pool, args.n_uncertain) \
-                  if uncertain_pool else []
-    diverse = _sample(diverse_pool, args.n_diverse)
-    anchors = crisis + uncertain + diverse
+    # De-duplicate by (seed, turn) — uncertain may overlap with
+    # crisis/diverse since we sampled independently from the same union.
+    seen = set()
+    anchors = []
+    for rec in crisis + uncertain + diverse:
+        key = (rec.get('seed_origin'), rec.get('turn_origin'))
+        if key in seen:
+            continue
+        seen.add(key)
+        anchors.append(rec)
     rng.shuffle(anchors)
 
     print(f"\nSampled:", flush=True)

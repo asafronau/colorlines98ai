@@ -2523,3 +2523,106 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      observation, retrained non-saturating value head). Scripts staged
      (`gen_b_selfplay.py`, `sample_b_anchors.py`, audit running);
      mining + training to follow.
+
+151. **K=128 audit on existing 16K oracle anchors — labels collapsed.**
+     Tested whether K=32 → K=128 changes ranking on the high-margin
+     subset (Δcap ≥ 0.15 at K=32, 1,525 anchors). B-vs-oracle agreement
+     on top-1 was 3.5%. On the 1,472 disagreements: **B wins 49.3%,
+     oracle wins 45.9%, ties 4.9%, mean Δcap = +0.003, median = 0**.
+     The "high-margin oracle labels" were sampling noise at 1.5σ. At
+     K=32, cap-rate sampling noise std ≈ 0.088; margin 0.15 is barely
+     above the noise floor. Path B v1's failure is now mechanistically
+     explained: it trained on labels that were noise. Plus: explicit
+     evidence that re-mining with K=128 on B-distribution states won't
+     help unless margins are gated much harder.
+
+152. **K=128 calibration on 100 fresh B-distribution anchors — oracle
+     mining is dead even at K=128.** Per ChatGPT's pre-commit rule, ran
+     a 100-anchor probe before spending 8h on full mining. Result:
+     **split-half winner agreement = 44%**, **Δcap≥0.25 stable yield
+     = 4%** (gate was ≥10% to proceed, <5% to abandon). Below every
+     threshold. Path B v2 (rollout mining on B's own distribution)
+     is structurally infeasible — the policy is uniform enough over
+     legal top-30 that K=128 rollouts can't separate moves with
+     statistical confidence at any reasonable margin tier. Closed
+     the oracle path entirely. Total saved compute: ~8h Colab + ~12h
+     training that wouldn't have produced learnable signal.
+
+153. **The under-commitment diagnostic.** Adding `analyze_target_
+     alignment.py` to compare model output vs V12 training targets on
+     the SAME action set revealed: V12 targets have top1_prob mean
+     0.261, but B_ep12 puts only **0.021** at the same action — **12×
+     less than the target asked for**. B's argmax agrees with target
+     argmax 62.5% of the time (good!), but its probability mass is
+     spread across non-target actions: only 9.7% of mass on the 5
+     trained target moves. The model has learned ranking direction
+     but not commitment scale. This is the actual training pathology
+     the whole oracle detour was a symptom of — V12 visit distributions
+     are soft (top1=0.26 on MCTS@400 visit counts), and training on
+     them with cross-entropy + dihedral × 8 + color × ~7! augmentation
+     produces a model that learns to be even FLATTER than the targets
+     demand (entropy invariance pressure).
+
+154. **Target temperature sharpening pilot — the breakthrough.** Test:
+     does sharpening V12 targets via `--target-temperature T` push the
+     model to commit? Pre-training entropy diagnostic on V12 targets
+     showed target top1 at T=1.0/0.75/0.50/0.25/0.10 = 0.26/0.28/0.31/
+     0.38/0.50. Ran sharp_75/sharp_50 (T=0.75 and 0.5) on Colab
+     G4-Blackwell, warm-start from B_smoke_epoch_12, otherwise identical
+     recipe. The `prob @ target_top1` metric stayed flat across all 24
+     epochs (0.021 → 0.021 for sharp_75, 0.022 for sharp_50) — looked
+     like the mechanism wasn't engaging. **Then gameplay eval revealed
+     the truth:**
+
+     | run | T | policy mean (500 seeds) | %>10K |
+     |---|---|---|---|
+     | B_ep12 baseline | — | 8,043 | 27% |
+     | sharp_75 | 0.75 | 8,817 (+10%) | 33% |
+     | **sharp_50** | **0.50** | **12,622 (+57%)** | **45%** |
+
+     Sharp_50 P95 hit 39,965 and seed 493 individually scored 89,508.
+     Project's 30K policy-only median target is now within reach. The
+     diagnostic metric was measuring the wrong axis — sharpening
+     improved feature quality at argmax even though softmax tail
+     stayed diffuse. Lesson: when a metric stays flat across
+     hyperparameter sweeps, eval gameplay directly before concluding
+     the mechanism didn't engage.
+
+155. **MCTS regime restored with stronger policy.** With B_ep12, MCTS@
+     100 + value_head_v12 + q=2.0 was net-NEGATIVE (mean dropped 4%):
+     value head saturated at max_score=30K and pruned B's better
+     moves. With sharp_50, the same MCTS recipe is **net-positive**:
+
+     | | sharp_50 policy | sharp_50 + MCTS@100, cap=20K |
+     |---|---|---|
+     | mean | 11,789 | **14,602 (+24%)** |
+     | P10 | 1,802 | 3,246 (+80%) |
+     | P50 | 8,964 | 12,080 (+35%) |
+     | P95 | 39,965 | 41,208 |
+     | %<1000 | 4.0% | 1.0% (−75%) |
+
+     The value head didn't change — the policy did. With a strong
+     enough prior, MCTS uses search to refine borderline cases rather
+     than wasting sims on obvious-good vs obvious-bad. The 8K-turn cap
+     was the binding constraint; raising to 20K shows MCTS uncapped at
+     14.6K mean (matches the prior pillar2z+MCTS@400 number of 15,465
+     at 1/4 the simulation cost — equal strength achieved by stronger
+     policy, not stronger search).
+
+156. **The teacher path is now visible.** Six weeks ago: pillar2z
+     policy mean 7,460, MCTS@400 plateau at 15,465, value head dead,
+     three iterations of DAgger/oracle/v3-head failed. Today: sharp_50
+     policy mean 11,789, sharp_50+MCTS@100 mean 14,602, sharp_50 P95
+     39,965 (single-game), 30K policy-only median achievable in 2-3
+     more iterations. The unlock was a **single hyperparameter**
+     (`--target-temperature 0.5`) applied on the existing pipeline.
+     Mechanism: V12 visit-distribution targets were softer than
+     necessary; the model trained to mimic that softness; sharpening
+     just before the CE loss forced commitment. None of the oracle /
+     DAgger / value-head experiments mattered for this discovery —
+     they only mattered for diagnosing where to look. The audit, the
+     gradient diagnostic, the K=128 calibration, the BN recalibration,
+     and the legal-distribution check all pointed at "the policy
+     isn't committing." Sharpening was the cheapest possible fix and
+     it engaged in the way ChatGPT had warned might happen: not via
+     the diagnostic-visible metric, but via the actual play quality.
