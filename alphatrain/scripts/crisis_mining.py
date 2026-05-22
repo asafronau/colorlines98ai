@@ -264,7 +264,7 @@ def _probe_worker(slot_id, seed_queue, task_queue, progress_queue,
             snapshot = dict(snapshots[rewind_idx])
             snapshot['original_seed'] = seed
             replay_seed = seed * 37 + rewind
-            task_queue.put((snapshot, replay_seed, sims, label))
+            task_queue.put((snapshot, replay_seed, sims, label, rewind))
             tasks_pushed += 1
 
         progress_queue.put((seed, 'died', tasks_pushed, skipped_existing))
@@ -304,7 +304,7 @@ def _replay_worker(slot_id, task_queue, result_queue,
         if task is None:
             break
 
-        snapshot, replay_seed, num_sims, label = task
+        snapshot, replay_seed, num_sims, label, rewind_turns = task
 
         mcts = MCTS(inference_client=client, max_score=max_score,
                     num_simulations=num_sims, batch_size=batch_size,
@@ -319,6 +319,8 @@ def _replay_worker(slot_id, task_queue, result_queue,
             feature_weights_path=feature_weights_path,
             value_head_path=value_head_path, q_weight=q_weight)
         result['label'] = label
+        result['rewind_turns'] = rewind_turns
+        result['continue_turns'] = continue_turns
         result['original_seed'] = snapshot.get('original_seed', replay_seed)
 
         cap = " [CAP]" if result.get('capped') else ""
@@ -482,7 +484,7 @@ def main():
                 snapshot = snapshots[rewind_idx]
                 snapshot['original_seed'] = seed
                 replay_seed = seed * 37 + rewind
-                replay_tasks.append((snapshot, replay_seed, sims, label))
+                replay_tasks.append((snapshot, replay_seed, sims, label, rewind))
             if (died + skipped) % 100 == 0:
                 print(f"  Probed {died + skipped}/{n_seeds}: "
                       f"{died} died, {skipped} survived, "
@@ -513,13 +515,17 @@ def main():
                     feature_weights_path=args.feature_value_weights,
                     value_head_path=args.value_head_path,
                     q_weight=args.q_weight)
-        for ti, (snapshot, replay_seed, sims, label) in enumerate(replay_tasks):
+        for ti, (snapshot, replay_seed, sims, label, rewind_turns) in enumerate(replay_tasks):
             result = replay_from_snapshot(
                 mcts, snapshot, replay_seed, sims,
                 args.continue_turns, args.max_turns,
                 feature_weights_path=args.feature_value_weights,
                 value_head_path=args.value_head_path,
                 q_weight=args.q_weight)
+            result['label'] = label
+            result['rewind_turns'] = rewind_turns
+            result['continue_turns'] = args.continue_turns
+            result['policy_max_turns'] = policy_max_turns
             orig_seed = snapshot.get('original_seed', replay_seed)
             fname = f"game_seed{orig_seed}_{label}_score{result['score']}.json"
             with open(os.path.join(args.save_dir, fname), 'w') as f:
@@ -652,6 +658,7 @@ def main():
                 result = result_queue.get(timeout=7200)
                 orig_seed = result.get('original_seed', result['seed'])
                 label = result.get('label', 'replay')
+                result['policy_max_turns'] = policy_max_turns
                 fname = f"game_seed{orig_seed}_{label}_score{result['score']}.json"
                 with open(os.path.join(args.save_dir, fname), 'w') as f:
                     json.dump(result, f)

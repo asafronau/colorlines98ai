@@ -50,7 +50,7 @@ Score progression across training iterations:
 | sharp_50 + MCTS@100 cap=20K | **14,602** | Same checkpoint with MCTS@100; +24% over policy alone. MCTS regime restored at this policy strength. |
 | **pillar3a = sharp_25_epoch_12** | **14,294** | + T=0.25 — extends the sharpening curve. +12% over sharp_50. Picked as new project baseline. (HISTORY 157) |
 | **pillar3a + MCTS@100 + value_head_pillar3a** | **21,310** | Retrained value head per HISTORY 158: +30% mean over OLD head. P50=17,644, P75=32,231 (25% of games above 30K target). New SOA. |
-| pillar4a (next) | TBD | Train on V13 corpus from pillar3a + MCTS@200 + new value head. Target: ≥+30% over pillar3a (≥18,500 policy). |
+| pillar3b (next) | TBD | Train on V13 corpus from pillar3a + MCTS@200 + new value head. Target: ≥+30% over pillar3a (≥18,500 policy). |
 
 ## Architecture
 

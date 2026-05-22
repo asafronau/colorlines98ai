@@ -2667,7 +2667,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      | **pillar3a** | **14,294** | **21,310** (new head) | **+49% MCTS** |
 
      One iteration on V12 (sharpening + value-head retrain) lifted
-     MCTS from 15K → 21K. If pillar4a (V13 corpus + sharpening) gives
+     MCTS from 15K → 21K. If pillar3b (V13 corpus + sharpening) gives
      another +30-50% via the now-properly-paired teacher signal,
      we land at 27-31K mean — at project target. The "2-3 more
      iterations" estimate looks conservative now.
