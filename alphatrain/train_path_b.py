@@ -9,8 +9,8 @@ Color permutation + dihedral augmentation are on by default (color was the
 The legacy name "train_path_b" comes from the Path B v1 oracle experiment
 (soft-KL auxiliary loss). That branch is closed (HISTORY 145, 151-152).
 This script is now V-corpus distillation only — no oracle path, no λ tuning,
-no auxiliary corpus. The training recipe that produces pillar3a / pillar4a /
-pillar5a is just this.
+no auxiliary corpus. The training recipe that produces pillar3a / pillar3b /
+pillar3c / ... is just this.
 
 Usage (Colab, ~12h for 17 epochs on G4 / L4):
     python -m alphatrain.train_path_b \\
@@ -19,8 +19,8 @@ Usage (Colab, ~12h for 17 epochs on G4 / L4):
         --resume alphatrain/data/pillar3a.pt --warm-start \\
         --epochs 17 --batch-size 32768 --lr 3e-4 --warmup-epochs 1 \\
         --target-temperature 0.5 \\
-        --copy-to /content/drive/MyDrive/alphatrain/pillar4a_best.pt \\
-        --save-dir /content/checkpoints/pillar4a
+        --copy-to /content/drive/MyDrive/alphatrain/pillar3b_best.pt \\
+        --save-dir /content/checkpoints/pillar3b
 
 To disable color augmentation (e.g., for ablation), pass --no-color-augment.
 To disable dihedral augmentation, pass --no-dihedral-augment. Default is
