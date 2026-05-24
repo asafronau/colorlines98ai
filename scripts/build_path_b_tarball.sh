@@ -47,6 +47,7 @@ tar czf $OUT \
     alphatrain/scripts/crisis_mining.py \
     alphatrain/scripts/build_expert_v2_tensor.py \
     alphatrain/scripts/fit_feature_value.py \
+    alphatrain/scripts/train_value_head.py \
     alphatrain/tests/__init__.py \
     alphatrain/tests/test_train_path_b.py \
     alphatrain/data/phase1_oracle_path_b.pt \

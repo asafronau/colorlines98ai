@@ -2671,3 +2671,101 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      another +30-50% via the now-properly-paired teacher signal,
      we land at 27-31K mean — at project target. The "2-3 more
      iterations" estimate looks conservative now.
+
+160. **Pillar3b lands (2026-05-22): policy mean 17,255 on
+     out-of-sample seeds 777000..777999, +15% over pillar3a.**
+     Decision gate cleared.
+
+     Training recipe: V13 corpus (9.16M states from selfplay@MCTS@400
+     + crisis@MCTS@600/400), warm-start from pillar3a (sharp_25_ep12),
+     17 epochs, target_temperature=0.5, lr=3e-4, batch 32K.
+
+     Per-epoch policy eval (500 seeds 0..499):
+
+     | ckpt | mean | P25 | P50 | P75 | <1000 | >10K |
+     |---|---|---|---|---|---|---|
+     | pillar3b_ep5  | 13,417 | 4,767 | 9,652  | 18,406 | 3.6% | 49% |
+     | pillar3b_ep10 | 17,489 | 5,488 | 13,199 | 24,190 | 5.6% | 59% |
+     | pillar3b_ep15 | 16,776 | 5,600 | 12,057 | 23,252 | 2.0% | 57% |
+     | pillar3b_ep20 | **18,863** | 5,815 | 14,232 | 26,442 | 2.4% | 60% |
+
+     Best by mean: epoch 20 (18,863). val_loss=2.1836 vs pillar3a's
+     2.2550 — drop is consistent with the gameplay lift.
+
+     Fresh out-of-sample comparison (seeds 0..499 were used during
+     pillar3a tuning, so they're overfit-suspect for SOA claims).
+     1000-seed eval on seeds 777000..777999:
+
+     | ckpt | mean | P10 | P25 | P50 | <1000 | >10K |
+     |---|---|---|---|---|---|---|
+     | sharp_25_ep12 (pillar3a) | 15,002 | 1,842 | 4,076 | 9,596  | 4.8% | 49% |
+     | **pillar3b_ep20**        | **17,255** | **2,476** | **5,483** | **12,567** | **2.5%** | **58%** |
+
+     Pillar3b gains: +15% mean, +35% P25, +31% P50, **floor halved**
+     (4.8% → 2.5%), +9pp on >10K rate. Both mean and floor moved.
+     The floor improvement is the most important signal — that's
+     where the gap to 30K+ best games lives.
+
+161. **Image-3 diagnostic (2026-05-22): the value head is the
+     leaf-evaluation bottleneck, not the search.**
+     See `docs/image3_value_head_diagnosis.md` for full write-up.
+
+     Concrete state where the only legal line-clearing move is
+     ranked #2-#3 by both pillar3a and pillar3b instead of #1.
+     Swept MCTS sims 100 → 3200, q_weight 0 → 3, c_puct 1.5 → 6.0,
+     Dirichlet noise. **Nothing flips the argmax to the clearing
+     move.** At ≥800 sims the top 3 candidates converge to within
+     ±0.1pp of each other — MCTS reports them as equivalent.
+
+     Crucially: at q_weight=0 (pure prior, no value head signal),
+     both pillar3a (clear at 20.0% behind pink-setup at 25.5%) and
+     pillar3b (clear at 20.7% behind pink-setup at 22.5%) show the
+     same bias. The bias is **in the policy prior, not the value
+     head**, but the value head also can't break the tie at q>0.
+
+     Likely root cause: value_head_sharp25_ep12 was trained on
+     V11-style **survival targets** (turns-until-death). It doesn't
+     differentiate "post-clear: +5pts, -5 balls, free turn" from
+     "post-pink-setup: line one closer to potential complete" — a
+     strong policy survives roughly equally from either state.
+
+     What this rules out for V14: more sims, q tuning, c_puct
+     tuning, more sharpening, "force the clears" hard supervision
+     (user-rejected — we want the model to learn *when* to clear).
+
+     What's likely required: a **score-aware value head**. Retrain
+     value head with targets = score gained over next H turns
+     (or score-per-turn density), not survival horizon. If the
+     post-clear state ranks measurably higher under this target,
+     the bias unlocks. Independent of pillar3c training. Cost ~3-5h.
+
+162. **Image-3 hypothesis REFUTED (2026-05-22 Phase 1 rollout judge).**
+     Common-RNG paired rollouts K=256 H=500 from the image-3 state
+     with pillar3b show the green-clear and pink-setup moves are
+     **statistically tied on score-over-horizon**:
+
+     | branch | mean Δscore (H=500) | A vs B win rate | die rate |
+     |---|---|---|---|
+     | A: green clear | 1004.9 | 43.8% | 2.0% |
+     | B: pink setup  | 1005.4 | **54.7%** | 3.1% |
+
+     Mean Δscore (A − B) = −0.5 ± 6.6 SE — CI crosses zero.
+     B's win-rate edge is statistically real (~3.5σ); the
+     +5 from immediate clear is recouped over horizon by bigger
+     clears in the patient branch. Pillar3b's preference for the
+     pink-setup is **correct** on this state. The visual "obvious
+     clear" intuition was confirmation bias on a near-tie.
+
+     This kills the score-aware-value-head retrain (HISTORY 161,
+     task #109) — based on a false premise. Engine mechanics
+     verified (calculate_score=n×(n−4), spawn suppressed on clear)
+     so the rules were never the issue.
+
+     Methodology lesson: visual analysis ≠ correct play. Always
+     run common-RNG rollouts before redesigning training
+     objectives. ChatGPT (2026-05-22) was right to push for a
+     direct rollout judge before approving compute on N=1.
+
+     Phase 2 (aggregate diagnostic across 100-300 clear-available
+     states) still worth running with corrected framing — but
+     priors now strongly suggest no systematic clear-undervaluation.
