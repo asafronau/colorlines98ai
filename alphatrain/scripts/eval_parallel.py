@@ -52,22 +52,90 @@ def _policy_server_worker(slot_id, seed_queue, result_queue,
     client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
                              request_queue, response_queue)
 
+    # Optional trajectory dump — instrumented per-turn metrics for failure
+    # analysis. Activated via env var POLICY_SAVE_TRAJ_DIR. Avoids touching
+    # the worker signature so eval_parallel still launches normally.
+    import os, json
+    save_dir = os.environ.get('POLICY_SAVE_TRAJ_DIR', '')
     while True:
         seed = seed_queue.get()
         if seed is None:
             break
         game = ColorLinesGame(seed=seed)
         game.reset()
+        traj = [] if save_dir else None
+        prev_score = 0
         while not game.game_over:
             obs_np = _build_obs_for_game(game)
             pol_np, _ = client.evaluate(obs_np)
             priors = _get_legal_priors_flat(game.board, pol_np, 30)
             if not priors:
                 break
+            # Snapshot pre-move metrics + full state (for Phase-B counterfactuals).
+            if traj is not None:
+                vals_arr = np.fromiter(priors.values(), dtype=np.float64)
+                vals_arr.sort()
+                top1 = float(vals_arr[-1]) if vals_arr.size else 0.0
+                top2 = float(vals_arr[-2]) if vals_arr.size > 1 else 0.0
+                # Largest empty component via BFS over empty cells
+                board_arr = game.board
+                visited = np.zeros_like(board_arr, dtype=bool)
+                lec = 0
+                n_components = 0
+                stack = []
+                for r0 in range(9):
+                    for c0 in range(9):
+                        if board_arr[r0, c0] != 0 or visited[r0, c0]:
+                            continue
+                        n_components += 1
+                        sz = 0
+                        stack.append((r0, c0))
+                        visited[r0, c0] = True
+                        while stack:
+                            r, c = stack.pop()
+                            sz += 1
+                            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                                nr, nc = r + dr, c + dc
+                                if (0 <= nr < 9 and 0 <= nc < 9
+                                        and not visited[nr, nc]
+                                        and board_arr[nr, nc] == 0):
+                                    visited[nr, nc] = True
+                                    stack.append((nr, nc))
+                        if sz > lec:
+                            lec = sz
+                traj.append({
+                    'turn': int(game.turns),
+                    'score': int(game.score),
+                    'empties': int((board_arr == 0).sum()),
+                    'lec': int(lec),
+                    'n_components': int(n_components),
+                    'n_legal_top30': len(priors),
+                    'top1_p': float(top1),
+                    'top1_top2_gap': float(top1 - top2),
+                    'board': board_arr.astype(np.int8).tolist(),
+                    'next_balls': [[[int(p[0]), int(p[1])], int(c)]
+                                    for p, c in game.next_balls],
+                })
             best = max(priors.items(), key=lambda x: x[1])[0]
             sf = best // 81
             tf = best % 81
-            game.move((sf // 9, sf % 9), (tf // 9, tf % 9))
+            res = game.move((sf // 9, sf % 9), (tf // 9, tf % 9))
+            if traj is not None and res.get('cleared', 0) > 0:
+                # Annotate the last entry with what the move cleared
+                traj[-1]['cleared'] = int(res['cleared'])
+                traj[-1]['score_delta'] = int(game.score - prev_score)
+            prev_score = game.score
+        if traj is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            with open(os.path.join(save_dir,
+                                    f'traj_seed{seed}.json'), 'w') as f:
+                json.dump({
+                    'seed': seed,
+                    'final_score': int(game.score),
+                    'final_turn': int(game.turns),
+                    'game_over': bool(game.game_over),
+                    'metrics': traj,
+                }, f)
         result_queue.put((seed, game.score, game.turns))
 
     obs_shm.close()
