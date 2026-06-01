@@ -15,6 +15,7 @@ Controls:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -192,6 +193,75 @@ class GameState:
         return True
 
 
+class _FakeGame:
+    """Minimal duck-typed stand-in so the draw_* helpers work in replay."""
+    board = None
+    next_balls = []
+    score = 0
+    turns = 0
+    game_over = False
+
+
+class ReplayState:
+    """Steps through a recorded game (scripts/find_worst_game.py output).
+
+    Each frame stores the board+next_balls BEFORE the move, plus the chosen
+    move and per-turn debug (empties, LEC, n_components, top-K policy).
+    Frames are pre-computed; no engine/RNG is run during replay.
+    """
+
+    def __init__(self, path):
+        with open(path) as fh:
+            self.data = json.load(fh)
+        self.frames = self.data['frames']
+        if not self.frames:
+            raise ValueError(f"No frames in {path}")
+        self.idx = 0
+        self.game = _FakeGame()
+        self.last_move = None
+        self.last_result = None
+        self.cur = None
+        self._load()
+
+    def _load(self):
+        fr = self.frames[self.idx]
+        self.cur = fr
+        self.game = _FakeGame()
+        self.game.board = np.array(fr['board'], dtype=np.int8)
+        self.game.next_balls = [(tuple(rc), int(c))
+                                 for rc, c in fr['next_balls']]
+        self.game.score = fr.get('score_before', fr['score'])
+        self.game.turns = fr['turn']
+        # game_over flag only meaningful on the last frame
+        self.game.game_over = (self.idx == len(self.frames) - 1
+                                and self.data.get('died', False))
+        cm = fr.get('chosen_move')
+        self.last_move = ((tuple(cm[0]), tuple(cm[1])) if cm else None)
+
+    def next(self):
+        if self.idx < len(self.frames) - 1:
+            self.idx += 1
+            self._load()
+
+    def prev(self):
+        if self.idx > 0:
+            self.idx -= 1
+            self._load()
+
+    def first(self):
+        self.idx = 0
+        self._load()
+
+    def last(self):
+        self.idx = len(self.frames) - 1
+        self._load()
+
+    def jump(self, frac):
+        self.idx = max(0, min(len(self.frames) - 1,
+                              int(frac * (len(self.frames) - 1))))
+        self._load()
+
+
 # ── Drawing ───────────────────────────────────────────────────────────────
 def cell_rect(r, c):
     return pygame.Rect(BOARD_X + c * CELL, BOARD_Y + r * CELL, CELL, CELL)
@@ -329,6 +399,136 @@ def draw_right_panel(surf, gs, font_small):
         surf.blit(loc_txt, (cx + radius + 12, cy - 8))
 
 
+def draw_replay_panel(surf, rs, font_small, font):
+    """Debug panel for replay mode: frame nav + per-turn metrics + top-K."""
+    fr = rs.cur
+    x = PANEL_X
+    y = PANEL_Y
+    n = len(rs.frames)
+
+    def line(text, color=TEXT, dy=18, fnt=font_small):
+        nonlocal y
+        surf.blit(fnt.render(text, True, color), (x, y))
+        y += dy
+
+    line(f"REPLAY  seed {rs.data.get('seed', '?')}", (140, 200, 255), 20)
+    model = os.path.basename(rs.data.get('model', ''))
+    line(model, TEXT_DIM, 22)
+
+    line(f"Frame {rs.idx + 1}/{n}", TEXT, 18)
+    line(f"Turn {fr['turn']}", TEXT, 18)
+    delta = fr['score'] - fr.get('score_before', fr['score'])
+    sc_txt = f"Score {fr.get('score_before', fr['score'])}"
+    if delta:
+        sc_txt += f"  (+{delta})"
+    line(sc_txt, (240, 220, 80) if delta else TEXT, 22)
+
+    # Fragmentation metrics — color LEC by danger
+    lec = fr['lec']
+    lec_color = ((240, 80, 80) if lec < 10
+                 else (240, 200, 80) if lec < 20 else (120, 220, 120))
+    line(f"Empties: {fr['empties']}", TEXT_DIM, 18)
+    line(f"LEC: {lec}", lec_color, 18)
+    line(f"Components: {fr['n_components']}", TEXT_DIM, 22)
+
+    # Chosen move
+    cm = fr.get('chosen_move')
+    if cm:
+        line(f"Move ({cm[0][0]},{cm[0][1]})->({cm[1][0]},{cm[1][1]})",
+             (80, 255, 180), 18)
+    res = fr.get('result')
+    if res and res.get('cleared'):
+        line(f"  cleared {res['cleared']} (+{res['score']})",
+             (240, 220, 80), 18)
+    if fr.get('no_legal_move'):
+        line("NO LEGAL MOVE — death", (240, 80, 80), 18)
+    y += 6
+
+    # Top-K policy
+    line("Top-K policy:", TEXT_DIM, 18)
+    chosen_t = tuple(map(tuple, cm)) if cm else None
+    for c in fr.get('top_k', [])[:8]:
+        mv = c['move']
+        mvt = (tuple(mv[0]), tuple(mv[1]))
+        is_chosen = (mvt == chosen_t)
+        col = (80, 255, 180) if is_chosen else TEXT_DIM
+        bar = '#' * int(round(c['prob'] * 20))
+        line(f"{c['prob']:.2f} {bar}", col, 15)
+
+
+def draw_replay_help(surf, font_small):
+    msg = ("[<- / ->] step   [Home/End] ends   "
+           "[Space] +10   [B] -10   [Esc] quit")
+    txt = font_small.render(msg, True, TEXT_DIM)
+    surf.blit(txt, (BOARD_X, BOARD_Y + BOARD_PX + 8))
+
+
+def replay_main(screen, clock, fonts, replay_path, start_frame=0):
+    """Replay loop: step through a recorded game with debug overlay."""
+    font_big, font, font_small = fonts
+    rs = ReplayState(replay_path)
+    if start_frame:
+        rs.idx = max(0, min(int(start_frame), len(rs.frames) - 1))
+        rs._load()
+    print(f"Replay: {replay_path} — {len(rs.frames)} frames, "
+          f"seed={rs.data.get('seed')}, final_score={rs.data.get('final_score')}, "
+          f"died={rs.data.get('died')}", flush=True)
+
+    btn_w, btn_h = 90, 40
+    by = BOARD_Y + BOARD_PX + (BOTTOM_BAR_H - btn_h) // 2
+    gap = 10
+    bx = MARGIN
+    btn_first = Button("|<", (bx, by, 50, btn_h), rs.first)
+    bx += 50 + gap
+    btn_prev = Button("< Prev", (bx, by, btn_w, btn_h), rs.prev)
+    bx += btn_w + gap
+    btn_next = Button("Next >", (bx, by, btn_w, btn_h), rs.next)
+    bx += btn_w + gap
+    btn_last = Button(">|", (bx, by, 50, btn_h), rs.last)
+    buttons = [btn_first, btn_prev, btn_next, btn_last]
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key in (pygame.K_RIGHT, pygame.K_n):
+                    rs.next()
+                elif event.key in (pygame.K_LEFT, pygame.K_p):
+                    rs.prev()
+                elif event.key == pygame.K_HOME:
+                    rs.first()
+                elif event.key == pygame.K_END:
+                    rs.last()
+                elif event.key == pygame.K_SPACE:
+                    for _ in range(10):
+                        rs.next()
+                elif event.key == pygame.K_b:
+                    for _ in range(10):
+                        rs.prev()
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for b in buttons:
+                    if b.handle_click(event.pos):
+                        break
+
+        screen.fill(BG)
+        draw_top_bar(screen, rs, "REPLAY MODE", font_big, font_small)
+        # Highlight the chosen move via the hint rings (src=blue, tgt=green)
+        draw_board(screen, rs, None, None, rs.last_move, font_small)
+        draw_replay_help(screen, font_small)
+        draw_replay_panel(screen, rs, font_small, font)
+        mouse_pos = pygame.mouse.get_pos()
+        for b in buttons:
+            b.draw(screen, font, mouse_pos)
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.quit()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
@@ -337,6 +537,13 @@ def main():
                          help='Path to PolicyNet checkpoint for AI features.')
     parser.add_argument('--seed', type=int, default=None,
                          help='Initial RNG seed (omit for random).')
+    parser.add_argument('--replay', type=str, default=None,
+                         help='Path to a recorded game JSON (from '
+                              'scripts/find_worst_game.py). Enters replay '
+                              'mode with debug overlay + next/prev.')
+    parser.add_argument('--replay-frame', type=int, default=0,
+                         help='Jump directly to this frame on open '
+                              '(e.g. a fork frame to inspect).')
     args = parser.parse_args()
 
     pygame.init()
@@ -346,6 +553,12 @@ def main():
     font_big = pygame.font.SysFont('Helvetica', 24, bold=True)
     font = pygame.font.SysFont('Helvetica', 16)
     font_small = pygame.font.SysFont('Helvetica', 13)
+
+    if args.replay:
+        pygame.display.set_caption("Color Lines 98 — Replay")
+        replay_main(screen, clock, (font_big, font, font_small), args.replay,
+                    start_frame=args.replay_frame)
+        return
 
     ai_player, ai_status = _try_load_model(args.model)
     if ai_player is None:
