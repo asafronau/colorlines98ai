@@ -30,6 +30,53 @@ import torch
 from multiprocessing import Process, Queue as MPQueue
 
 
+def _largest_empty_component(board):
+    """Size of the largest 4-connected empty region (for --record-game)."""
+    visited = np.zeros_like(board, dtype=bool)
+    best = 0
+    for r0 in range(9):
+        for c0 in range(9):
+            if board[r0, c0] != 0 or visited[r0, c0]:
+                continue
+            sz = 0
+            stack = [(r0, c0)]
+            visited[r0, c0] = True
+            while stack:
+                r, c = stack.pop()
+                sz += 1
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = r + dr, c + dc
+                    if (0 <= nr < 9 and 0 <= nc < 9
+                            and not visited[nr, nc] and board[nr, nc] == 0):
+                        visited[nr, nc] = True
+                        stack.append((nr, nc))
+            if sz > best:
+                best = sz
+    return int(best)
+
+
+def _count_empty_components(board):
+    """Number of 4-connected empty regions (for --record-game)."""
+    visited = np.zeros_like(board, dtype=bool)
+    n = 0
+    for r0 in range(9):
+        for c0 in range(9):
+            if board[r0, c0] != 0 or visited[r0, c0]:
+                continue
+            n += 1
+            stack = [(r0, c0)]
+            visited[r0, c0] = True
+            while stack:
+                r, c = stack.pop()
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = r + dr, c + dc
+                    if (0 <= nr < 9 and 0 <= nc < 9
+                            and not visited[nr, nc] and board[nr, nc] == 0):
+                        visited[nr, nc] = True
+                        stack.append((nr, nc))
+    return int(n)
+
+
 # ── Worker: policy-only player via GPU server ───────────────────────
 
 def _policy_server_worker(slot_id, seed_queue, result_queue,
@@ -57,6 +104,8 @@ def _policy_server_worker(slot_id, seed_queue, result_queue,
     # the worker signature so eval_parallel still launches normally.
     import os, json
     save_dir = os.environ.get('POLICY_SAVE_TRAJ_DIR', '')
+    record_path = os.environ.get('POLICY_RECORD_GAME', '')
+    max_turns = int(os.environ.get('POLICY_MAX_TURNS', '100000'))
     while True:
         seed = seed_queue.get()
         if seed is None:
@@ -64,8 +113,9 @@ def _policy_server_worker(slot_id, seed_queue, result_queue,
         game = ColorLinesGame(seed=seed)
         game.reset()
         traj = [] if save_dir else None
+        rec = [] if record_path else None  # play_gui --replay format
         prev_score = 0
-        while not game.game_over:
+        while not game.game_over and game.turns < max_turns:
             obs_np = _build_obs_for_game(game)
             pol_np, _ = client.evaluate(obs_np)
             priors = _get_legal_priors_flat(game.board, pol_np, 30)
@@ -119,11 +169,44 @@ def _policy_server_worker(slot_id, seed_queue, result_queue,
             best = max(priors.items(), key=lambda x: x[1])[0]
             sf = best // 81
             tf = best % 81
-            res = game.move((sf // 9, sf % 9), (tf // 9, tf % 9))
+            chosen = ((sf // 9, sf % 9), (tf // 9, tf % 9))
+
+            # Capture a play_gui --replay frame BEFORE executing the move.
+            if rec is not None:
+                board_arr = game.board
+                top_sorted = sorted(priors.items(), key=lambda x: -x[1])[:10]
+                rec_frame = {
+                    'turn': int(game.turns),
+                    'score_before': int(game.score),
+                    'board': board_arr.astype(np.int8).tolist(),
+                    'next_balls': [[[int(p[0]), int(p[1])], int(c)]
+                                    for p, c in game.next_balls],
+                    'empties': int((board_arr == 0).sum()),
+                    'lec': _largest_empty_component(board_arr),
+                    'n_components': _count_empty_components(board_arr),
+                    'chosen_move': [[int(chosen[0][0]), int(chosen[0][1])],
+                                    [int(chosen[1][0]), int(chosen[1][1])]],
+                    'top_k': [
+                        {'move': [[int((m // 81) // 9), int((m // 81) % 9)],
+                                  [int((m % 81) // 9), int((m % 81) % 9)]],
+                         'prob': float(pr)}
+                        for m, pr in top_sorted
+                    ],
+                }
+
+            res = game.move(*chosen)
             if traj is not None and res.get('cleared', 0) > 0:
                 # Annotate the last entry with what the move cleared
                 traj[-1]['cleared'] = int(res['cleared'])
                 traj[-1]['score_delta'] = int(game.score - prev_score)
+            if rec is not None:
+                rec_frame['score'] = int(game.score)
+                rec_frame['result'] = {
+                    'valid': bool(res.get('valid', True)),
+                    'cleared': int(res.get('cleared', 0)),
+                    'score': int(game.score - rec_frame['score_before']),
+                }
+                rec.append(rec_frame)
             prev_score = game.score
         if traj is not None:
             os.makedirs(save_dir, exist_ok=True)
@@ -135,6 +218,16 @@ def _policy_server_worker(slot_id, seed_queue, result_queue,
                     'final_turn': int(game.turns),
                     'game_over': bool(game.game_over),
                     'metrics': traj,
+                }, f)
+        if rec is not None:
+            with open(record_path, 'w') as f:
+                json.dump({
+                    'seed': seed,
+                    'model': '(eval_parallel policy server)',
+                    'final_score': int(game.score),
+                    'final_turns': int(game.turns),
+                    'died': bool(game.game_over),
+                    'frames': rec,
                 }, f)
         result_queue.put((seed, game.score, game.turns))
 
@@ -215,7 +308,8 @@ def _run_policy_server(args, task_seeds, total, device_str):
           f"\n{'='*60}", flush=True)
     server = InferenceServer(args.model, n_workers, device=device_str,
                              max_batch_per_worker=args.batch_size,
-                             use_compile=args.compile)
+                             use_compile=args.compile,
+                             fp16=not args.fp32)
     server.start()
 
     seed_queue = MPQueue()
@@ -357,46 +451,45 @@ def _run_mcts_local(args, task_seeds, total, device_str):
 # ── Output formatting ──────────────────────────────────────────────
 
 def _print_results_table(seeds, pol_results, mcts_results,
-                         show_pol=True, show_mcts=True):
+                         show_pol=True, show_mcts=True, show_scores=False):
     print(f"\n{'='*60}\nResults: {len(seeds)} seeds\n{'='*60}\n",
           flush=True)
 
     def by_seed(rs):
         d = {}
-        for seed, score, _ in rs:
-            d[seed] = score  # one game per seed
+        for seed, score, turns in rs:
+            d[seed] = (score, turns)  # one game per seed
         return d
-
-    header = f"{'Seed':>6}"
-    if show_pol:
-        header += f" | {'Pol':>6}"
-    if show_mcts:
-        header += f" | {'MCTS':>6}"
-    if show_pol and show_mcts:
-        header += f" | {'Chg':>5}"
-    print(header, flush=True)
-    print('-' * len(header), flush=True)
 
     pol_by = by_seed(pol_results) if pol_results else {}
     mcts_by = by_seed(mcts_results) if mcts_results else {}
-    pol_all, mcts_all = [], []
-    for s in seeds:
-        row = f"{s:>6}"
+    pol_all = [pol_by.get(s, (0, 0))[0] for s in seeds] if show_pol else []
+    mcts_all = [mcts_by.get(s, (0, 0))[0] for s in seeds] if show_mcts else []
+
+    if show_scores:
+        header = f"{'Seed':>6}"
         if show_pol:
-            ps = pol_by.get(s, 0)
-            pol_all.append(ps)
-            row += f" | {ps:>6}"
+            header += f" | {'Pol':>6}"
         if show_mcts:
-            ms = mcts_by.get(s, 0)
-            mcts_all.append(ms)
-            row += f" | {ms:>6}"
+            header += f" | {'MCTS':>6}"
         if show_pol and show_mcts:
-            pm = pol_by.get(s, 0)
-            mm = mcts_by.get(s, 0)
-            pct = (mm / pm - 1) * 100 if pm > 0 else 0
-            row += f" | {pct:>+4.0f}%"
-        print(row, flush=True)
-    print('-' * len(header), flush=True)
+            header += f" | {'Chg':>5}"
+        print(header, flush=True)
+        print('-' * len(header), flush=True)
+        for s in seeds:
+            row = f"{s:>6}"
+            if show_pol:
+                row += f" | {pol_by.get(s, (0, 0))[0]:>6}"
+            if show_mcts:
+                row += f" | {mcts_by.get(s, (0, 0))[0]:>6}"
+            if show_pol and show_mcts:
+                pm = pol_by.get(s, (0, 0))[0]
+                mm = mcts_by.get(s, (0, 0))[0]
+                pct = (mm / pm - 1) * 100 if pm > 0 else 0
+                row += f" | {pct:>+4.0f}%"
+            print(row, flush=True)
+        print('-' * len(header), flush=True)
+
     row = f"{'MEAN':>6}"
     if show_pol:
         row += f" | {np.mean(pol_all):>6.0f}"
@@ -408,15 +501,21 @@ def _print_results_table(seeds, pol_results, mcts_results,
         row += f" | {pct:>+4.0f}%"
     print(row, flush=True)
 
-    for label, all_scores in [("Pol", pol_all), ("MCTS", mcts_all)]:
+    for label, by, all_scores in [("Pol", pol_by, pol_all),
+                                    ("MCTS", mcts_by, mcts_all)]:
         if not all_scores:
-            continue
-        if (label == "Pol" and not show_pol) or \
-                (label == "MCTS" and not show_mcts):
             continue
         a = np.array(all_scores)
         n = len(a)
-        print(f"\n  {label} percentiles ({n} games):", flush=True)
+        imin = int(np.argmin(a))
+        imax = int(np.argmax(a))
+        min_seed, max_seed = seeds[imin], seeds[imax]
+        min_turns = by.get(min_seed, (0, 0))[1]
+        max_turns = by.get(max_seed, (0, 0))[1]
+        print(f"\n  {label} stats ({n} games):", flush=True)
+        print(f"    min={a.min():.0f} (seed {min_seed} @ {min_turns}t)  "
+              f"max={a.max():.0f} (seed {max_seed} @ {max_turns}t)  "
+              f"mean={a.mean():.0f}", flush=True)
         print(f"    P1={np.percentile(a,1):.0f}  P5={np.percentile(a,5):.0f}  "
               f"P10={np.percentile(a,10):.0f}  P25={np.percentile(a,25):.0f}  "
               f"P50={np.percentile(a,50):.0f}  P75={np.percentile(a,75):.0f}  "
@@ -478,7 +577,41 @@ def main():
     p.add_argument('--compile', action='store_true',
                    help='torch.compile(reduce-overhead) in the GPU server. '
                         'CUDA only; ignored elsewhere.')
+    p.add_argument('--show-scores', action='store_true',
+                   help='Print per-seed score table. Default off; summary '
+                        'stats (mean/min/max/percentiles/thresholds) always '
+                        'print.')
+    p.add_argument('--fp32', action='store_true',
+                   help='Run the policy inference server in fp32 instead of '
+                        'fp16. ~2x slower on MPS but DETERMINISTIC across '
+                        'device and batch size — a single-seed re-run '
+                        'reproduces the exact game from a multi-seed scan '
+                        '(fp16 diverges via batch-dependent kernel choice). '
+                        'Use with --record-game to autopsy a specific seed.')
+    p.add_argument('--record-game', type=str, default=None,
+                   help='Record the full per-turn trajectory (board, '
+                        'next_balls, top-K, LEC, n_components, chosen move) '
+                        'to this JSON path, in play_gui --replay format. '
+                        'Intended for a SINGLE --seeds value. Pair with '
+                        '--fp32 for an exactly-reproducible recording.')
     args = p.parse_args()
+
+    # Cap policy games at --max-turns (the worker had no cap → strong games
+    # ran to thousands of turns). Threaded via env to avoid touching the
+    # worker signature. A game hitting the cap is NOT a natural death.
+    os.environ['POLICY_MAX_TURNS'] = str(args.max_turns)
+
+    # Recording is wired into the policy worker via env var (avoids touching
+    # the worker process signature). Only meaningful with the policy player.
+    if args.record_game:
+        os.environ['POLICY_RECORD_GAME'] = args.record_game
+        if args.mcts_only:
+            raise SystemExit("--record-game needs the policy player; "
+                             "remove --mcts-only.")
+        if len(args.seeds) != 1:
+            print(f"  WARNING: --record-game with {len(args.seeds)} seeds; "
+                  f"each seed overwrites the same file. Pass one seed.",
+                  flush=True)
 
     if args.device:
         device_str = args.device
@@ -526,7 +659,8 @@ def main():
 
     _print_results_table(seeds, pol_results, mcts_results,
                          show_pol=not args.mcts_only,
-                         show_mcts=not args.policy_only)
+                         show_mcts=not args.policy_only,
+                         show_scores=args.show_scores)
 
 
 if __name__ == '__main__':

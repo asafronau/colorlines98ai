@@ -66,10 +66,11 @@ class InferenceServer:
 
     def __init__(self, model_path, num_workers, device=None,
                  max_batch_per_worker=MAX_BATCH, use_compile=False,
-                 value_head_path=None):
+                 value_head_path=None, fp16=True):
         self.model_path = model_path
         self.use_compile = use_compile
         self.value_head_path = value_head_path
+        self.fp16 = fp16
         self.num_workers = num_workers
         self.max_batch = max_batch_per_worker
 
@@ -107,7 +108,7 @@ class InferenceServer:
                   self.num_workers, self.max_batch,
                   self._obs_shm.name, self._pol_shm.name, self._val_shm.name,
                   self.request_queue, self.response_queues,
-                  self.use_compile, self.value_head_path),
+                  self.use_compile, self.value_head_path, self.fp16),
             daemon=True)
         self._process.start()
 
@@ -132,7 +133,7 @@ class InferenceServer:
 def _gpu_loop(model_path, device_str, num_workers, max_batch,
               obs_shm_name, pol_shm_name, val_shm_name,
               request_queue, response_queues, use_compile=False,
-              value_head_path=None):
+              value_head_path=None, fp16=True):
     """GPU inference process main loop.
 
     Gathers requests from multiple workers using busy-poll, then runs
@@ -154,9 +155,10 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     val_buf = np.ndarray((N, B), dtype=np.float32, buffer=val_shm.buf)
 
     device = torch.device(device_str)
+    compute_dtype = torch.float16 if fp16 else torch.float32
     from alphatrain.evaluate import load_model
     net, _ = load_model(model_path, device)
-    net = net.half()
+    net = net.to(compute_dtype)
 
     # Optional NN value head — runs over the SAME backbone features as
     # the policy. We don't trace the head separately; we'll trace the
@@ -170,7 +172,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
             load_any, DEFAULT_HORIZON_WEIGHTS)
         value_head, ckpt_meta, value_head_type = load_any(
             value_head_path, device=device)
-        value_head = value_head.half()
+        value_head = value_head.to(compute_dtype)
         value_head_target_type = ckpt_meta.get('target_type', 'survival')
         if value_head_type == 'spatial':
             horizon_weights = None
@@ -179,13 +181,13 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
         elif value_head_target_type == 'density':
             density_weights = (0.5, 0.3, 0.2)
             horizon_weights = torch.tensor(
-                density_weights, dtype=torch.float16, device=device)
+                density_weights, dtype=compute_dtype, device=device)
             print(f"  ValueHead (DENSITY mode) loaded from {value_head_path}, "
                   f"horizons={ckpt_meta.get('horizons')}, "
                   f"weights={density_weights}", flush=True)
         else:
             horizon_weights = torch.tensor(
-                DEFAULT_HORIZON_WEIGHTS, dtype=torch.float16, device=device)
+                DEFAULT_HORIZON_WEIGHTS, dtype=compute_dtype, device=device)
             print(f"  ValueHead (survival mode) loaded from {value_head_path}",
                   flush=True)
 
@@ -201,7 +203,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
         net = net.to(memory_format=torch.channels_last)
 
     dummy = torch.empty(1, 18, 9, 9,
-                        device=device, dtype=torch.float16,
+                        device=device, dtype=compute_dtype,
                         memory_format=mem_fmt).normal_()
 
     # Forward callable: either policy-only or fused (policy + scalar V).
@@ -249,7 +251,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
 
             forward_module = _PolicyValueWrapper(net, value_head,
                                                   horizon_weights, is_density)
-        forward_module = forward_module.to(device).half().eval()
+        forward_module = forward_module.to(device).to(compute_dtype).eval()
         returns_value = True
     else:
         forward_module = net
@@ -273,7 +275,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
 
     max_total = num_workers * max_batch
     gpu_obs = torch.empty(max_total, 18, 9, 9,
-                          device=device, dtype=torch.float16,
+                          device=device, dtype=compute_dtype,
                           memory_format=mem_fmt)
     obs_staging = np.empty((max_total,) + OBS_SHAPE, dtype=np.float32)
     # When no NN value head is configured, val_buf stays zero forever
@@ -284,7 +286,8 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
     total_evals = 0
     total_gpu_batches = 0
     t_start = time.time()
-    print(f"GPU inference server ready ({device_str}, fp16, "
+    print(f"GPU inference server ready ({device_str}, "
+          f"{'fp16' if fp16 else 'fp32'}, "
           f"{num_workers} slots, max_batch={max_batch})", flush=True)
 
     GPU_BATCH_CAP = num_workers * max_batch
@@ -336,7 +339,7 @@ def _gpu_loop(model_path, device_str, num_workers, max_batch,
                       obs_buf[slot_id, :count])
             total_count += count
         gpu_obs[:total_count] = torch.from_numpy(
-            obs_staging[:total_count]).half()
+            obs_staging[:total_count]).to(compute_dtype)
 
         with torch.inference_mode():
             if returns_value:
