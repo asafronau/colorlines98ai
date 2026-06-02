@@ -26,6 +26,8 @@ LO, HI, HORIZON = 15, 45, 300
 R_CURVE, R_SCREEN, R_CONFIRM = 100, 100, 500
 POL_K, FV_K = 10, 12
 BATCH = 128                             # rollout batch; bump on cuda (L4/A100)
+WORKERS = 1                             # parallel rollout workers (MPS ~1.4x; cuda more)
+COMPILE = False                         # torch.compile rollout forward (cuda only)
 REC_TAIL = 60                           # keep only last 60 frames (HI=45 + buffer) — tiny files
 MAX_SECONDS = 25000                     # ~7 h
 T0 = time.time()
@@ -52,7 +54,7 @@ def run(cmd, logpath):
 
 
 def main():
-    global N_TRY, SEED_START, MAX_SECONDS, REC_CAP, LO, HI, R_CURVE, R_SCREEN, R_CONFIRM, REC_DEVICE, BATCH
+    global N_TRY, SEED_START, MAX_SECONDS, REC_CAP, LO, HI, R_CURVE, R_SCREEN, R_CONFIRM, REC_DEVICE, BATCH, WORKERS, COMPILE
     if '--smoke' in sys.argv:
         N_TRY, REC_CAP, SEED_START = 3, 8000, 51000
         LO, HI = 20, 30
@@ -66,6 +68,8 @@ def main():
     R_SCREEN = _argint('--r-screen', R_SCREEN)
     R_CURVE = _argint('--r-curve', R_CURVE)
     R_CONFIRM = _argint('--r-confirm', R_CONFIRM)
+    WORKERS = _argint('--workers', WORKERS)
+    COMPILE = '--compile' in sys.argv
     log(f"HARVEST: seeds {SEED_START}..{SEED_START+N_TRY-1}; depths {LO}-{HI}; "
         f"horizon {HORIZON}; R curve/screen/confirm={R_CURVE}/{R_SCREEN}/{R_CONFIRM}; "
         f"rec_cap={REC_CAP}; max={MAX_SECONDS}s")
@@ -99,7 +103,9 @@ def main():
                   '--r-curve', str(R_CURVE), '--r-screen', str(R_SCREEN),
                   '--r-confirm', str(R_CONFIRM), '--pol-k', str(POL_K),
                   '--fv-k', str(FV_K), '--batch', str(BATCH),
-                  '--fp16', '--out', mpath],
+                  '--workers', str(WORKERS)] +
+                 (['--compile'] if COMPILE else []) +
+                 ['--fp16', '--out', mpath],
                  f'logs/harvest_mine_{seed}.log')
         if os.path.exists(mpath):
             swept.append((seed, g, mpath))

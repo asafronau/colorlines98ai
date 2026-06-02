@@ -29,6 +29,7 @@ from alphatrain.evaluate import load_model
 from alphatrain.mcts import (_build_obs_for_game, _get_legal_priors_flat,
                              _evaluate_features_linear)
 from scripts.batched_rollout import batched_rollout, restore, _decode
+from scripts.parallel_rollout import RolloutPool
 
 
 def _next_arrays(next_balls):
@@ -91,6 +92,12 @@ def main():
     p.add_argument('--band-hi', type=float, default=85.0)
     p.add_argument('--flag-gap', type=float, default=10.0)
     p.add_argument('--batch', type=int, default=128)
+    p.add_argument('--workers', type=int, default=1,
+                   help='Parallel rollout worker processes (1=single-process). '
+                        'MPS gains are modest (GPU-forward-bound, ~1.4x); cuda '
+                        'scales better. Persistent across all 3 phases.')
+    p.add_argument('--compile', action='store_true',
+                   help='torch.compile the rollout forward in workers (cuda only).')
     p.add_argument('--fp16', action='store_true')
     p.add_argument('--out', default=None)
     a = p.parse_args()
@@ -100,6 +107,8 @@ def main():
                        else 'cuda' if torch.cuda.is_available() else 'cpu')
     net, _ = load_model(a.model, dev, fp16=a.fp16)
     dtype = next(net.parameters()).dtype
+    pool = (RolloutPool(a.model, str(dev), a.fp16, a.workers, use_compile=a.compile)
+            if a.workers > 1 else None)
     fvw = None
     if a.fv_k > 0:
         w = np.load(a.fv_weights)
@@ -131,7 +140,8 @@ def main():
           flush=True)
 
     def run(jobs, tag):
-        res = batched_rollout(net, dev, dtype, jobs, a.horizon, batch=a.batch)
+        res = (pool.run(jobs, a.horizon, a.batch) if pool
+               else batched_rollout(net, dev, dtype, jobs, a.horizon, batch=a.batch))
         print(f"  [{tag}] {len(jobs)} rollouts, {time.time()-t0:.0f}s", flush=True)
         return res
 
@@ -239,6 +249,8 @@ def main():
     print(f"\n{n_real} REAL forks; band {len(band)} depths; "
           f"{sum(len(r['cand_rates']) for r in rows)} per-move labels; "
           f"{time.time()-t0:.0f}s. Wrote {out}", flush=True)
+    if pool:
+        pool.close()
 
 
 if __name__ == '__main__':
