@@ -55,6 +55,11 @@ os.makedirs('logs', exist_ok=True)
 os.makedirs('alphatrain/data/death_games', exist_ok=True)
 OUT = f'{DRIVE}/mine_colab___IDX__'
 os.makedirs(OUT, exist_ok=True)
+# RESUME: pull any already-mined files back so this run SKIPS them (idempotent
+# — safe to re-run after a disconnect; it continues where it left off)
+!cp -n {OUT}/mine_*.json logs/ 2>/dev/null
+print('resuming with', len([x for x in os.listdir('logs') if x.startswith('mine_')]),
+      'already-mined seeds')
 # crash-safe: copy new mine files to Drive every 5 min (local logs stay fast)
 get_ipython().system_raw(
     "nohup bash -c 'while true; do cp -u logs/mine_*.json " + OUT +
@@ -72,11 +77,14 @@ Plays to natural death, mines, confirms. Watch the `death .. -> mine` lines and
 `mine rc=0` counts. Mine files are streaming to Drive in the background."""
 
 RUN = """%cd /content
+# R_SCREEN=100 is high quality. Lower to ~50-60 for ~2x faster mining — the
+# R=500 confirm still gates fork quality; the screen just flags candidates.
+# Re-runnable: skips seeds already in logs/ (pulled from Drive above).
 !python scripts/overnight_systematic.py \\
-    --device cuda --batch 256 \\
+    --device cuda --batch 256 --r-screen 100 \\
     --seed-start __SEED__ --n-try 10000 --max-seconds 82800 \\
-    2>&1 | tee logs/mining___IDX__.log \\
-    | grep -E "death |mine rc|HARVEST|DONE|forks:|fork\\(s\\)"
+    2>&1 | tee -a logs/mining___IDX__.log \\
+    | grep -E "death |mine rc|HARVEST|DONE|forks:|fork\\(s\\)|skip"
 """
 
 FINAL = """# Final flush to Drive (catches the last <5 min not yet synced)
