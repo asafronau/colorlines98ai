@@ -109,6 +109,8 @@ def main():
     dtype = next(net.parameters()).dtype
     pool = (RolloutPool(a.model, str(dev), a.fp16, a.workers, use_compile=a.compile)
             if a.workers > 1 else None)
+    if a.compile and pool is None:        # compile the single-process rollout net
+        net = torch.compile(net)
     fvw = None
     if a.fv_k > 0:
         w = np.load(a.fv_weights)
