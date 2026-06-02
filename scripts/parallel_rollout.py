@@ -24,8 +24,8 @@ def _init(model_path, device_str, fp16, use_compile=False):
     torch.set_num_threads(1)
     dev = torch.device(device_str)
     net, _ = load_model(model_path, dev, fp16=fp16)
-    if use_compile and dev.type == 'cuda':   # cuda-only; MPS compile unsupported
-        net = torch.compile(net, mode='reduce-overhead')
+    if use_compile:   # measured ~1.38x forward on MPS; cuda typically more
+        net = torch.compile(net)
     _W['net'] = net
     _W['dev'] = dev
     _W['dtype'] = next(net.parameters()).dtype

@@ -107,3 +107,43 @@ better GPU. To get 4× on Colab we must make the rollout **GPU-bound**:
    games before trusting any mined fork.
 3. If staying on CPU game logic: the M5 ceiling is ~1.9×; combine with the
    `--r-screen` knob (algorithmic, ~2× fewer rollouts) for ~3–4× more games/hour.
+
+## More measurements (2026-06-02 cont.)
+
+### torch.compile (forward)
+Works on MPS (contrary to the old "MPS unsupported" note): **1.38× faster
+forward** (batch 256: 13.9→10.0 ms). But the compile WARMUP is paid per process,
+and `overnight` is subprocess-per-game, so a single game's mining only saw
+**1.07×** (warmup ate the gain). It pays off only with a persistent process; on
+cuda it's a bigger win and the inference server already supports `--compile`.
+Enabled for MPS too in `parallel_rollout`/`mine_crisis_sweep --compile`.
+
+### Can a CPU-only second process harvest the idle 18 cores? No (+1.5%)
+Measured (`bench_cpu_gpu.py`): **CPU-only rollout = 154 turns/s vs GPU = 10,603
+turns/s — the CPU is ~69× slower** at the conv forward (the dominant 81%). A
+parallel CPU process would add only ~1.5%. The idle cores are idle because the
+expensive work (the policy forward) is GPU-friendly / CPU-hostile; threading is
+already maxed. So there is **no free throughput to harvest on the M5** — the one
+GPU is the saturated bottleneck.
+
+## The GPU-vectorized rollout engine (`scripts/gpu_engine.py`) — the real lever
+
+Runs the ENTIRE Color Lines rollout on-device (batched move / line-clear / spawn
+/ reachability / obs), with **zero per-step CPU↔GPU round-trip**.
+- **Verified correct:** `legal_mask` bit-exact (200/200), `clear_lines_at`
+  bit-exact (300/300), catastrophe-rate **parity** vs the CPU engine within
+  Monte-Carlo noise (max |Δ|/2SE = 0.67). Spawn matches the DISTRIBUTION (random-
+  key top-k uniform empties), not PCG64 — which is all a Monte-Carlo estimate needs.
+- **M5: 0.92× (slightly slower)** — M5 is GPU-bound, so moving the (cheap-on-CPU)
+  game logic ONTO the bottleneck GPU costs more than it saves. M5 can't benefit.
+- **Colab A100 (expected): the 4×+ win** — it removes the 2-vCPU game-logic
+  bottleneck that caps Colab today and lets the fast GPU run flat-out. UNVERIFIED
+  locally; verify with `python scripts/gpu_engine.py --parity cuda`.
+- **Generalizes:** the same engine = batched policy EVAL (returns scores → P5/P10/
+  <1000; a Colab win there too), and its verified batched primitives are the
+  groundwork for a future GPU-batched MCTS (the self-play lever). Not used by
+  current MCTS self-play (tree search, not policy rollout).
+
+**Net:** vectorization was the right call — it's the only path to 4×+ (on a fast
+GPU). On the M5 the answer is "the GPU is the wall; use `--workers` (1.38×) and/or
+`--r-screen` and the fleet." The win is on Colab, pending the cuda verification.
