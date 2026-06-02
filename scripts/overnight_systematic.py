@@ -63,6 +63,9 @@ def main():
     MAX_SECONDS = _argint('--max-seconds', MAX_SECONDS)
     REC_DEVICE = _argstr('--device', REC_DEVICE)
     BATCH = _argint('--batch', BATCH)
+    R_SCREEN = _argint('--r-screen', R_SCREEN)
+    R_CURVE = _argint('--r-curve', R_CURVE)
+    R_CONFIRM = _argint('--r-confirm', R_CONFIRM)
     log(f"HARVEST: seeds {SEED_START}..{SEED_START+N_TRY-1}; depths {LO}-{HI}; "
         f"horizon {HORIZON}; R curve/screen/confirm={R_CURVE}/{R_SCREEN}/{R_CONFIRM}; "
         f"rec_cap={REC_CAP}; max={MAX_SECONDS}s")
@@ -75,6 +78,9 @@ def main():
             log(f"TIME GUARD ({MAX_SECONDS}s) — stop launching."); break
         gpath = f'alphatrain/data/death_games/death_{seed}.json'
         mpath = f'logs/mine_{seed}.json'
+        if os.path.exists(mpath):            # idempotent resume — already mined
+            log(f"seed {seed}: already mined — skip")
+            continue
         # play to natural death (fp16) → record trajectory
         run([PY, 'scripts/find_worst_game.py', '--model', MODEL,
              '--record-seed', str(seed), '--max-turns', str(REC_CAP),
