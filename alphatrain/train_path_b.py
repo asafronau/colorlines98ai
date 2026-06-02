@@ -41,6 +41,7 @@ from torch.utils.data import DataLoader
 
 from alphatrain.counterfactual import (
     build_corpus as build_aux_corpus,
+    build_crisis_corpus,
     listwise_margin_loss,
     preflight_metrics as aux_preflight_metrics,
     DEFAULT_MARGIN as AUX_DEFAULT_MARGIN,
@@ -49,6 +50,35 @@ from alphatrain.counterfactual import (
 )
 from alphatrain.dataset import NUM_CHANNELS, TensorDatasetGPU
 from alphatrain.model import AlphaTrainNet, count_parameters
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def frozen_bn(model):
+    """Put BatchNorm layers in eval mode for the duration of a forward pass.
+
+    The aux corpus is out-of-distribution (dense late-game crisis boards). A
+    train-mode aux forward UPDATES BN running mean/var toward that distribution
+    — and inference uses those running stats, so the deployed policy gets
+    poisoned (train loss stays fine on batch stats while val/gameplay degrade;
+    see the BN-contamination lessons). Splitting the forward fixed the loss
+    contamination but NOT the running-stat update. Freezing BN here makes the
+    aux forward normalize with the SAME running stats inference uses (so the
+    aux teaches inference-mode behavior) and stops the poisoning. Affine
+    params + conv/linear weights still receive gradients.
+    """
+    bns = [m for m in model.modules()
+           if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    prev = [m.training for m in bns]
+    for m in bns:
+        m.eval()
+    try:
+        yield
+    finally:
+        for m, p in zip(bns, prev):
+            m.train(p)
 
 
 def cross_entropy_soft(logits, targets):
@@ -102,6 +132,11 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
         ptr: persistent int across batches (passed as a mutable list).
     """
     model.train(True)
+    # Aux forward goes through the UNCOMPILED module (shares parameters with the
+    # compiled `model`). Toggling BN.eval() on a torch.compile'd model is
+    # unreliable — the compiled graph may have specialized on training=True, so
+    # the frozen-BN switch might not take effect. The eager module respects it.
+    base_model = getattr(model, '_orig_mod', model)
     use_amp = amp_dtype != torch.float32
     total_loss = 0.0
     total_aux = 0.0
@@ -129,9 +164,18 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                     aux['target_lambda'], aux['warmup_epochs'])
                 if lam > 0.0:
                     aux_obs, aux_idx = _next_aux_batch(aux)
-                    aux_out = model(aux_obs)
+                    # Freeze BN + use the eager module so the OOD crisis states
+                    # don't poison BN running stats (which inference uses) and
+                    # the freeze actually takes effect under torch.compile.
+                    with frozen_bn(base_model):
+                        aux_out = base_model(aux_obs)
                     aux_logits = (aux_out[0] if isinstance(aux_out, tuple)
                                   else aux_out)
+                    # Anti-dilution: weight each crisis fork by its (normalized)
+                    # confirmed catastrophe gap so the high-value forks dominate
+                    # the aux gradient instead of being averaged into noise.
+                    anchor_w = (aux['weight'][aux_idx]
+                                if aux.get('weighted') else None)
                     aux_loss = listwise_margin_loss(
                         aux_logits,
                         aux['winner_idx'][aux_idx],
@@ -140,7 +184,8 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                         aux['loser_mask'][aux_idx],
                         margin=aux['margin'],
                         top1_weight=aux['top1_weight'],
-                        other_weight=aux['other_weight'])
+                        other_weight=aux['other_weight'],
+                        anchor_weight=anchor_w)
                     loss = main_loss + lam * aux_loss
                     total_aux += float(aux_loss.detach())
                     aux_steps += 1
@@ -209,27 +254,49 @@ def _next_aux_batch(aux):
 
 
 @torch.no_grad()
-def _run_preflight(model, aux, device, amp_dtype, epoch, step_in_epoch,
-                    steps_per_epoch):
-    """Run preflight metrics on the full aux corpus and print."""
-    was_training = model.training
-    model.train(False)
+def _preflight_on(model, sub, batch_size, margin, device, amp_dtype):
+    """Run preflight metrics on a sub-corpus dict (obs/winner/top1/loser/mask)."""
     use_amp = amp_dtype != torch.float32
-    N = aux['obs'].size(0)
-    bs = max(1, aux['batch_size'])
+    N = sub['obs'].size(0)
+    bs = max(1, batch_size)
     chunks = []
     with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
         for i in range(0, N, bs):
-            out = model(aux['obs'][i:i+bs])
+            out = model(sub['obs'][i:i+bs])
             chunks.append(out[0] if isinstance(out, tuple) else out)
     logits = torch.cat(chunks, dim=0).float()
-    m = aux_preflight_metrics(
-        logits, aux['winner_idx'], aux['top1_idx'],
-        aux['loser_idx'], aux['loser_mask'], margin=aux['margin'])
-    print(f"  [preflight ep{epoch+1} step {step_in_epoch}/{steps_per_epoch}] "
-          f"top1_flip={m['stored_top1_flip_rate']:.4f} "
-          f"clean_margin@{aux['margin']}={m['all_clean_loser_margin_rate']:.4f}",
-          flush=True)
+    return aux_preflight_metrics(
+        logits, sub['winner_idx'], sub['top1_idx'],
+        sub['loser_idx'], sub['loser_mask'], margin=margin)
+
+
+@torch.no_grad()
+def _run_preflight(model, aux, device, amp_dtype, epoch, step_in_epoch,
+                    steps_per_epoch):
+    """Preflight metrics on the (train) aux corpus and the held-out split.
+
+    The held-out fork metrics are the load-bearing signal: pillar3c regressed
+    while train metrics looked fine, so we watch whether the safe-move ranking
+    generalizes to forks from UNSEEN games (project_pillar3c_failure.md).
+    """
+    was_training = model.training
+    model.train(False)
+
+    def _fmt(tag, m):
+        return (f"  [{tag} ep{epoch+1} step {step_in_epoch}/{steps_per_epoch}] "
+                f"flip={m['stored_top1_flip_rate']:.3f} "
+                f"margin(win-pol)={m['mean_top1_margin']:+.2f} "
+                f"conc={m['clean_loser_concordance']:.3f} "
+                f"clean@{aux['margin']}={m['all_clean_loser_margin_rate']:.3f}")
+
+    m = _preflight_on(model, aux, aux['batch_size'], aux['margin'],
+                      device, amp_dtype)
+    print(_fmt('preflight', m), flush=True)
+    if aux.get('heldout') is not None:
+        mh = _preflight_on(model, aux['heldout'], aux['batch_size'],
+                           aux['margin'], device, amp_dtype)
+        print(_fmt('heldout ', mh), flush=True)
+
     if (aux.get('abort_flip_rate') is not None
             and step_in_epoch >= aux.get('abort_after_step', 0)
             and m['stored_top1_flip_rate'] < aux['abort_flip_rate']):
@@ -329,7 +396,46 @@ def main():
     p.add_argument('--aux-abort-after-step', type=int, default=500,
                    help='Earliest step (within an epoch) at which abort can '
                         'trigger. Default 500 matches Phase 3 plan.')
+    # Crisis-fork aux loss (the floor work). Same listwise-margin machinery as
+    # --aux-counterfactual, but fed CI-confirmed R=500 forks from the
+    # rewind-from-death harvest (logs/mine_*.json) instead of R=24 stationary
+    # counterfactuals. These two flags are mutually exclusive.
+    p.add_argument('--aux-crisis', type=str, default=None,
+                   help='Glob of mine_crisis_sweep outputs (e.g. '
+                        '"logs/mine_*.json"). Builds the confirmed-fork aux '
+                        'corpus and adds the floor-aware listwise-margin loss.')
+    p.add_argument('--aux-crisis-corpus', type=str, default=None,
+                   help='Path to a PRE-BUILT crisis corpus .pt '
+                        '(scripts/build_crisis_corpus_file.py). Use this on '
+                        'Colab instead of --aux-crisis so you upload one small '
+                        'file, not the mine/death JSON tree.')
+    p.add_argument('--aux-crisis-death-dir',
+                   default='alphatrain/data/death_games',
+                   help='Directory of death_{seed}.json (for the policy move).')
+    p.add_argument('--aux-clean-loser-margin', type=float, default=10.0,
+                   help='A candidate is a clean loser only if its catastrophe '
+                        'exceeds the winner by >= this many pp (noise guard; '
+                        'R=100 gap SE ~7pp).')
+    p.add_argument('--aux-min-gap', type=float, default=0.0,
+                   help='Drop confirmed forks whose catastrophe gap is below '
+                        'this (pp). 0 = keep all CI-confirmed forks.')
+    p.add_argument('--aux-weighted', action='store_true',
+                   help='Weight each fork by its normalized confirmed gap in '
+                        'the listwise loss (anti-dilution; high-gap forks '
+                        'dominate). Off = uniform.')
+    p.add_argument('--aux-holdout-frac', type=float, default=0.0,
+                   help='Fraction of SEEDS held out of aux training and '
+                        'monitored separately (generalization check). 0=off.')
+    p.add_argument('--aux-split-seed', type=int, default=0,
+                   help='RNG seed for the by-seed held-out split.')
+    p.add_argument('--max-train-states', type=int, default=0,
+                   help='Cap on base training states (local smoke only; '
+                        '0 = use all). Subsamples the main corpus, not the aux.')
     args = p.parse_args()
+    if (bool(args.aux_crisis or args.aux_crisis_corpus)
+            and bool(args.aux_counterfactual)):
+        raise SystemExit("--aux-crisis[-corpus] and --aux-counterfactual are "
+                         "mutually exclusive.")
 
     # Device
     if torch.cuda.is_available():
@@ -355,6 +461,10 @@ def main():
         device=str(device),
         seed=42,
     )
+    if args.max_train_states and args.max_train_states < len(train_set.base_indices):
+        train_set.base_indices = train_set.base_indices[:args.max_train_states]
+        print(f"  SUBSAMPLE: train base states capped to "
+              f"{len(train_set.base_indices):,} (local smoke)", flush=True)
     train_loader = DataLoader(train_set, batch_size=args.batch_size,
                               shuffle=True, num_workers=0,
                               collate_fn=train_set.collate)
@@ -487,6 +597,97 @@ def main():
               f"warmup_ep={args.aux_warmup_epochs} batch={args.aux_batch_size}",
               flush=True)
         # Baseline preflight before any optimization steps.
+        _run_preflight(model, aux, device, amp_dtype,
+                       epoch=-1, step_in_epoch=0,
+                       steps_per_epoch=len(train_loader))
+
+    # Crisis-fork aux corpus setup (the floor work)
+    if args.aux_crisis or args.aux_crisis_corpus:
+        if args.aux_crisis_corpus:
+            print(f"\nLoading pre-built crisis corpus: "
+                  f"{args.aux_crisis_corpus}", flush=True)
+            raw = torch.load(args.aux_crisis_corpus, map_location='cpu',
+                             weights_only=False)
+            corpus = {k: (v.to(device) if torch.is_tensor(v) else v)
+                      for k, v in raw.items()}
+        else:
+            print(f"\nBuilding crisis-fork aux corpus: {args.aux_crisis}",
+                  flush=True)
+            corpus = build_crisis_corpus(
+                args.aux_crisis, death_dir=args.aux_crisis_death_dir,
+                device=str(device),
+                clean_loser_margin=args.aux_clean_loser_margin,
+                min_gap=args.aux_min_gap)
+        cs = corpus['_stats']
+        print(f"  {cs['n_anchors']} confirmed forks from {cs['n_seeds']} seeds "
+              f"/ {cs['n_files']} games; {cs['n_clean_pairs']} clean-loser "
+              f"pairs (dropped {cs['n_unconfirmed']} unconfirmed, "
+              f"{cs['n_degenerate']} degenerate)", flush=True)
+
+        with torch.no_grad():
+            full_obs = train_set._build_obs_core(
+                corpus['boards'].long(), next_pos=corpus['next_pos'],
+                next_col=corpus['next_col'], n_next=corpus['n_next'])
+            if device.type == 'cuda':
+                full_obs = full_obs.contiguous(
+                    memory_format=torch.channels_last)
+
+        # By-seed held-out split (anchors from one game are correlated; split
+        # by seed so held-out forks genuinely test generalization).
+        seeds_t = corpus['seed']
+        uniq = sorted(set(int(s) for s in seeds_t.tolist()))
+        n_hold = (max(1, int(round(args.aux_holdout_frac * len(uniq))))
+                  if args.aux_holdout_frac > 0 else 0)
+        if n_hold > 0:
+            g = torch.Generator().manual_seed(args.aux_split_seed)
+            hperm = torch.randperm(len(uniq), generator=g).tolist()
+            hold_seeds = set(uniq[i] for i in hperm[:n_hold])
+            hold_mask = torch.tensor([int(s) in hold_seeds
+                                      for s in seeds_t.tolist()],
+                                     device=device)
+        else:
+            hold_mask = torch.zeros(len(seeds_t), dtype=torch.bool,
+                                    device=device)
+        tr = (~hold_mask).nonzero(as_tuple=True)[0]
+        ho = hold_mask.nonzero(as_tuple=True)[0]
+        # Renormalize train weights to mean 1 over the TRAIN subset so λ keeps
+        # its meaning after the held-out anchors are removed.
+        w_tr = corpus['weight'][tr]
+        w_tr = w_tr / w_tr.mean().clamp(min=1e-6)
+        N_aux = tr.numel()
+        aux = {
+            'obs': full_obs[tr],
+            'winner_idx': corpus['winner_idx'][tr],
+            'top1_idx': corpus['top1_idx'][tr],
+            'loser_idx': corpus['loser_idx'][tr],
+            'loser_mask': corpus['loser_mask'][tr],
+            'weight': w_tr,
+            'weighted': args.aux_weighted,
+            'batch_size': args.aux_batch_size,
+            'target_lambda': args.aux_lambda,
+            'margin': args.aux_margin,
+            'top1_weight': args.aux_top1_weight,
+            'other_weight': args.aux_other_weight,
+            'warmup_epochs': args.aux_warmup_epochs,
+            'preflight_every': args.aux_preflight_every,
+            'abort_flip_rate': args.aux_abort_flip_rate,
+            'abort_after_step': args.aux_abort_after_step,
+            'perm': torch.randperm(N_aux, device=device),
+            'ptr': [0],
+        }
+        if ho.numel() > 0:
+            aux['heldout'] = {
+                'obs': full_obs[ho],
+                'winner_idx': corpus['winner_idx'][ho],
+                'top1_idx': corpus['top1_idx'][ho],
+                'loser_idx': corpus['loser_idx'][ho],
+                'loser_mask': corpus['loser_mask'][ho],
+            }
+        print(f"  train forks={N_aux} heldout forks={ho.numel()} "
+              f"({n_hold}/{len(uniq)} seeds); weighted={args.aux_weighted} "
+              f"λ={args.aux_lambda} margin={args.aux_margin} "
+              f"warmup_ep={args.aux_warmup_epochs} batch={args.aux_batch_size}",
+              flush=True)
         _run_preflight(model, aux, device, amp_dtype,
                        epoch=-1, step_in_epoch=0,
                        steps_per_epoch=len(train_loader))
