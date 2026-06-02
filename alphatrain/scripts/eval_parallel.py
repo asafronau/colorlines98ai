@@ -105,7 +105,7 @@ def _policy_server_worker(slot_id, seed_queue, result_queue,
     import os, json
     save_dir = os.environ.get('POLICY_SAVE_TRAJ_DIR', '')
     record_path = os.environ.get('POLICY_RECORD_GAME', '')
-    max_turns = int(os.environ.get('POLICY_MAX_TURNS', '100000'))
+    max_turns = int(os.environ.get('POLICY_MAX_TURNS', '1000000'))
     while True:
         seed = seed_queue.get()
         if seed is None:
@@ -552,7 +552,11 @@ def main():
     p.add_argument('--override-threshold', type=float, default=0.0,
                    help='Skip MCTS pick if visit count is too close to '
                         "policy's pick (0.2 = 20%%). 0 = always trust MCTS.")
-    p.add_argument('--max-turns', type=int, default=5000)
+    p.add_argument('--max-turns', type=int, default=1_000_000,
+                   help='Turn cap. Default 1,000,000 = effectively no cap '
+                        '(games play to natural death, per project policy; no '
+                        'game reaches this — max observed ~70k turns). Lower '
+                        'it only to bound wall-clock on a quick smoke.')
     p.add_argument('--device', default=None,
                    help='mps/cuda/cpu. Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
@@ -643,6 +647,15 @@ def main():
     print(f"Model: {args.model}", flush=True)
 
     task_seeds = list(seeds)
+
+    # The policy player runs only through the GPU inference server — there is no
+    # CPU policy path. Asking for it on cpu used to SILENTLY return 0-score
+    # games (every seed 0@0t); crash loudly instead of producing garbage.
+    if not args.mcts_only and device_str == 'cpu':
+        raise SystemExit(
+            "Policy eval requires a GPU device (the inference server has no CPU "
+            "path; --device cpu silently yields 0-score games). Use "
+            "--device mps or --device cuda. (For CPU, run MCTS-only.)")
 
     # ── Policy phase ──
     pol_results = []

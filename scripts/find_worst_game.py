@@ -20,6 +20,7 @@ Usage:
 """
 from __future__ import annotations
 import argparse
+import collections
 import json
 import os
 import sys
@@ -94,11 +95,17 @@ def _scan_one(args):
     return (seed, int(g.score), int(g.turns), bool(g.game_over))
 
 
-def record_game(net, device, net_dtype, seed, max_turns, top_k=10):
-    """Replay a single seed, recording full per-turn debug info."""
+def record_game(net, device, net_dtype, seed, max_turns, top_k=10, tail=0):
+    """Replay a seed, recording per-turn debug info.
+
+    tail>0 keeps only the LAST `tail` frames — all we need, since mining rewinds
+    at most ~45 plies. This keeps a natural-death recording tiny (a few dozen
+    frames) no matter how long the game runs (could be 70k+ turns).
+    """
     g = ColorLinesGame(seed=seed)
     g.reset()
-    frames = []
+    frames = collections.deque(maxlen=tail) if tail else []
+    t0 = time.time()
     while not g.game_over and g.turns < max_turns:
         board = g.board.copy()
         next_balls = [[list(rc), int(c)] for rc, c in g.next_balls]
@@ -141,7 +148,10 @@ def record_game(net, device, net_dtype, seed, max_turns, top_k=10):
         if not result['valid']:
             g.game_over = True
             break
-    return frames, int(g.score), int(g.turns), bool(g.game_over)
+        if g.turns % 2000 == 0:
+            print(f"    ...recording turn {g.turns}, score {g.score} "
+                  f"({time.time()-t0:.0f}s)", flush=True)
+    return list(frames), int(g.score), int(g.turns), bool(g.game_over)
 
 
 def main():
@@ -153,6 +163,10 @@ def main():
     p.add_argument('--workers', type=int, default=12)
     p.add_argument('--device', default='cpu', choices=['cpu', 'mps', 'cuda'])
     p.add_argument('--top-k', type=int, default=10)
+    p.add_argument('--record-tail', type=int, default=0,
+                   help='Keep only the last N recorded frames (0=all). Mining '
+                        'rewinds <=~45 plies, so ~60 keeps a natural-death '
+                        'death-game file tiny regardless of game length.')
     p.add_argument('--out', default='alphatrain/data/worst_game.json')
     p.add_argument('--scan-out', default='alphatrain/data/worst_game_scan.json',
                    help='Where to dump the full scan table (all seeds).')
@@ -180,7 +194,7 @@ def main():
               f"(device={device.type}, dtype={net_dtype}) ===", flush=True)
         frames, fscore, fturns, fdied = record_game(
             net, device, net_dtype, args.record_seed, args.max_turns,
-            top_k=args.top_k)
+            top_k=args.top_k, tail=args.record_tail)
         rec = {
             'seed': args.record_seed, 'model': args.model,
             'final_score': fscore, 'final_turns': fturns, 'died': fdied,

@@ -178,6 +178,7 @@ def main():
         rows.append({'depth': depth, 'turn': turn, 'empties': empt,
                      'board': anchor['board'], 'next_balls': anchor['next_balls'],
                      'pol_cat': pol_cat, 'best_cat': cat[best_ci],
+                     'pol_move': list(map(list, cand[pol_i])),
                      'best_move': list(map(list, cand[best_ci])), 'gap': gap,
                      'flag': flag,
                      'cand_rates': [[list(map(list, cand[ci])), cat[ci], a.r_screen]

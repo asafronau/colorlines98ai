@@ -20,17 +20,23 @@ FV_WEIGHTS = 'alphatrain/data/feature_value_weights_2y_nb.npz'
 
 # ── config ──
 SEED_START, N_TRY = 50000, 40
-REC_CAP, MIN_TURN = 12000, 50          # play to natural death; skip cap-hits
-REC_DEVICE = 'mps'                      # fp16 recording (precision irrelevant — re-eval'd fresh)
+REC_CAP, MIN_TURN = 1_000_000, 50      # NO cap — record to TRUE natural death
+REC_DEVICE = 'mps'                      # fp16 recording (precision irrelevant — re-eval'd fresh); 'cuda' on Colab
 LO, HI, HORIZON = 15, 45, 300
 R_CURVE, R_SCREEN, R_CONFIRM = 100, 100, 500
 POL_K, FV_K = 10, 12
+BATCH = 128                             # rollout batch; bump on cuda (L4/A100)
+REC_TAIL = 60                           # keep only last 60 frames (HI=45 + buffer) — tiny files
 MAX_SECONDS = 25000                     # ~7 h
 T0 = time.time()
 
 
 def _argint(flag, default):
     return int(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else default
+
+
+def _argstr(flag, default):
+    return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 
 
 def log(msg):
@@ -46,7 +52,7 @@ def run(cmd, logpath):
 
 
 def main():
-    global N_TRY, SEED_START, MAX_SECONDS, REC_CAP, LO, HI, R_CURVE, R_SCREEN, R_CONFIRM
+    global N_TRY, SEED_START, MAX_SECONDS, REC_CAP, LO, HI, R_CURVE, R_SCREEN, R_CONFIRM, REC_DEVICE, BATCH
     if '--smoke' in sys.argv:
         N_TRY, REC_CAP, SEED_START = 3, 8000, 51000
         LO, HI = 20, 30
@@ -55,6 +61,8 @@ def main():
     N_TRY = _argint('--n-try', N_TRY)
     SEED_START = _argint('--seed-start', SEED_START)
     MAX_SECONDS = _argint('--max-seconds', MAX_SECONDS)
+    REC_DEVICE = _argstr('--device', REC_DEVICE)
+    BATCH = _argint('--batch', BATCH)
     log(f"HARVEST: seeds {SEED_START}..{SEED_START+N_TRY-1}; depths {LO}-{HI}; "
         f"horizon {HORIZON}; R curve/screen/confirm={R_CURVE}/{R_SCREEN}/{R_CONFIRM}; "
         f"rec_cap={REC_CAP}; max={MAX_SECONDS}s")
@@ -70,6 +78,7 @@ def main():
         # play to natural death (fp16) → record trajectory
         run([PY, 'scripts/find_worst_game.py', '--model', MODEL,
              '--record-seed', str(seed), '--max-turns', str(REC_CAP),
+             '--record-tail', str(REC_TAIL),
              '--device', REC_DEVICE, '--out', gpath], 'logs/harvest_record.log')
         if not os.path.exists(gpath):
             log(f"seed {seed}: record failed; skip."); continue
@@ -83,7 +92,8 @@ def main():
                   '--lo', str(LO), '--hi', str(HI), '--horizon', str(HORIZON),
                   '--r-curve', str(R_CURVE), '--r-screen', str(R_SCREEN),
                   '--r-confirm', str(R_CONFIRM), '--pol-k', str(POL_K),
-                  '--fv-k', str(FV_K), '--fp16', '--out', mpath],
+                  '--fv-k', str(FV_K), '--batch', str(BATCH),
+                  '--fp16', '--out', mpath],
                  f'logs/harvest_mine_{seed}.log')
         if os.path.exists(mpath):
             swept.append((seed, g, mpath))
