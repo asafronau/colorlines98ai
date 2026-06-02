@@ -147,3 +147,13 @@ Runs the ENTIRE Color Lines rollout on-device (batched move / line-clear / spawn
 **Net:** vectorization was the right call — it's the only path to 4×+ (on a fast
 GPU). On the M5 the answer is "the GPU is the wall; use `--workers` (1.38×) and/or
 `--r-screen` and the fleet." The win is on Colab, pending the cuda verification.
+
+### `--r-screen 50` (measured, fork-preserving)
+On a fork-rich game (seed 21517): `--r-screen 50` found the **same 5 confirmed
+forks at the same depths** as `--r-screen 100`, in **6m41 vs 9m30 = 1.42×** faster.
+The forks (gaps 10–27pp) clear the noisier R=50 screen easily, and the R=500
+confirm gates quality regardless. Recommended default for the SCALED harvest
+(`--r-screen 50`, optionally `--r-curve 50` to approach 2×); only very-marginal
+forks (gap ≲10pp) risk being missed on some games — acceptable since volume
+dominates (the fork-count learning curve). It stacks with `--workers` and the
+fleet, and is device-independent (helps Colab too).
