@@ -77,11 +77,15 @@ Plays to natural death, mines, confirms. Watch the `death .. -> mine` lines and
 `mine rc=0` counts. Mine files are streaming to Drive in the background."""
 
 RUN = """%cd /content
-# --r-screen 50: verified fork-preserving at 1.42x (vs 100) — the R=500 confirm
-# still gates fork quality; the screen just flags candidates. Re-runnable: skips
-# seeds already in logs/ (pulled from Drive above), so a disconnect/restart resumes.
+# --r-screen 50: verified fork-preserving at 1.42x (vs 100); R=500 confirm gates
+#   quality, the screen just flags candidates.
+# --workers 8: cuda runs the per-process forwards CONCURRENTLY (unlike MPS, which
+#   serializes), so workers parallelize the CPU game logic + overlap the GPU.
+#   Single-process (workers 1) leaves the L4/A100 mostly idle. Tune up toward the
+#   vCPU count if the GPU isn't saturated.
+# Re-runnable: skips seeds already in logs/ (pulled from Drive), so restart resumes.
 !python scripts/overnight_systematic.py \\
-    --device cuda --batch 256 --r-screen 50 \\
+    --device cuda --batch 256 --r-screen 50 --workers 8 \\
     --seed-start __SEED__ --n-try 10000 --max-seconds 82800 \\
     2>&1 | tee -a logs/mining___IDX__.log \\
     | grep -E "death |mine rc|HARVEST|DONE|forks:|fork\\(s\\)|skip"
