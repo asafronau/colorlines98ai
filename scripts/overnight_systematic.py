@@ -85,11 +85,13 @@ def main():
         if os.path.exists(mpath):            # idempotent resume — already mined
             log(f"seed {seed}: already mined — skip")
             continue
-        # play to natural death (fp16) → record trajectory
-        run([PY, 'scripts/find_worst_game.py', '--model', MODEL,
-             '--record-seed', str(seed), '--max-turns', str(REC_CAP),
-             '--record-tail', str(REC_TAIL),
-             '--device', REC_DEVICE, '--out', gpath], 'logs/harvest_record.log')
+        # record to natural death — but SKIP if already recorded (e.g. by the
+        # fast batched pass scripts/batch_record.py). Idempotent two-pass workflow.
+        if not os.path.exists(gpath):
+            run([PY, 'scripts/find_worst_game.py', '--model', MODEL,
+                 '--record-seed', str(seed), '--max-turns', str(REC_CAP),
+                 '--record-tail', str(REC_TAIL),
+                 '--device', REC_DEVICE, '--out', gpath], 'logs/harvest_record.log')
         if not os.path.exists(gpath):
             log(f"seed {seed}: record failed; skip."); continue
         g = json.load(open(gpath))
