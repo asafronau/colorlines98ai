@@ -77,11 +77,11 @@ Plays to natural death, mines, confirms. Watch the `death .. -> mine` lines and
 `mine rc=0` counts. Mine files are streaming to Drive in the background."""
 
 RUN = """%cd /content
-# R_SCREEN=100 is high quality. Lower to ~50-60 for ~2x faster mining — the
-# R=500 confirm still gates fork quality; the screen just flags candidates.
-# Re-runnable: skips seeds already in logs/ (pulled from Drive above).
+# --r-screen 50: verified fork-preserving at 1.42x (vs 100) — the R=500 confirm
+# still gates fork quality; the screen just flags candidates. Re-runnable: skips
+# seeds already in logs/ (pulled from Drive above), so a disconnect/restart resumes.
 !python scripts/overnight_systematic.py \\
-    --device cuda --batch 256 --r-screen 100 \\
+    --device cuda --batch 256 --r-screen 50 \\
     --seed-start __SEED__ --n-try 10000 --max-seconds 82800 \\
     2>&1 | tee -a logs/mining___IDX__.log \\
     | grep -E "death |mine rc|HARVEST|DONE|forks:|fork\\(s\\)|skip"
