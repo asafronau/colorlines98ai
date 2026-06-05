@@ -374,20 +374,28 @@ class ColorLinesGame:
             for i in range(n)
         ]
 
-    def _spawn_balls(self) -> int:
-        spawned = 0
+    def _spawn_balls(self) -> list[tuple[int, int]]:
+        """Spawn this turn's balls; return their ACTUAL landing cells.
+
+        A ball whose intended cell is occupied is displaced to a random empty
+        cell. Callers must clear-check the RETURNED landing cells, not
+        ``self.next_balls`` (the intended positions) — otherwise a line
+        completed by a displaced ball is never detected/cleared.
+        """
+        landed = []
         for (row, col), color in self.next_balls:
             if self.board[row, col] == 0:
                 self.board[row, col] = color
-                spawned += 1
+                landed.append((row, col))
             else:
                 empty = _get_empty_array(self.board)
                 if len(empty) > 0:
                     idx = self.rng.randint(0, len(empty))
-                    self.board[empty[idx, 0], empty[idx, 1]] = color
-                    spawned += 1
+                    r, c = int(empty[idx, 0]), int(empty[idx, 1])
+                    self.board[r, c] = color
+                    landed.append((r, c))
         self._cc_labels = None
-        return spawned
+        return landed
 
     # ── Masks ─────────────────────────────────────────────────────────
 
@@ -446,9 +454,10 @@ class ColorLinesGame:
             result['cleared'] = cleared
         else:
             # No line cleared → spawn new balls
-            self._spawn_balls()
-            # Check if spawned balls created lines
-            for (br, bc), _ in self.next_balls:
+            landed = self._spawn_balls()
+            # Check if spawned balls created lines — at their ACTUAL landing
+            # cells (a displaced ball lands somewhere other than its intended cell)
+            for (br, bc) in landed:
                 if self.board[br, bc] != 0:
                     spawn_cleared = _clear_lines_at(self.board, br, bc)
                     if spawn_cleared > 0:
@@ -493,8 +502,8 @@ class ColorLinesGame:
             total_pts = calculate_score(cleared)
             self.score += total_pts
         else:
-            self._spawn_balls()
-            for (br, bc), _ in self.next_balls:
+            landed = self._spawn_balls()
+            for (br, bc) in landed:
                 if self.board[br, bc] != 0:
                     spawn_cleared = _clear_lines_at(self.board, br, bc)
                     if spawn_cleared > 0:
@@ -524,8 +533,8 @@ class ColorLinesGame:
         if cleared > 0:
             self.score += calculate_score(cleared)
         else:
-            self._spawn_balls()
-            for (br, bc), _ in self.next_balls:
+            landed = self._spawn_balls()
+            for (br, bc) in landed:
                 if self.board[br, bc] != 0:
                     spawn_cleared = _clear_lines_at(self.board, br, bc)
                     if spawn_cleared > 0:

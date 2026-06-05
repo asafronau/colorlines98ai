@@ -24,24 +24,34 @@ def code(text):
 cells = []
 
 cells.append(md(r"""
-# Pillar3d: crisis-fork floor distillation (pillar3c done right)
+# Pillar3d (Track 1): crisis-fork floor distillation on the CLEAN fork subset
 
 ## Goal
 
-Lift pillar3b's policy-only **floor** (P5 1,576 -> >=2,500, <1000 rate 2.5% -> <=1.5%)
-WITHOUT regressing the mean (17,255) more than ~5%. Policy-only / browser-WASM target.
+Lift pillar3b's policy-only **floor** (fixed-engine baseline: mean 17,581, P5 1,452,
+P10 2,377, <1000 2.9%, <500 0.3%) WITHOUT regressing the mean more than ~5%.
+Policy-only / browser-WASM target. This is the **conservative Track-1 calibration**:
+the cleanest fork subset + a small aux nudge, to validate the augment->distill->floor-eval
+pipeline before scaling to the harder clustered forks.
 
 ## Method
 
-Same listwise-margin auxiliary loss as pillar3c, but fed **CI-confirmed R=500 crisis
-forks** from the rewind-from-death harvest instead of the R=24 stationary
-counterfactuals that made pillar3c regress. pillar3c's three root causes and the fixes:
+Listwise-margin auxiliary loss fed **CI-confirmed R=500 crisis forks**, but on the
+**Track-1 CLEAN subset only**: forks that are (a) **isolated** (no adjacent confirmed
+fork) and (b) **non-clearing** (the policy move does not complete a line). This removes
+the "phantom forks" we diagnosed -- a *correct* move (often a forced clear) blamed for a
+*downstream* blunder, because the greedy-rollout judge can't separate move quality from
+the policy's own later mistake. Phantoms cluster on the turns before a real blunder, so
+isolated + non-clearing forks are the highest-trust signal: **479 clean forks** (from
+1,209 confirmed; dropped 572 clustered + 158 clearing-policy-move).
 
-| pillar3c failure | pillar3d fix |
+pillar3c's three root causes and the fixes carried here:
+
+| pillar3c failure | fix |
 |---|---|
 | R=24 labels too noisy | R=500 paired-bootstrap, keep only CI-excludes-0 forks |
-| argmax-flip too aggressive on wrong winners | winners are confirmed lower-catastrophe moves |
-| "val loss missed it" | we watch **held-out fork flip-rate** (by-seed split), not val CE |
+| argmax-flip too aggressive | confirmed winners + clean isolated subset + **lambda=0.05** (was 0.15) |
+| "val loss missed it" | watch **held-out fork flip-rate** (by-seed split) + val CE within 5% |
 
 Per confirmed fork: winner = confirmed safe move, top1(loser) = the move the policy
 actually played (higher catastrophe), clean losers = candidates >=10pp worse than the
@@ -58,15 +68,16 @@ That +3.3 gap is what training must close. Local smoke already moved **held-out*
 ## Required Drive uploads (`MyDrive/alphatrain/`)
 
 1. `colorlines_pillar3d.tar.gz` -- code archive (build command below)
-2. `crisis_corpus_v1.pt` -- pre-built confirmed-fork corpus (tiny, ~0.1 MB)
+2. `crisis_corpus_track1.pt` -- pre-built confirmed-fork corpus (tiny, ~0.1 MB)
 3. `v13_pillar3a.pt.gz` -- V13 tensor (already on Drive from pillar3b)
 4. `pillar3b_epoch_20.pt` -- warm-start checkpoint (already on Drive)
 
 **Build the tarball + corpus locally first** (from repo root, AFTER the harvest finishes):
 ```bash
-# 1. (re)build the confirmed-fork corpus from the full harvest
+# 1. (re)build the Track-1 CLEAN corpus (isolated + non-clearing forks)
 PYTHONPATH=. python scripts/build_crisis_corpus_file.py \
-    --out alphatrain/data/crisis_corpus_v1.pt
+    --isolated --drop-clearing \
+    --out alphatrain/data/crisis_corpus_track1.pt
 
 # 2. code archive
 tar czf colorlines_pillar3d.tar.gz \
@@ -85,7 +96,7 @@ tar czf colorlines_pillar3d.tar.gz \
     game/
 ```
 
-Then upload `colorlines_pillar3d.tar.gz` and `crisis_corpus_v1.pt` to `MyDrive/alphatrain/`.
+Then upload `colorlines_pillar3d.tar.gz` and `crisis_corpus_track1.pt` to `MyDrive/alphatrain/`.
 """.strip()))
 
 cells.append(code(
@@ -109,8 +120,8 @@ shutil.copy(f'{DRIVE}/pillar3b_epoch_20.pt',
 print(f'pillar3b: {os.path.getsize("/content/alphatrain/data/pillar3b_epoch_20.pt")/1e6:.0f} MB')
 
 # Crisis-fork corpus (separate small upload; rebuilt after each harvest)
-cc = '/content/alphatrain/data/crisis_corpus_v1.pt'
-shutil.copy(f'{DRIVE}/crisis_corpus_v1.pt', cc)
+cc = '/content/alphatrain/data/crisis_corpus_track1.pt'
+shutil.copy(f'{DRIVE}/crisis_corpus_track1.pt', cc)
 print(f'crisis corpus: {os.path.getsize(cc)/1e6:.2f} MB')
 
 # V13 training tensor (~5 GB after decompression)
@@ -148,23 +159,26 @@ cells.append(code(r"""
 %cd /content
 !PYTHONPATH=. python scripts/eval_fork_ranking.py \
     --model alphatrain/data/pillar3b_epoch_20.pt \
-    --corpus alphatrain/data/crisis_corpus_v1.pt \
+    --corpus alphatrain/data/crisis_corpus_track1.pt \
     --holdout-frac 0.2 --split-seed 0
 """.strip()))
 
 cells.append(md(r"""
-## Train pillar3d (primary: lambda=0.15, weighted, held-out monitored)
+## Train pillar3d Track 1 (lambda=0.05, weighted, held-out monitored)
 
-~12h on L4/A100. Checkpoints copied to Drive every epoch via `--copy-to`.
+~12h on L4/A100. Checkpoints copied to Drive every epoch via `--copy-to`. This is the
+**conservative** run: small aux nudge (lambda=0.05) on the clean isolated fork subset.
+No auto-abort guard here -- at lambda=0.05 the flip rises slowly during the 2-epoch
+warmup, so a step-500 abort would false-trip; instead WATCH the prints and the val CE.
 
 **Watch the preflight prints** (every 200 main steps; both `preflight` = train forks
 and `heldout ` = unseen-game forks):
 - `flip` should rise on BOTH train and heldout (heldout rising = the fix generalizes,
-  not memorization). Step-500 train flip auto-aborts if < 0.05 (aux too weak).
-- `margin(win-pol)` should climb from ~ -3.3 toward 0+ (winner overtaking the policy move).
+  not memorization). With lambda=0.05 expect a gentle rise, not a jump.
+- `margin(win-pol)` should climb from negative toward 0+ (winner overtaking the policy move).
 - `conc` should stay high (~0.71+); a drop means we're damaging the good ranking.
-- **`V12 val: loss`** must stay within ~5% of pillar3b's (~2.18). If it climbs, the aux is
-  over-pushing and breaking the policy (pillar3c's failure mode) -> lower lambda.
+- **`val: loss`** must stay within ~5% of pillar3b's (~2.18). If it climbs, the aux is
+  over-pushing and breaking the policy (pillar3c's failure mode) -> lower lambda further.
 """.strip()))
 
 cells.append(code(r"""
@@ -175,12 +189,11 @@ cells.append(code(r"""
     --resume alphatrain/data/pillar3b_epoch_20.pt --warm-start \
     --epochs 17 --batch-size 32768 --lr 3e-4 --warmup-epochs 1 \
     --target-temperature 0.5 \
-    --aux-crisis-corpus alphatrain/data/crisis_corpus_v1.pt --aux-weighted \
+    --aux-crisis-corpus alphatrain/data/crisis_corpus_track1.pt --aux-weighted \
     --aux-holdout-frac 0.2 --aux-split-seed 0 \
-    --aux-lambda 0.15 --aux-margin 0.25 \
+    --aux-lambda 0.05 --aux-margin 0.25 \
     --aux-batch-size 128 --aux-warmup-epochs 2.0 \
     --aux-preflight-every 200 \
-    --aux-abort-flip-rate 0.05 --aux-abort-after-step 500 \
     --copy-to /content/drive/MyDrive/alphatrain/pillar3d_best.pt \
     --save-dir /content/checkpoints/pillar3d 2>&1 | tee /content/pillar3d_train.log
 """.strip()))
@@ -206,7 +219,7 @@ cells.append(code(r"""
 EP = 17  # edit to taste
 !PYTHONPATH=. python scripts/eval_fork_ranking.py \
     --model /content/checkpoints/pillar3d/epoch_{EP}.pt \
-    --corpus alphatrain/data/crisis_corpus_v1.pt \
+    --corpus alphatrain/data/crisis_corpus_track1.pt \
     --holdout-frac 0.2 --split-seed 0
 """.strip()))
 
@@ -231,30 +244,33 @@ helped. After downloading the checkpoints (eval_parallel prints mean/percentiles
 to stdout -- tee it to a log; it has no --output flag):
 
 ```bash
-# Policy-only floor eval on 1000 OOS seeds (pillar3b's eval range, for comparison).
+# Policy-only floor eval (FIXED engine). MUST use the SAME 2000-seed range as the
+# baseline so floor percentiles are comparable: seeds 777000-778999.
 # NOTE: the policy player runs through the GPU inference server -- use --device
-# mps (M5) or cuda, NOT cpu (eval_parallel skips the policy server on cpu and
-# silently returns 0-score games).
-for ep in 8 11 14 17; do
-    echo "===== pillar3d epoch ${ep} ====="
+# mps (M5) or cuda, NOT cpu (eval_parallel crashes on cpu policy eval by design).
+for ep in 5 8 10; do
+    echo "===== pillar3d-track1 epoch ${ep} ====="
     python -m alphatrain.scripts.eval_parallel \
         --model alphatrain/data/pillar3d_epoch_${ep}.pt --policy-only \
-        --seeds $(seq 777000 777999) \
+        --seeds $(seq 777000 778999) \
         --device mps --workers 16 \
-        2>&1 | tee alphatrain/data/pillar3d_ep${ep}_eval.log | grep -E 'P5|P10|mean|<1000|>5000'
+        2>&1 | tee alphatrain/data/pillar3d_ep${ep}_eval.log | grep -E 'P5|P10|mean|<1000|<500|>5000'
 done
 ```
 
-**Decision gate** (vs pillar3b: mean 17,255, P5 1,576, <1000 rate 2.5%):
+**Decision gate** (vs pillar3b FIXED-engine baseline: mean 17,581, P5 1,452, P10 2,377,
+<1000 2.9%, <500 0.3%):
 
 | outcome | criterion |
 |---|---|
-| Strong win | P5 >= 2500 AND <1000 <= 1.0% AND mean >= 16,400 |
-| Acceptable | P5 >= 2200 AND <1000 <= 1.5% AND mean >= 16,400 |
-| No-go | mean drops > 10% OR floor doesn't improve |
+| Strong win | P10 >= 3,200 AND <1000 <= 1.8% AND mean >= 16,700 |
+| Acceptable | P10 >= 2,700 AND <1000 <= 2.4% AND mean >= 16,700 |
+| No-go | mean drops > 8% OR floor (P10 / <1000) doesn't improve |
 
-If the floor improves but is undersized, scale the harvest (more seeds -> more
-confirmed forks -> denser crisis-state coverage) and rebuild the corpus.
+Track 1 is a CALIBRATION: even "acceptable" validates the augment->distill->floor-eval
+loop. If the floor improves but is undersized, go to Track 2 (the local-search judge
+cleans the clustered forks -> ~2-3x more clean signal), then re-mine on this improved
+policy (labels are pi-relative).
 """.strip()))
 
 nb = {"cells": cells,

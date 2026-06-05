@@ -183,10 +183,62 @@ def listwise_margin_loss(logits,
     return per_anchor.mean()
 
 
+def soft_correction_loss(logits, tgt_idx, tgt_prob,
+                         anchor_weight=None, target_temperature=1.0):
+    """Weighted (optionally sharpened) soft cross-entropy toward the MCTS visit dist.
+
+    The MCTS-corrections target (vs the listwise margin): at each correction state
+    the target is the MCTS visit distribution over the top-K moves, so we distill
+    the policy toward it directly.
+
+    logits:      (B, 6561) — model output on the canonical correction obs batch
+    tgt_idx:     (B, K) long  — top-K MCTS move indices (0 in pad slots)
+    tgt_prob:    (B, K) float — their probs, renormalized over the stored top-K
+                 (0 in pad slots, so they contribute nothing)
+    anchor_weight: (B,) float or None — confidence weight (e.g. normalized margin);
+                 scales each anchor BEFORE the mean (anti-dilution).
+    target_temperature < 1.0 sharpens the target (commit to the high-visit move),
+                 matching the main distillation's --target-temperature.
+
+    Returns scalar loss.
+    """
+    logp = F.log_softmax(logits, dim=-1)
+    gathered = torch.gather(logp, 1, tgt_idx)                        # (B, K) log q
+    p = tgt_prob
+    if target_temperature != 1.0:
+        p = p.pow(1.0 / target_temperature)
+        p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    per_anchor = -(p * gathered).sum(dim=1)                          # (B,) soft CE
+    if anchor_weight is not None:
+        per_anchor = per_anchor * anchor_weight
+    return per_anchor.mean()
+
+
 def _move_index_from_list(m):
     """Coerce a [[sr,sc],[dr,dc]] move (JSON form) → flat 6561 index."""
     (sr, sc), (dr, dc) = m
     return (int(sr) * BOARD_SIZE + int(sc)) * 81 + (int(dr) * BOARD_SIZE + int(dc))
+
+
+def _move_clears(board, move):
+    """True if `move` completes a line of >=5 (i.e. it's a clearing move).
+
+    Used by the Track-1 clean filter: a clearing policy move is the phantom-fork
+    signature (a correct/necessary clear getting blamed for a downstream blunder),
+    so we drop those anchors. Reachability is irrelevant here — the policy move
+    was legal by construction; we only ask whether placing the ball completes a
+    line at the destination.
+    """
+    import numpy as np
+    from game.board import _find_lines_at
+    (sr, sc), (tr, tc) = move
+    b = np.array(board, dtype=np.int64)
+    color = b[sr, sc]
+    if color == 0:
+        return False
+    b[sr, sc] = 0
+    b[tr, tc] = color
+    return _find_lines_at(b, tr, tc) >= 5
 
 
 def build_crisis_corpus(mine_glob='logs/mine_*.json',
@@ -195,7 +247,9 @@ def build_crisis_corpus(mine_glob='logs/mine_*.json',
                         clean_loser_margin=10.0,
                         max_losers=MAX_LOSERS_PER_ANCHOR,
                         min_gap=0.0,
-                        require_confirmed=True):
+                        require_confirmed=True,
+                        isolated_only=False,
+                        drop_clearing_pol=False):
     """Build the listwise aux corpus from the crisis-fork harvest.
 
     Reads every logs/mine_*.json (mine_crisis_sweep output). For each CONFIRMED
@@ -228,6 +282,7 @@ def build_crisis_corpus(mine_glob='logs/mine_*.json',
     loser_idx_list, loser_mask_list, n_clean_list = [], [], []
     weights, seeds = [], []
     n_files = n_flag = n_unconfirmed = n_degenerate = 0
+    n_clustered = n_clearing = 0
 
     for f in files:
         try:
@@ -237,6 +292,8 @@ def build_crisis_corpus(mine_glob='logs/mine_*.json',
         n_files += 1
         seed = int(d['meta']['seed'])
         confirms = d.get('confirms', {})
+        # depths whose fork is CI-confirmed real — for the isolated-only filter
+        real_depths = {int(k) for k, cc in confirms.items() if cc.get('real')}
         frames = None        # lazy: only load the death game if a row lacks pol_move
         for r in d['rows']:
             if not r['flag']:
@@ -249,6 +306,12 @@ def build_crisis_corpus(mine_glob='logs/mine_*.json',
             gap = float(c['gap']) if c else float(r['gap'])
             if gap < min_gap:
                 continue
+            # Track-1 clean filter: drop forks adjacent to another confirmed fork
+            # (consecutive-turn clusters are where phantoms live — keep singletons).
+            if isolated_only and ((r['depth'] - 1 in real_depths)
+                                  or (r['depth'] + 1 in real_depths)):
+                n_clustered += 1
+                continue
             pm = r.get('pol_move')       # new mine files store it directly
             if pm is None:               # old files: recover from the death game
                 if frames is None:
@@ -258,6 +321,11 @@ def build_crisis_corpus(mine_glob='logs/mine_*.json',
                 assert fr['board'] == r['board'], (
                     f"frame/row board mismatch seed={seed} depth={r['depth']}")
                 pm = fr['chosen_move']
+            # Track-1 clean filter: drop forks whose policy move is a CLEAR (the
+            # phantom signature — a correct clear blamed for a later blunder).
+            if drop_clearing_pol and _move_clears(r['board'], pm):
+                n_clearing += 1
+                continue
             win_idx = _move_index_from_list(r['best_move'])
             pol_idx = _move_index_from_list(pm)
             if win_idx == pol_idx:        # degenerate: winner == policy move
@@ -320,6 +388,8 @@ def build_crisis_corpus(mine_glob='logs/mine_*.json',
     corpus['_stats'] = {
         'n_files': n_files, 'n_flagged': n_flag,
         'n_unconfirmed': n_unconfirmed, 'n_degenerate': n_degenerate,
+        'n_clustered_dropped': n_clustered, 'n_clearing_dropped': n_clearing,
+        'isolated_only': isolated_only, 'drop_clearing_pol': drop_clearing_pol,
         'n_anchors': len(boards), 'n_clean_pairs': int(sum(n_clean_list)),
         'n_seeds': int(len(set(seeds))),
     }
