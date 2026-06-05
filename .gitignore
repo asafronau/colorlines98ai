@@ -17,6 +17,9 @@ __pycache__/
 # Data files (large, stored externally)
 data/
 alphatrain/data/
+crisis/
+*.pt
+*.npz
 
 # Tarballs (built artifacts)
 *.tar.gz

@@ -43,6 +43,7 @@ from alphatrain.counterfactual import (
     build_corpus as build_aux_corpus,
     build_crisis_corpus,
     listwise_margin_loss,
+    soft_correction_loss,
     preflight_metrics as aux_preflight_metrics,
     DEFAULT_MARGIN as AUX_DEFAULT_MARGIN,
     DEFAULT_TOP1_WEIGHT as AUX_DEFAULT_TOP1_WEIGHT,
@@ -176,16 +177,26 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                     # the aux gradient instead of being averaged into noise.
                     anchor_w = (aux['weight'][aux_idx]
                                 if aux.get('weighted') else None)
-                    aux_loss = listwise_margin_loss(
-                        aux_logits,
-                        aux['winner_idx'][aux_idx],
-                        aux['top1_idx'][aux_idx],
-                        aux['loser_idx'][aux_idx],
-                        aux['loser_mask'][aux_idx],
-                        margin=aux['margin'],
-                        top1_weight=aux['top1_weight'],
-                        other_weight=aux['other_weight'],
-                        anchor_weight=anchor_w)
+                    if aux.get('mode') == 'soft':
+                        # MCTS-corrections: weighted, sharpened soft-CE toward the
+                        # visit distribution (the floor pipeline v2).
+                        aux_loss = soft_correction_loss(
+                            aux_logits,
+                            aux['tgt_idx'][aux_idx],
+                            aux['tgt_prob'][aux_idx],
+                            anchor_weight=anchor_w,
+                            target_temperature=aux['target_temperature'])
+                    else:
+                        aux_loss = listwise_margin_loss(
+                            aux_logits,
+                            aux['winner_idx'][aux_idx],
+                            aux['top1_idx'][aux_idx],
+                            aux['loser_idx'][aux_idx],
+                            aux['loser_mask'][aux_idx],
+                            margin=aux['margin'],
+                            top1_weight=aux['top1_weight'],
+                            other_weight=aux['other_weight'],
+                            anchor_weight=anchor_w)
                     loss = main_loss + lam * aux_loss
                     total_aux += float(aux_loss.detach())
                     aux_steps += 1
@@ -223,8 +234,8 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
 
         if (aux is not None and aux['preflight_every'] > 0
                 and (bi + 1) % aux['preflight_every'] == 0):
-            _run_preflight(model, aux, device, amp_dtype, epoch, bi + 1,
-                           steps_per_epoch)
+            pf = _run_soft_preflight if aux.get('mode') == 'soft' else _run_preflight
+            pf(model, aux, device, amp_dtype, epoch, bi + 1, steps_per_epoch)
 
     return total_loss / n, (total_aux / aux_steps if aux_steps else 0.0)
 
@@ -307,6 +318,40 @@ def _run_preflight(model, aux, device, amp_dtype, epoch, step_in_epoch,
             f"< threshold {aux['abort_flip_rate']} at step "
             f"{step_in_epoch} epoch {epoch+1}. Increase --aux-lambda "
             f"or relax filter, then re-run.")
+    if was_training:
+        model.train(True)
+
+
+@torch.no_grad()
+def _run_soft_preflight(model, aux, device, amp_dtype, epoch, step_in_epoch,
+                        steps_per_epoch):
+    """Preflight for MCTS-corrections (soft mode): match-rate (policy argmax ==
+    MCTS top move) + weighted soft-CE, on train and held-out. Held-out match-rate
+    rising = the corrections GENERALIZE; flat = memorizing (Track-1's failure)."""
+    was_training = model.training
+    model.train(False)
+    use_amp = amp_dtype != torch.float32
+
+    def _on(sub):
+        N, bs = sub['obs'].size(0), max(1, aux['batch_size'])
+        match, ce_sum = 0, 0.0
+        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+            for i in range(0, N, bs):
+                out = model(sub['obs'][i:i + bs])
+                logits = (out[0] if isinstance(out, tuple) else out).float()
+                ti, tp = sub['tgt_idx'][i:i + bs], sub['tgt_prob'][i:i + bs]
+                match += (logits.argmax(1) == ti[:, 0]).sum().item()
+                logp = torch.log_softmax(logits, 1)
+                ce_sum += (-(tp * torch.gather(logp, 1, ti)).sum(1)).sum().item()
+        return match / max(N, 1), ce_sum / max(N, 1)
+
+    mr, ce = _on(aux)
+    print(f"  [soft-preflight ep{epoch+1} step {step_in_epoch}/{steps_per_epoch}] "
+          f"match(argmax=MCTS)={mr:.3f} softCE={ce:.3f}", flush=True)
+    if aux.get('heldout') is not None:
+        mrh, ceh = _on(aux['heldout'])
+        print(f"  [soft-heldout  ep{epoch+1} step {step_in_epoch}/{steps_per_epoch}] "
+              f"match={mrh:.3f} softCE={ceh:.3f}", flush=True)
     if was_training:
         model.train(True)
 
@@ -409,6 +454,15 @@ def main():
                         '(scripts/build_crisis_corpus_file.py). Use this on '
                         'Colab instead of --aux-crisis so you upload one small '
                         'file, not the mine/death JSON tree.')
+    p.add_argument('--aux-corrections-corpus', type=str, default=None,
+                   help='Path to a PRE-BUILT MCTS-corrections corpus .pt '
+                        '(scripts/build_corrections_corpus.py). Floor pipeline v2: '
+                        'weighted, sharpened soft-CE toward the MCTS visit '
+                        'distribution. Mutually exclusive with the other aux modes.')
+    p.add_argument('--aux-target-temperature', type=float, default=0.5,
+                   help='Sharpening for the MCTS-corrections soft target '
+                        '(<1 = commit to the high-visit move). Independent of the '
+                        'main --target-temperature.')
     p.add_argument('--aux-crisis-death-dir',
                    default='alphatrain/data/death_games',
                    help='Directory of death_{seed}.json (for the policy move).')
@@ -432,10 +486,11 @@ def main():
                    help='Cap on base training states (local smoke only; '
                         '0 = use all). Subsamples the main corpus, not the aux.')
     args = p.parse_args()
-    if (bool(args.aux_crisis or args.aux_crisis_corpus)
-            and bool(args.aux_counterfactual)):
-        raise SystemExit("--aux-crisis[-corpus] and --aux-counterfactual are "
-                         "mutually exclusive.")
+    if sum(bool(x) for x in (args.aux_counterfactual,
+                             args.aux_crisis or args.aux_crisis_corpus,
+                             args.aux_corrections_corpus)) > 1:
+        raise SystemExit("Pick ONE aux mode: --aux-counterfactual, "
+                         "--aux-crisis[-corpus], or --aux-corrections-corpus.")
 
     # Device
     if torch.cuda.is_available():
@@ -522,7 +577,7 @@ def main():
         optimizer, start_factor=0.1, end_factor=1.0,
         total_iters=args.warmup_epochs)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs - args.warmup_epochs,
+        optimizer, T_max=max(1, args.epochs - args.warmup_epochs),
         eta_min=args.lr * 0.01)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, [warmup, cosine], milestones=[args.warmup_epochs])
@@ -692,6 +747,68 @@ def main():
                        epoch=-1, step_in_epoch=0,
                        steps_per_epoch=len(train_loader))
 
+    # MCTS-corrections aux setup (floor pipeline v2: weighted/sharpened soft-CE)
+    if args.aux_corrections_corpus:
+        print(f"\nLoading MCTS-corrections corpus: "
+              f"{args.aux_corrections_corpus}", flush=True)
+        raw = torch.load(args.aux_corrections_corpus, map_location='cpu',
+                         weights_only=False)
+        corpus = {k: (v.to(device) if torch.is_tensor(v) else v)
+                  for k, v in raw.items()}
+        cs = corpus['_stats']
+        print(f"  {cs['n_corrections']} corrections from {cs['n_seeds']} seeds "
+              f"/ {cs['n_files']} games", flush=True)
+        with torch.no_grad():
+            full_obs = train_set._build_obs_core(
+                corpus['boards'].long(), next_pos=corpus['next_pos'],
+                next_col=corpus['next_col'], n_next=corpus['n_next'])
+            if device.type == 'cuda':
+                full_obs = full_obs.contiguous(memory_format=torch.channels_last)
+        seeds_t = corpus['seed']
+        uniq = sorted(set(int(s) for s in seeds_t.tolist()))
+        n_hold = (max(1, int(round(args.aux_holdout_frac * len(uniq))))
+                  if args.aux_holdout_frac > 0 else 0)
+        if n_hold > 0:
+            g = torch.Generator().manual_seed(args.aux_split_seed)
+            hperm = torch.randperm(len(uniq), generator=g).tolist()
+            hold_seeds = set(uniq[i] for i in hperm[:n_hold])
+            hold_mask = torch.tensor([int(s) in hold_seeds
+                                      for s in seeds_t.tolist()], device=device)
+        else:
+            hold_mask = torch.zeros(len(seeds_t), dtype=torch.bool, device=device)
+        tr = (~hold_mask).nonzero(as_tuple=True)[0]
+        ho = hold_mask.nonzero(as_tuple=True)[0]
+        w_tr = corpus['weight'][tr]
+        w_tr = w_tr / w_tr.mean().clamp(min=1e-6)
+        N_aux = tr.numel()
+        aux = {
+            'mode': 'soft',
+            'obs': full_obs[tr],
+            'tgt_idx': corpus['tgt_idx'][tr],
+            'tgt_prob': corpus['tgt_prob'][tr],
+            'weight': w_tr,
+            'weighted': args.aux_weighted,
+            'target_temperature': args.aux_target_temperature,
+            'batch_size': args.aux_batch_size,
+            'target_lambda': args.aux_lambda,
+            'warmup_epochs': args.aux_warmup_epochs,
+            'preflight_every': args.aux_preflight_every,
+            'perm': torch.randperm(N_aux, device=device),
+            'ptr': [0],
+        }
+        if ho.numel() > 0:
+            aux['heldout'] = {'obs': full_obs[ho],
+                              'tgt_idx': corpus['tgt_idx'][ho],
+                              'tgt_prob': corpus['tgt_prob'][ho]}
+        print(f"  train corrections={N_aux} heldout={ho.numel()} "
+              f"({n_hold}/{len(uniq)} seeds); weighted={args.aux_weighted} "
+              f"λ={args.aux_lambda} aux_T={args.aux_target_temperature} "
+              f"warmup_ep={args.aux_warmup_epochs} batch={args.aux_batch_size}",
+              flush=True)
+        _run_soft_preflight(model, aux, device, amp_dtype,
+                            epoch=-1, step_in_epoch=0,
+                            steps_per_epoch=len(train_loader))
+
     os.makedirs(args.save_dir, exist_ok=True)
     print(f"\n=== Training {args.epochs} epochs ===", flush=True)
     t_total = time.time()
@@ -715,9 +832,9 @@ def main():
         print(f"  V12 val: loss={vl:.4f} [{time.time()-et:.0f}s]",
               flush=True)
         if aux is not None:
-            _run_preflight(model, aux, device, amp_dtype,
-                           epoch=epoch, step_in_epoch=len(train_loader),
-                           steps_per_epoch=len(train_loader))
+            pf = _run_soft_preflight if aux.get('mode') == 'soft' else _run_preflight
+            pf(model, aux, device, amp_dtype, epoch=epoch,
+               step_in_epoch=len(train_loader), steps_per_epoch=len(train_loader))
 
         ck = {
             'epoch': epoch,

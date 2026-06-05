@@ -24,12 +24,19 @@ def main():
     p.add_argument('--death-dir', default='alphatrain/data/death_games')
     p.add_argument('--clean-loser-margin', type=float, default=10.0)
     p.add_argument('--min-gap', type=float, default=0.0)
+    p.add_argument('--isolated', action='store_true',
+                   help='Track 1: keep only forks with no adjacent confirmed '
+                        'fork (drop consecutive-turn clusters where phantoms live).')
+    p.add_argument('--drop-clearing', action='store_true',
+                   help='Track 1: drop forks whose policy move clears a line '
+                        '(the phantom-fork signature).')
     p.add_argument('--out', default='alphatrain/data/crisis_corpus_v1.pt')
     a = p.parse_args()
 
     corpus = build_crisis_corpus(
         a.mine_glob, death_dir=a.death_dir, device='cpu',
-        clean_loser_margin=a.clean_loser_margin, min_gap=a.min_gap)
+        clean_loser_margin=a.clean_loser_margin, min_gap=a.min_gap,
+        isolated_only=a.isolated, drop_clearing_pol=a.drop_clearing)
     cs = corpus['_stats']
     # weights are normalized to mean 1 over the FULL corpus here; train_path_b
     # re-normalizes over the train split after the held-out seeds are removed.
@@ -40,6 +47,9 @@ def main():
           f"{cs['n_files']} games")
     print(f"  {cs['n_clean_pairs']} clean-loser pairs; dropped "
           f"{cs['n_unconfirmed']} unconfirmed, {cs['n_degenerate']} degenerate")
+    if a.isolated or a.drop_clearing:
+        print(f"  TRACK-1 clean filter: dropped {cs['n_clustered_dropped']} "
+              f"clustered + {cs['n_clearing_dropped']} clearing-policy-move forks")
     print(f"  clean_loser_margin={a.clean_loser_margin}pp  min_gap={a.min_gap}pp")
 
 

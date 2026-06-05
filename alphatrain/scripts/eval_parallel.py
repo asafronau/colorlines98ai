@@ -1,4 +1,4 @@
-    """Parallel evaluation: policy and MCTS players on a list of seeds.
+"""Parallel evaluation: policy and MCTS players on a list of seeds.
 
 CPU workers handle game simulation + batched virtual-loss MCTS. One GPU
 process handles all NN inference via shared memory.

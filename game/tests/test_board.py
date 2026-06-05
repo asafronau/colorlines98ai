@@ -964,12 +964,12 @@ class TestSpawnBalls:
     """Place next_balls on the board. Handle collisions (occupied -> random placement)."""
 
     def test_all_placed(self):
-        """All next_balls placed on an empty board."""
+        """All next_balls placed on an empty board; returns their landing cells."""
         g = ColorLinesGame(seed=42)
         g.board = EMPTY_BOARD.copy()
         g.next_balls = [((0, 0), 1), ((1, 1), 2), ((2, 2), 3)]
-        spawned = g._spawn_balls()
-        assert spawned == 3
+        landed = g._spawn_balls()
+        assert landed == [(0, 0), (1, 1), (2, 2)]
         assert g.board[0, 0] == 1
         assert g.board[1, 1] == 2
         assert g.board[2, 2] == 3
@@ -980,21 +980,54 @@ class TestSpawnBalls:
         g = ColorLinesGame(seed=42)
         g.board = board.copy()
         g.next_balls = [((0, 0), 3)]  # tries to spawn at occupied (0,0)
-        spawned = g._spawn_balls()
-        assert spawned == 1
-        # (0,0) still has original ball (5), the new ball (3) went somewhere else
-        # Total balls should be 2
+        landed = g._spawn_balls()
+        # one ball placed, displaced to a cell OTHER than the occupied (0,0)
+        assert len(landed) == 1
+        (lr, lc) = landed[0]
+        assert (lr, lc) != (0, 0)
+        assert g.board[lr, lc] == 3        # the displaced ball is at its reported cell
+        # (0,0) still has its original ball (5); board now holds 2 balls total
+        assert g.board[0, 0] == 5
         assert np.count_nonzero(g.board) == 2
-        # Color 3 should exist somewhere on the board
-        assert 3 in g.board
 
-    def test_spawn_returns_count(self):
-        """_spawn_balls returns the number of balls actually spawned."""
+    def test_spawn_returns_landing_cells(self):
+        """_spawn_balls returns the ACTUAL landing cell of each spawned ball."""
         g = ColorLinesGame(seed=42)
         g.board = EMPTY_BOARD.copy()
         g.next_balls = [((0, 0), 1), ((1, 1), 2)]
-        count = g._spawn_balls()
-        assert count == 2
+        landed = g._spawn_balls()
+        assert landed == [(0, 0), (1, 1)]
+
+    def test_displaced_ball_completing_line_is_cleared(self):
+        """Regression: a displaced spawn ball that completes a line must clear.
+
+        Bug: move() clear-checked next_balls (intended positions), so a line
+        completed at a displaced ball's ACTUAL cell was never detected.
+        """
+        # 4 yellows on the main diagonal, only (4,4) empty (the completing cell),
+        # non-yellow filler with no runs everywhere else.
+        nonyel = [1, 2, 3, 5, 6]
+        board = np.array([[nonyel[(r + 2 * c) % 5] for c in range(9)] for r in range(9)],
+                         dtype=EMPTY_BOARD.dtype)
+        for (r, c) in [(0, 0), (1, 1), (2, 2), (3, 3)]:
+            board[r, c] = 4
+        board[4, 4] = 0
+        g = ColorLinesGame(seed=42)
+        g.board = board
+        g._cc_labels = None
+        # intended spawn at occupied (8,8), off the diagonal -> displaced to (4,4)
+        g.next_balls = [((8, 8), 4)]
+        landed = g._spawn_balls()
+        assert landed == [(4, 4)]
+        cleared = 0
+        for (br, bc) in landed:
+            if g.board[br, bc] != 0:
+                cleared += _clear_lines_at(g.board, br, bc)
+        assert cleared == 5                      # the diagonal was detected at (4,4)
+        assert g.board[4, 4] == 0                # and cleared
+        # no completed line remains anywhere
+        assert all(_find_lines_at(g.board, r, c) < 5
+                   for r in range(9) for c in range(9) if g.board[r, c])
 
     def test_spawn_invalidates_cc_cache(self):
         """After spawning, the connected component cache is invalidated."""

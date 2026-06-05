@@ -399,6 +399,35 @@ def draw_right_panel(surf, gs, font_small):
         surf.blit(loc_txt, (cx + radius + 12, cy - 8))
 
 
+def _empty_component_stats(board):
+    """Largest empty connected component size + number of empty components.
+
+    Computed from the board so the panel works for leaner recordings (e.g.
+    batch_record) that don't store 'lec'/'n_components' per frame.
+    """
+    seen = [[False] * 9 for _ in range(9)]
+    largest = n = 0
+    for r0 in range(9):
+        for c0 in range(9):
+            if board[r0][c0] != 0 or seen[r0][c0]:
+                continue
+            n += 1
+            size = 0
+            stack = [(r0, c0)]
+            seen[r0][c0] = True
+            while stack:
+                r, c = stack.pop()
+                size += 1
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = r + dr, c + dc
+                    if (0 <= nr < 9 and 0 <= nc < 9
+                            and not seen[nr][nc] and board[nr][nc] == 0):
+                        seen[nr][nc] = True
+                        stack.append((nr, nc))
+            largest = max(largest, size)
+    return largest, n
+
+
 def draw_replay_panel(surf, rs, font_small, font):
     """Debug panel for replay mode: frame nav + per-turn metrics + top-K."""
     fr = rs.cur
@@ -423,13 +452,18 @@ def draw_replay_panel(surf, rs, font_small, font):
         sc_txt += f"  (+{delta})"
     line(sc_txt, (240, 220, 80) if delta else TEXT, 22)
 
-    # Fragmentation metrics — color LEC by danger
-    lec = fr['lec']
+    # Fragmentation metrics — color LEC by danger. Compute from the board when
+    # the recording didn't store them (leaner batch_record frames).
+    if 'lec' in fr and 'n_components' in fr:
+        lec, n_comp = fr['lec'], fr['n_components']
+    else:
+        lec, n_comp = _empty_component_stats(fr['board'])
+    empties = fr.get('empties', sum(v == 0 for row in fr['board'] for v in row))
     lec_color = ((240, 80, 80) if lec < 10
                  else (240, 200, 80) if lec < 20 else (120, 220, 120))
-    line(f"Empties: {fr['empties']}", TEXT_DIM, 18)
+    line(f"Empties: {empties}", TEXT_DIM, 18)
     line(f"LEC: {lec}", lec_color, 18)
-    line(f"Components: {fr['n_components']}", TEXT_DIM, 22)
+    line(f"Components: {n_comp}", TEXT_DIM, 22)
 
     # Chosen move
     cm = fr.get('chosen_move')
