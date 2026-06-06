@@ -172,8 +172,9 @@ def main():
                      args=(i, seed_q, res_q, server._obs_shm.name,
                            server._pol_shm.name, server._val_shm.name,
                            a.workers, a.batch_size, server.request_queue,
-                           server.response_queues[i], a.sims, a.top_k, a.q_weight,
-                           FV, a.mcts_seeds, a.topk_visits, death_dir, a.lo, a.hi, a.out_dir))
+                           server.response_queues[i], a.sims, a.top_k,
+                           a.q_weight, FV, a.mcts_seeds, a.topk_visits, death_dir,
+                           a.lo, a.hi, a.out_dir))
         pr.start(); procs.append(pr)
 
     n_corr, n_states, t0 = 0, 0, time.time()

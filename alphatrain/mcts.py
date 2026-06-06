@@ -757,6 +757,23 @@ class MCTS:
         if use_server:
             obs_np_buf = self._obs_np_buf
 
+        # Vectorized root selection. The root has top_k (~300) children and is
+        # scanned on EVERY simulation's first descent step — the mining CPU hot
+        # loop. These arrays MIRROR the root children's Node stats (kept in
+        # lockstep in the virtual-loss + backup steps below) so the depth-0 PUCT
+        # argmax becomes one numpy op instead of a ~300-iter Python loop. Deeper
+        # nodes (small fan-out) keep the Python path. Bit-identical to the scalar
+        # loop (same float ops, first-max argmax) — proven by golden_search_test.py.
+        _root_items = list(root.children.items())
+        n_root = len(_root_items)
+        root_actions_arr = np.fromiter((a for a, _ in _root_items),
+                                       dtype=np.int64, count=n_root)
+        root_nodes_list = [c for _, c in _root_items]
+        root_cpp = c_puct * np.fromiter((c.prior for _, c in _root_items),
+                                        dtype=np.float64, count=n_root)
+        root_vc_arr = np.zeros(n_root, dtype=np.float64)    # mirrors visit_count
+        root_vsum_arr = np.zeros(n_root, dtype=np.float64)  # mirrors value_sum
+
         sims_done = 0
         while sims_done < num_sims:
             bs = min(batch_size, num_sims - sims_done)
@@ -764,6 +781,7 @@ class MCTS:
             batch_games = []
             batch_leaf_nodes = []
             batch_game_over = []
+            batch_root_idx = []
             obs_count = 0
 
             # === SELECT B leaves with virtual loss ===
@@ -771,11 +789,39 @@ class MCTS:
                 node = root
                 sim_game = game.clone(rng=sim_rng)
                 path = [node]
+                cur_root_idx = -1
 
                 depth = 0
                 while node.children and not sim_game.game_over:
+                    # Depth 0 (root, ~300 children, all valid): vectorized PUCT
+                    # argmax over the mirror arrays — bit-identical to the scalar
+                    # loop below, but one numpy op instead of ~300 Python iters.
+                    if depth == 0:
+                        sqrt_parent = math.sqrt(node.visit_count)
+                        q_range = max_q - min_q
+                        vc = root_vc_arr
+                        if q_range > 0:
+                            q_norm = (root_vsum_arr / np.where(vc > 0, vc, 1.0)
+                                      - min_q) / q_range
+                            np.putmask(q_norm, vc == 0, 0.5)
+                        else:
+                            q_norm = np.full(n_root, 0.5)
+                        score = q_weight * q_norm \
+                            + root_cpp * sqrt_parent / (1.0 + vc)
+                        ri = int(np.argmax(score))
+                        cur_root_idx = ri
+                        best_child = root_nodes_list[ri]
+                        best_action = int(root_actions_arr[ri])
+                        src_flat = best_action // 81
+                        tgt_flat = best_action % 81
+                        sim_game.trusted_move(src_flat // 9, src_flat % 9,
+                                              tgt_flat // 9, tgt_flat % 9)
+                        path.append(best_child)
+                        node = best_child
+                        depth += 1
+                        continue
+
                     # Open-loop PUCT with lazy reachability validation.
-                    # Depth 0 (root): board is shared, all children valid.
                     # Depth 1+: cheap occupancy filter on all children,
                     # then reachability check only on the chosen move.
                     sqrt_parent = math.sqrt(node.visit_count)
@@ -850,10 +896,14 @@ class MCTS:
                 for n in path:
                     n.visit_count += 1
                     n.value_sum -= VIRTUAL_LOSS
+                if cur_root_idx >= 0:  # mirror the root child (path[1]) touched above
+                    root_vc_arr[cur_root_idx] += 1.0
+                    root_vsum_arr[cur_root_idx] -= VIRTUAL_LOSS
 
                 batch_paths.append(path)
                 batch_leaf_nodes.append(node)
                 batch_games.append(sim_game)
+                batch_root_idx.append(cur_root_idx)
 
                 if sim_game.game_over:
                     batch_game_over.append(True)
@@ -993,6 +1043,9 @@ class MCTS:
 
                 for n in path:
                     n.value_sum += VIRTUAL_LOSS + value
+                ridx = batch_root_idx[b]
+                if ridx >= 0:  # mirror the root child's value_sum update
+                    root_vsum_arr[ridx] += VIRTUAL_LOSS + value
 
             sims_done += bs
 
