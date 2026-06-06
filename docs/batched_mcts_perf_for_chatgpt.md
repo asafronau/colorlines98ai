@@ -73,7 +73,14 @@ same-machine numpy:
 (The production sims=4800 run is in progress; we expect ~these ÷6 in trees/s, i.e. **~0.4 trees/s**,
 because wall scales ~linearly in sims — plus a bit worse since late sims descend deeper trees.)
 
-## 5. Where the time goes (the important part)
+> **⚠️ SECTIONS 5–6 ARE SUPERSEDED by the L4 profiler result at the bottom ("RESULT — L4
+> torch.profiler trace").** The "flat term = launch overhead" and "~2 trees/s ceiling" reasoning
+> below was an extrapolation from 2 K-points and turned out WRONG: the profiler shows the GPU is
+> only 14% utilized and the wall is dominated by per-sim CPU `.cpu()` syncs + O(K) Python
+> expand/backup loops, not descent kernel launches. Kept for the record; read §RESULT for the
+> actual diagnosis and plan.
+
+## 5. Where the time goes (the important part) — [SUPERSEDED, see §RESULT]
 
 The full-search wall is **NOT flat in K**. Fitting a line through the two points:
 
@@ -270,3 +277,88 @@ you'd watch for? (b) For Stage 2, is a fixed-length padded descent with per-tree
 right shape to make CUDA-graph / `torch.compile` capture actually stick, given dynamic node
 allocation? (c) Does the closed-loop node-board cache (store board + legal top-k at expansion) change
 your Stage ordering now that we know transfers/loops — not descent compute — are the cost?
+
+---
+
+# UPDATE 2 — Stage 1 BUILT + measured on L4. It did NOT improve throughput. We need your read.
+
+We implemented the full Stage-1 vectorization you recommended and golden-tested it. Then we measured
+on the L4. **The throughput did not move.** This contradicts the earlier diagnosis that the per-tree
+Python loops + host syncs were the cost, so we're bringing it back to you before picking Stage 2.
+
+## What we built (all golden-tested EXACT vs the numba reference)
+
+- `legal_priors_t` (GPU): full legal set 1536/1536, prior err 1e-7, **top-300 selection 100% identical**.
+  Uses CC-once + neighbour-component membership + full-6561 mask then top-k, exactly as you specified.
+- `build_observation_t` (GPU 18-channel obs): **bit-exact**, 0.0 error over 1024 boards.
+- Rewrote the search: obs + logits + legal_priors + **expand** + **backup** all on-device.
+  - Expand: vectorized — every tree writes children into its next-free node slot for all K at once;
+    only expanders bump the counter / link the parent edge. **No `for k in range(K)`, no per-child
+    `.to(dev)`, no `nonzero`.**
+  - Backup: single `scatter_add` over the whole path. **No Python loop, no `.item()`.**
+  - Dirichlet on GPU; coarse early-exit (one `bool(active.any())` sync per 8 descent steps).
+  - The ONLY remaining per-sim host sync is the feature-value round-trip (one batched `.cpu()` →
+    numba `board_features_with_next` → `.to(dev)`). We left it as the measured-or-not question.
+- Argmax still EXACT vs scalar on the smoke states (5405/4064/3274/3515).
+
+## The L4 result (K=256, sims=100, torch.profiler)
+
+```
+                     old v1      Stage-1 (now)
+ops / sim            46,761      46,747          <- essentially UNCHANGED
+Self CUDA time        2.58 s      2.715 s
+Self CPU time        ~18.7 s     20.8 s          <- the wall; CPU-dispatch-bound
+GPU utilization       14 %        ~13 %
+trees/s @ sims=4800  ~0.29       ~0.29           <- no change
+```
+
+The op *composition* changed exactly as designed — `aten::copy_` 287k→198k, the per-tree loop is
+gone, replaced by vectorized `aten::add` (scatter backup, 81k) and `aten::bitwise_and` (legal mask,
+74k) — but the **total stayed ~46.7k ops/sim**. NN forward (conv+cutlass+bn) is ~55% of the small
+2.7 s GPU time; everything else is the descent's elementwise/index/scatter ops.
+
+## Our revised diagnosis (please confirm or correct)
+
+The per-tree Python expand loop was a **red herring** — it was a small fraction. The real cost is the
+**descent itself**, which was always vectorized: ~depth × (connected-components + reachability +
+`apply_move`'s 4 line-clears + PUCT scoring) = tens of thousands of tiny **eager** ops per sim. The
+GPU executes them in 2.7 s, but the CPU can't *dispatch* ~4.7M ops/100-sims fast enough (~4 µs each →
+~20 s). So it's **eager-dispatch-bound on the descent**, and vectorizing the leaf/expand/backup
+trimmed the wrong 5 %. Stage 1 was necessary groundwork (correct, K-independent, nearly sync-free →
+graph-capturable) but not sufficient.
+
+Correctness of the rewrite: full argmax+TV vs scalar = 3/4 agree, meanTV 0.298 (this run used 1 scalar
+determinization, vs an earlier 6/6 at 3 seeds — the one divergence at depth-60 is most likely
+open-loop spawn-RNG variance, but we'll firm it up).
+
+## The fork — which Stage 2, and in what order?
+
+Both seem to ultimately require porting the feature-value (`board_features_with_next`, ~250 lines incl.
+next-ball spawn simulation) to GPU, since that `.cpu()` is the last sync either way.
+
+1. **CUDA Graphs / `torch.compile`** on the (open-loop) descent — capture the ~46k-op per-sim
+   sequence, replay with near-zero CPU dispatch. Since the GPU only needs ~2.7 s, naively this could
+   reach ~1.8 trees/s @K=256 and scale to **>M5 at K=1024**, keeping semantics. Blockers to remove:
+   the feature-value `.cpu()`, the early-exit sync (→ truly fixed-length descent), and dynamic node
+   allocation inside the captured region (n_nodes is a tensor; is tensor-indexed in-place scatter
+   into fixed `[K,N,W]` buffers capturable, or does the changing `new_id` break the graph?).
+2. **Closed-loop node-board caching** — store the board + precomputed legal top-k at expansion so each
+   descent step is a *gather* instead of re-running CC/reachability/apply_move. This **deletes** the
+   bulk of the 46k ops rather than dispatching them faster. Bigger structural win, but a **semantic
+   change** (determinized per node) needing TV re-validation. (Teacher mining may tolerate it — the
+   scalar teacher already averages only 3 determinizations.)
+
+**Questions:**
+- (a) Given the bottleneck is eager *dispatch* of ~46k ops/sim (GPU itself is 87% idle), is CUDA
+  Graphs the right first lever, or will the dynamic node allocation + variable descent depth make
+  capture impractical without first going closed-loop?
+- (b) For CUDA-graph capture: can a per-sim region with in-place scatter into fixed `[K,N,W]` tree
+  buffers (indices computed from tensors, never `.item()`'d) be captured and replayed across sims,
+  even though the *logical* tree grows? Or is the standard pattern to capture only the
+  fixed-structure inner kernels (CC / reachability / clear / PUCT) and leave the outer loop in Python?
+- (c) Is closed-loop caching actually the higher-leverage move here (deletes ops vs. dispatches them
+  faster), and would you do it *before* attempting graph capture given it also shrinks the op count
+  that any graph would have to replay?
+- (d) Anything that says "stop — tiny-board deep MCTS at 4800 sims is the wrong job for a GPU; the
+  46k-eager-op descent is intrinsic, put this on a multicore-CPU / Rust path and use the GPU only for
+  a batched prior server"? We want the honest version.

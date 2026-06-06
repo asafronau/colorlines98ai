@@ -125,19 +125,20 @@ def main():
 
     if a.profile:
         K = ks[0]
+        psims = 25                       # few sims: the profiler buffers EVERY op in host RAM
         b, pp, c, n = _synth_states(K, a.density, 1)
-        print(f"--- torch.profiler: K={K} sims=100 ablate={a.ablate} ---", flush=True)
+        print(f"--- torch.profiler: K={K} sims={psims} ablate={a.ablate} ---", flush=True)
         from torch.profiler import profile, ProfilerActivity
         acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if dev.type == 'cuda' else [])
         with profile(activities=acts) as prof:
-            batched_search_gpu(net, dev, dtype, b, pp, c, n, fv, sims=100, top_k=a.top_k,
+            batched_search_gpu(net, dev, dtype, b, pp, c, n, fv, sims=psims, top_k=a.top_k,
                                ablate=a.ablate)
             sync()
         key = 'cuda_time_total' if dev.type == 'cuda' else 'cpu_time_total'
         print(prof.key_averages().table(sort_by=key, row_limit=18), flush=True)
         evs = prof.key_averages()
         print(f"  total distinct kernels/ops: {len(evs)};  total calls: "
-              f"{sum(e.count for e in evs)} over 100 sims = {sum(e.count for e in evs)/100:.0f}/sim",
+              f"{sum(e.count for e in evs)} over {psims} sims = {sum(e.count for e in evs)/psims:.0f}/sim",
               flush=True)
         print(flush=True)
 
