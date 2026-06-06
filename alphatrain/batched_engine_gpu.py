@@ -90,6 +90,102 @@ def label_components_sv(boards, iters=8):
                        ).reshape(K, BOARD, BOARD)
 
 
+def build_observation_t(boards, next_pos, next_col, next_n, labels=None):
+    """Vectorized GPU port of alphatrain.observation.build_observation → [K,18,9,9] float32.
+    Channels: 0-6 one-hot colors, 7 empty, 8-10 next-ball color/7, 11 next mask, 12 empty-component
+    size/81, 13-16 line length (H,V,D1,D2)/9 at occupied cells, 17 max line length/9. Keeps the NN
+    leaf path fully on-device (no per-leaf build_observation + transfer)."""
+    K = boards.shape[0]
+    dev = boards.device
+    b = boards
+    obs = torch.zeros((K, 18, BOARD, BOARD), dtype=torch.float32, device=dev)
+    for col in range(1, NUM_COLORS + 1):                              # 0-6 one-hot colors
+        obs[:, col - 1] = (b == col).float()
+    obs[:, 7] = (b == 0).float()                                     # empty
+    kar = torch.arange(K, device=dev)
+    for i in range(next_pos.shape[1]):                              # 8-10 color/7, 11 mask
+        act = i < next_n
+        if not bool(act.any()):
+            continue
+        pr = next_pos[:, i, 0].long(); pc = next_pos[:, i, 1].long()
+        ka = kar[act]
+        obs[ka, 8 + i, pr[act], pc[act]] = next_col[act, i].float() / 7.0
+        obs[ka, 11, pr[act], pc[act]] = 1.0
+    if labels is None:                                              # 12 empty-component size/81
+        labels = label_components_sv(boards)
+    lf = labels.reshape(K, BOARD * BOARD)
+    valid = (lf >= 0).float()
+    lab_idx = lf.clamp(min=0)
+    sizes = torch.zeros(K, BOARD * BOARD, device=dev).scatter_add_(1, lab_idx, valid)
+    comp = torch.gather(sizes, 1, lab_idx) * valid
+    obs[:, 12] = (comp / 81.0).reshape(K, BOARD, BOARD)
+    # 13-17 line lengths: per (dir, sign) cumulative same-colour run over a -1 padded board
+    occf = (b > 0).float()
+    color = b
+    P = BOARD - 1; SZP = BOARD + 2 * P
+    pad = torch.full((K, SZP, SZP), -1, dtype=b.dtype, device=dev)
+    pad[:, P:P + BOARD, P:P + BOARD] = b
+    rr0 = (torch.arange(BOARD, device=dev).view(BOARD, 1) + P).expand(BOARD, BOARD)
+    cc0 = (torch.arange(BOARD, device=dev).view(1, BOARD) + P).expand(BOARD, BOARD)
+    maxlen = torch.zeros((K, BOARD, BOARD), dtype=torch.float32, device=dev)
+    for di, (dr, dc) in enumerate(((0, 1), (1, 0), (1, 1), (1, -1))):
+        length = occf.clone()                                       # center counts once
+        for s in (1, -1):
+            cur = b > 0                                             # run must start from a ball
+            for j in range(1, BOARD):
+                rr = rr0 + s * dr * j; cc = cc0 + s * dc * j
+                same = (pad[:, rr, cc] == color) & cur
+                cur = same
+                length = length + same.float()
+        obs[:, 13 + di] = (length / 9.0) * occf
+        maxlen = torch.maximum(maxlen, length * occf)
+    obs[:, 17] = maxlen / 9.0
+    return obs
+
+
+def legal_priors_t(boards, logits, top_k, labels=None):
+    """Vectorized GPU port of mcts._legal_priors_jit over a batch (Stage-1 keystone: keeps leaf
+    expansion fully on-device, no per-tree CPU loop). boards [K,9,9] int, logits [K,6561] float
+    (flat action = src_flat*81 + tgt_flat), top_k int. Returns (cnt[K] int64, idx[K,top_k] int64
+    with -1 pad, pri[K,top_k] float32 with 0 pad).
+
+    Legality (matches the BFS reference): a move (src,tgt) is legal iff src is occupied, tgt is
+    empty, and tgt's empty-component is one of the components adjacent to src. A source can border
+    SEVERAL empty components, so this is neighbour-component membership, not 'same component as src'.
+    Priors = softmax over the top_k highest-logit legal moves (top-k over the FULL 6561 masked
+    logits, never top-k-then-filter)."""
+    K = boards.shape[0]
+    dev = boards.device
+    N = BOARD * BOARD                                                  # 81
+    if labels is None:
+        labels = label_components_sv(boards)                          # [K,9,9] empty>=0, ball=-1
+    occ = (boards != 0).reshape(K, N)                                 # [K,81] src occupied
+    empty = (boards == 0).reshape(K, N)                               # [K,81] tgt empty
+    tgt_label = labels.reshape(K, N)                                  # [K,81] (ball=-1)
+    neg1 = torch.full_like(labels, -1)
+    up = torch.cat([neg1[:, :1, :], labels[:, :-1, :]], dim=1)        # neighbour at (r-1,c)
+    down = torch.cat([labels[:, 1:, :], neg1[:, :1, :]], dim=1)       # (r+1,c)
+    left = torch.cat([neg1[:, :, :1], labels[:, :, :-1]], dim=2)      # (r,c-1)
+    right = torch.cat([labels[:, :, 1:], neg1[:, :, :1]], dim=2)      # (r,c+1)
+    nbr = torch.stack([up.reshape(K, N), down.reshape(K, N),
+                       left.reshape(K, N), right.reshape(K, N)], dim=2)   # [K,81,4] src nbr labels
+    # match[K,s,t] = any src-neighbour label == tgt label. tgt_empty forces tgt_label>=0, so the
+    # -1 (ball/OOB) neighbour sentinels can never spuriously match a real target component.
+    match = (nbr.unsqueeze(2) == tgt_label.unsqueeze(1).unsqueeze(3)).any(dim=3)   # [K,81,81]
+    legal = (occ.unsqueeze(2) & empty.unsqueeze(1) & match).reshape(K, N * N)      # [K,6561]
+    ninf = torch.finfo(logits.dtype).min
+    masked = torch.where(legal, logits, torch.full_like(logits, ninf))
+    vals, idx = masked.topk(top_k, dim=1)                            # top-k over ALL 6561
+    valid = vals > ninf
+    cnt = valid.sum(dim=1)
+    vmax = torch.where(valid, vals, torch.full_like(vals, ninf)).max(dim=1, keepdim=True).values
+    ex = torch.where(valid, torch.exp((vals - vmax).float()), torch.zeros_like(vals, dtype=torch.float32))
+    pri = ex / ex.sum(dim=1, keepdim=True).clamp(min=1e-30)
+    idx = torch.where(valid, idx, torch.full_like(idx, -1))
+    pri = torch.where(valid, pri, torch.zeros_like(pri))
+    return cnt, idx, pri
+
+
 def reachable_many_t(labels, src, tgt):
     """Torch reachable_many. labels [K,9,9] (empty=component id>=0, ball=-1),
     src/tgt int [K,W,2]. Returns bool [K,W]."""

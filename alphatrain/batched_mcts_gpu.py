@@ -41,6 +41,36 @@ def _evaluate(net, dev, dtype, boards_t, npos_t, ncol_t, nn_t, fv, eval_net=True
     return logits, vals, boards
 
 
+from numba import njit as _njit
+
+
+@_njit(cache=True)
+def _feature_values_batch(boards, npos, ncol, nn, coefs, means, stds, bias):
+    """Batched feature-value (one numba call over K leaves, no Python per-tree overhead).
+    boards[K,9,9] int8, npos[K,3,2] int8, ncol[K,3] int8, nn[K] int. -> values[K] float64."""
+    K = boards.shape[0]
+    out = np.empty(K, dtype=np.float64)
+    for k in range(K):
+        out[k] = _evaluate_features_linear(boards[k], npos[k, :, 0], npos[k, :, 1],
+                                           ncol[k], nn[k], coefs, means, stds, bias)
+    return out
+
+
+def _leaf_values_gpu(cur_board, cur_pos, cur_col, cur_n, fv, dev):
+    """Leaf values on GPU [K] via one batched CPU feature eval (Stage-1 intermediate: the NN path
+    is fully on-device, only the linear feature value still round-trips; port to GPU if it
+    dominates the profile)."""
+    coefs, means, stds, bias = fv
+    boards = cur_board.to(torch.int8).cpu().numpy()
+    npos = cur_pos.to(torch.int8).cpu().numpy()
+    ncol = cur_col.to(torch.int8).cpu().numpy()
+    nn = cur_n.to(torch.int32).cpu().numpy()
+    vals = _feature_values_batch(boards, npos, ncol, nn,
+                                 coefs.astype(np.float64), means.astype(np.float64),
+                                 stds.astype(np.float64), float(bias))
+    return torch.from_numpy(vals.astype(np.float32)).to(dev)
+
+
 @torch.no_grad()
 def batched_search_gpu(net, dev, dtype, boards0_np, npos0_np, ncol0_np, nn0_np,
                        fv, sims=4800, top_k=300, c_puct=2.5, q_weight=2.0,
@@ -77,25 +107,26 @@ def batched_search_gpu(net, dev, dtype, boards0_np, npos0_np, ncol0_np, nn0_np,
     n_children = torch.zeros((K, N), dtype=ti, device=dev)
     n_nodes = torch.ones(K, dtype=ti, device=dev)
 
-    # ---- root expansion (leaf eval on CPU; priors+dirichlet written into node 0) ----
-    logits, val0, _ = _evaluate(net, dev, dtype, boards0, npos0, ncol0, nn0, fv)
-    rng = np.random.default_rng(seed)
-    for k in range(K):
-        cnt, idx, pri = _legal_priors_jit(boards0_np[k].astype(np.int8), logits[k], top_k)
-        cnt = int(cnt)
-        if cnt == 0:
-            continue
-        pri = pri.astype(np.float64)
-        if dirichlet_weight > 0 and dirichlet_alpha > 0:
-            noise = rng.dirichlet([dirichlet_alpha] * cnt)
-            pri = (1.0 - dirichlet_weight) * pri + dirichlet_weight * noise
-        ch_action[k, 0, :cnt] = torch.from_numpy(idx[:cnt].astype(np.int16)).to(dev)
-        ch_prior[k, 0, :cnt] = torch.from_numpy(pri[:cnt].astype(np.float16)).to(dev)
-        n_children[k, 0] = cnt
+    # ---- root expansion (GPU obs+forward+legal_priors; vectorized Dirichlet into node 0) ----
+    torch.manual_seed(seed)
+    labels0 = beg.label_components_sv(boards0, iters=8)
+    obs0 = beg.build_observation_t(boards0, npos0, ncol0, nn0, labels=labels0)
+    logits0 = net(obs0.to(dtype)).float()
+    cnt0, idx0, pri0 = beg.legal_priors_t(boards0, logits0, top_k, labels=labels0)
+    if dirichlet_weight > 0 and dirichlet_alpha > 0:
+        valid0 = idx0 >= 0                                          # [K,W] legal slots
+        conc = torch.full((K, W), float(dirichlet_alpha))           # sample on CPU (mps lacks
+        g = torch.distributions.Gamma(conc, torch.ones_like(conc)).sample().to(dev) * valid0.float()  # _standard_gamma); root-only
+        noise = g / g.sum(dim=1, keepdim=True).clamp(min=1e-30)     # Dirichlet over legal slots
+        pri0 = (1.0 - dirichlet_weight) * pri0 + dirichlet_weight * noise
+    ch_action[:, 0] = idx0.to(t16)                                  # -1 pads preserved
+    ch_prior[:, 0] = pri0.to(tp)
+    n_children[:, 0] = cnt0.to(ti)
+    val0_t = _leaf_values_gpu(boards0, npos0, ncol0, nn0, fv, dev)
     node_visits[:, 0] = 1.0
-    node_vsum[:, 0] = torch.from_numpy(val0.astype(np.float32)).to(dev)
-    min_q = torch.from_numpy(val0.astype(np.float32)).to(dev).clone()
-    max_q = torch.from_numpy(val0.astype(np.float32)).to(dev).clone()
+    node_vsum[:, 0] = val0_t
+    min_q = val0_t.clone()
+    max_q = val0_t.clone()
     slot_idx = torch.arange(W, device=dev).unsqueeze(0)
 
     if ablate == 'descent_only':
@@ -124,7 +155,7 @@ def batched_search_gpu(net, dev, dtype, boards0_np, npos0_np, ncol0_np, nn0_np,
         terminal = torch.zeros(K, dtype=tb, device=dev)
 
         for _d in range(max_depth):
-            if not bool(active.any()):
+            if _d & 7 == 0 and _d and not bool(active.any()):  # coarse early-exit (1 sync / 8 steps)
                 break
             cn = cur_node
             nch = n_children[kar, cn]
@@ -161,11 +192,11 @@ def batched_search_gpu(net, dev, dtype, boards0_np, npos0_np, ncol0_np, nn0_np,
             no_legal = active & ~has_legal
             leaf_node = torch.where(no_legal, cur_node, leaf_node)
 
-            if bool(move_mask.any()):
-                rows = torch.nonzero(move_mask, as_tuple=True)[0]
-                path_nodes[rows, plen[rows]] = cn[rows]
-                path_slots[rows, plen[rows]] = best[rows]
-                plen[rows] += 1
+            # record (node, slot) at depth plen for moving trees — full-K masked write (no nonzero)
+            wp = plen.clamp(max=max_depth - 1)
+            path_nodes[kar, wp] = torch.where(move_mask, cn, path_nodes[kar, wp])
+            path_slots[kar, wp] = torch.where(move_mask, best, path_slots[kar, wp])
+            plen = plen + move_mask.to(ti)
 
             best_act = ch_act[kar, best]
             bsf = best_act // 81; btf = best_act % 81
@@ -191,39 +222,43 @@ def batched_search_gpu(net, dev, dtype, boards0_np, npos0_np, ncol0_np, nn0_np,
         if ablate == 'descent_only':
             continue                                    # skip eval/expand/backup (no CPU sync)
 
-        # ---- evaluate leaves (CPU leaf eval), expand new-node leaves, backup ----
-        logits, value, _ = _evaluate(net, dev, dtype, cur_board, cur_pos, cur_col, cur_n, fv,
-                                     eval_net=(ablate != 'no_net'))
-        cur_board_np = cur_board.to(torch.int8).cpu().numpy()
-        ep = expand_parent.cpu().numpy(); es = expand_slot.cpu().numpy()
-        term = terminal.cpu().numpy(); ln = leaf_node.cpu().numpy()
-        nn_host = n_nodes.cpu().numpy()
-        for k in range(K):
-            if ep[k] >= 0 and not term[k]:
-                new = int(nn_host[k]); nn_host[k] += 1
-                ch_nodeid[k, int(ep[k]), int(es[k])] = new
-                cnt, idx, pri = _legal_priors_jit(cur_board_np[k], logits[k], top_k)
-                cnt = int(cnt)
-                if cnt > 0:
-                    ch_action[k, new, :cnt] = torch.from_numpy(idx[:cnt].astype(np.int16)).to(dev)
-                    ch_prior[k, new, :cnt] = torch.from_numpy(pri[:cnt].astype(np.float16)).to(dev)
-                    n_children[k, new] = cnt
-                ln[k] = new
-        n_nodes = torch.from_numpy(nn_host).to(dev)
-        leaf_node = torch.from_numpy(ln).to(dev)
+        # ---- leaf eval (obs+logits+priors on GPU; value via batched CPU feature eval),
+        #      VECTORIZED expand, backup ----
+        labels_leaf = beg.label_components_sv(cur_board, iters=8)
+        if ablate != 'no_net':
+            obs = beg.build_observation_t(cur_board, cur_pos, cur_col, cur_n, labels=labels_leaf)
+            logits = net(obs.to(dtype)).float()
+        else:
+            logits = torch.zeros((K, NACT), device=dev)
+        cnt_l, idx_l, pri_l = beg.legal_priors_t(cur_board, logits, top_k, labels=labels_leaf)
+        value_t = _leaf_values_gpu(cur_board, cur_pos, cur_col, cur_n, fv, dev)
 
-        # backup (vectorized over the path via scatter; per-step torch)
-        value_t = torch.from_numpy(value.astype(np.float32)).to(dev)
-        max_l = int(plen.max().item())
-        for i in range(max_l):
-            on = (i < plen)
-            nd = path_nodes[:, i]; sl = path_slots[:, i]
-            valid = on & (nd >= 0)
-            vi = torch.where(valid, value_t, torch.zeros_like(value_t))
-            node_visits[kar, nd.clamp(min=0)] += valid.float()
-            node_vsum[kar, nd.clamp(min=0)] += vi
-            ch_visits[kar, nd.clamp(min=0), sl.clamp(min=0)] += valid.float()
-            ch_vsum[kar, nd.clamp(min=0), sl.clamp(min=0)] += vi
+        # expand: every tree writes its children into its next free slot new_id for ALL K (harmless
+        # scratch for non-expanders, overwritten next sim); only expanders bump n_nodes, link the
+        # parent edge, and adopt the new node as leaf. No boolean indexing / no host sync.
+        expand_mask = (expand_parent >= 0) & ~terminal
+        new_id = n_nodes                                              # [K] next free node per tree
+        ch_action[kar, new_id] = idx_l.to(t16)                        # -1 pads preserved
+        ch_prior[kar, new_id] = pri_l.to(tp)
+        n_children[kar, new_id] = cnt_l.to(ti)
+        ep_c = expand_parent.clamp(min=0); es_c = expand_slot.clamp(min=0)
+        cur_link = ch_nodeid[kar, ep_c, es_c]                         # non-expanders rewrite unchanged
+        ch_nodeid[kar, ep_c, es_c] = torch.where(expand_mask, new_id.to(t16), cur_link)
+        leaf_node = torch.where(expand_mask, new_id, leaf_node)
+        n_nodes = n_nodes + expand_mask.to(ti)
+
+        # backup: scatter-add the leaf value to every (node, edge) on each path in ONE shot (no
+        # Python loop, no .item()). A path visits each node once, so no within-row scatter collision.
+        depth_ar = torch.arange(max_depth, device=dev).unsqueeze(0)
+        on = (depth_ar < plen.unsqueeze(1)) & (path_nodes >= 0)       # [K,max_depth] valid steps
+        pn = path_nodes.clamp(min=0); ps = path_slots.clamp(min=0)
+        vrow = value_t.unsqueeze(1)
+        onv = on.float(); onval = torch.where(on, vrow, torch.zeros_like(vrow))
+        node_visits.scatter_add_(1, pn, onv)
+        node_vsum.scatter_add_(1, pn, onval)
+        flat = pn * W + ps
+        ch_visits.view(K, N * W).scatter_add_(1, flat, onv)
+        ch_vsum.view(K, N * W).scatter_add_(1, flat, onval)
         lnv = leaf_node >= 0
         node_visits[kar, leaf_node.clamp(min=0)] += lnv.float()
         node_vsum[kar, leaf_node.clamp(min=0)] += torch.where(lnv, value_t, torch.zeros_like(value_t))
