@@ -45,12 +45,93 @@ def _make_step(boards, src, tgt, rows, cols, prior, visits, vsum, nodevis, out_b
     return step
 
 
+PROBE_NAMES = ['label_cc', 'build_obs', 'net_forward', 'legal_priors', 'apply_move_det',
+               'scatter_add', 'topk']
+
+
+def _probe_one(dev, K, name):
+    """Capture ONE component in this (isolated) process. Prints OK/FAILED. A CUDA capture failure
+    corrupts the context, so each component must run in its own process (see _probe)."""
+    import torch.backends.cudnn as cudnn
+    cudnn.benchmark = False
+    from alphatrain.model import PolicyNet
+    from alphatrain import batched_engine_gpu as beg
+    rng = np.random.default_rng(0)
+    bnp = np.where(rng.random((K, 9, 9)) < 0.55, rng.integers(1, 8, (K, 9, 9)), 0).astype(np.int8)
+    boards = torch.from_numpy(bnp.astype(np.int64)).to(dev)
+    npos = torch.zeros((K, 3, 2), dtype=torch.int64, device=dev)
+    ncol = torch.ones((K, 3), dtype=torch.int64, device=dev)
+    nn = torch.full((K,), 3, dtype=torch.int64, device=dev)
+    src = torch.zeros((K, 2), dtype=torch.int64, device=dev)
+    tgt = torch.zeros((K, 2), dtype=torch.int64, device=dev)
+    if name in ('net_forward', 'legal_priors'):
+        net = PolicyNet(in_channels=18, num_blocks=10, channels=256).to(dev).half(); net.train(False)
+        obs = beg.build_observation_t(boards, npos, ncol, nn).half()
+        logits = net(obs).float()
+    tree = torch.zeros((K, 200 * 300), device=dev)
+    idxb = torch.randint(0, 200 * 300, (K, 64), device=dev); valb = torch.ones((K, 64), device=dev)
+    big = torch.rand((K, 6561), device=dev)
+    fns = {
+        'label_cc':       lambda: beg.label_components_sv(boards, iters=8),
+        'build_obs':      lambda: beg.build_observation_t(boards, npos, ncol, nn),
+        'net_forward':    lambda: net(beg.build_observation_t(boards, npos, ncol, nn).half()),
+        'legal_priors':   lambda: beg.legal_priors_t(boards, logits, 300),
+        'apply_move_det': lambda: beg.apply_move_nosync_t(boards.clone(), npos, ncol, nn, src, tgt,
+                                                          deterministic=True),
+        'scatter_add':    lambda: tree.scatter_add_(1, idxb, valb),
+        'topk':           lambda: big.topk(300, dim=1),
+    }
+    fn = fns[name]
+    s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    g.replay(); torch.cuda.synchronize()
+    print(f"  {name:16s} CAPTURE OK", flush=True)
+
+
+def _probe(dev, K):
+    """Run each component's capture in its OWN subprocess (isolation)."""
+    import subprocess
+    self = os.path.abspath(__file__)
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(self)),
+               CUDA_LAUNCH_BLOCKING='1')
+    for name in PROBE_NAMES:
+        r = subprocess.run([sys.executable, self, '--probe-one', name, '--k', str(K),
+                            '--device', dev.type], capture_output=True, text=True, env=env)
+        out = (r.stdout + r.stderr).strip().splitlines()
+        ok = any('CAPTURE OK' in l for l in out)
+        if ok:
+            print(f"  {name:16s} CAPTURE OK", flush=True)
+        else:
+            err = [l for l in out if ('Error' in l or 'error' in l or 'FAILED' in l)]
+            print(f"  {name:16s} FAILED: {(err[-1] if err else out[-1] if out else '?')[:140]}",
+                  flush=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--device', default=None)
     p.add_argument('--k', type=int, default=256)
     p.add_argument('--iters', type=int, default=400)
+    p.add_argument('--probe', action='store_true', help='isolate which component breaks capture')
+    p.add_argument('--probe-one', default=None, help=argparse.SUPPRESS)
     a = p.parse_args()
+    if a.probe_one:
+        _probe_one(_device(a.device), a.k, a.probe_one)
+        return
+    if a.probe:
+        dev = _device(a.device)
+        print(f"device={dev.type} K={a.k} -- per-component capture probe (each in own process)",
+              flush=True)
+        if dev.type != 'cuda':
+            print("  (capture only on cuda)", flush=True); return
+        _probe(dev, a.k)
+        return
     dev = _device(a.device)
     K = a.k
     print(f"device={dev.type} K={K} iters={a.iters} W={W}", flush=True)

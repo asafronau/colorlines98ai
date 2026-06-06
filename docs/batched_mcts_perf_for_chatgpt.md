@@ -1,5 +1,8 @@
 # GPU batched-MCTS throughput — request for ideas
 
+> **READING NOTE: UPDATE 3 (bottom) is the CURRENT state. Sections 5-6, 'RESULT', and UPDATE 1-2 are historical/superseded — kept for the trail.**
+
+
 We built a GPU batched-tree MCTS to speed up "teacher" search for a Color Lines 98 RL agent.
 It is **correct** but **slower end-to-end than our CPU baseline**, even on an L4. We've localized
 the bottleneck and want ideas before we either fix it or shelve it. Please poke holes and suggest
@@ -362,3 +365,80 @@ next-ball spawn simulation) to GPU, since that `.cpu()` is the last sync either 
 - (d) Anything that says "stop — tiny-board deep MCTS at 4800 sims is the wrong job for a GPU; the
   46k-eager-op descent is intrinsic, put this on a multicore-CPU / Rust path and use the GPU only for
   a batched prior server"? We want the honest version.
+
+---
+
+# UPDATE 3 — Full-sim CUDA-graph capture WORKS (6.4x) but loses to the production search. Why, + a fork.
+
+We followed your spike recipe to completion and captured the FULL per-sim. It captures and replays
+correctly. But sims-matched against the real workload it does NOT beat the CPU miner, for a reason
+specific to MCTS, and we want your read before picking the next lever.
+
+## What we did (all the capture blockers, in order)
+
+Made the per-sim fully capture-safe and bisected the failures with a per-component probe (each
+component captured in its own subprocess, since a failed capture corrupts the CUDA context):
+1. `torch.rand` in `apply_move` -> "Offset increment outside graph capture". Fixed: deterministic
+   RNG-free spawn for the spike (randomness doesn't affect timing).
+2. `build_observation` had a hidden `bool(.any())` + boolean-index in the next-ball channels (correct
+   eagerly, breaks capture). Fixed: masked full-K writes. Probe then showed all 7 components capture OK
+   (label_cc, build_obs, net_forward, legal_priors, apply_move, scatter_add, topk).
+3. Node-buffer overrun: `n_nodes` increments in place every `per_sim`, and the graph path runs
+   per_sim more than `sims` times (warmup + capture + replays), so it ran past the `[K,N,W]` tree
+   buffer -> device-side index assert. Fixed: clamp the slot + size N with headroom.
+
+## Result (L4, full per-sim captured, FAKE gpu value)
+
+```
+            eager(fixed-depth)   graph        speedup
+K=256          136.4 s           21.4 s        6.4x
+K=512          136.3 s           24.2 s        5.6x
+```
+
+Capture works; 6.4x over the (fixed-depth) eager baseline. **But that eager baseline is a strawman**
+(fixed depth, nobody runs it). Two honest comparisons:
+
+- **vs the real workload (sims-matched).** The graph replays one sim per call, so wall is linear in
+  sims. At the mining sims=4800 (48x the 100 measured): K=512 -> 24.2*48 ≈ 1162 s for 512 trees =
+  **0.44 trees/s**; K=256 -> **0.25 trees/s**. **M5 = 3.56 trees/s. So the captured graph is ~8x
+  BELOW the CPU miner at equal sims.** K=1024 (~0.8 trees/s) still loses.
+- **vs the production eager search** (the one with coarse early-exit, profiled earlier at K=256
+  sims=100 = 18.4 s wall, 2.7 s GPU, dispatch-bound): the captured graph is **21.4 s — slightly
+  SLOWER**.
+
+## Diagnosis (please sanity-check)
+
+Graph capture did NOT lose to dispatch — it eliminated dispatch (the 21.4 s is now almost all GPU
+compute). It lost to the **fixed-depth requirement clashing with MCTS's growing tree**: capture needs
+a static loop, so every sim runs all 64 descent steps. But in MCTS the *early* sims descend a young,
+shallow tree (1-2 plies); only late sims are deep. The production early-exit search naturally does
+shallow early sims (its 2.7 s total GPU compute reflects mostly-shallow descents). The fixed-depth
+graph does ~8x more descent step-executions (64 x 100 vs ~avg-low x 100), so the ~6x capture win is
+canceled by ~8x more compute. **Dispatch is solved; we're now compute-bound on the descent engine
+ops (CC + reachability + apply_move's 4 clears), executed depth x sims times.**
+
+## The fork
+
+1. **Block capture (open-loop, keeps semantics).** Capture a SMALL fixed descent block (e.g. 8
+   steps) as a graph; Python-loop it with an early-exit `bool(active.any())` check *between* blocks
+   (one sync per 8 steps). Dispatch-free within a block AND depth-matched (early sims do 1 block then
+   stop). If wall approaches the ~2.7 s real GPU compute, K=512-1024 could hit ~3-6 trees/s -> beat M5.
+2. **Closed-loop node-board caching (semantic change).** Store board + precomputed legal top-k at
+   expansion so each descent step is a gather, DELETING the per-step CC/reachability/apply_move (the
+   compute floor itself, not just its dispatch). Bigger win; changes the teacher (determinized);
+   needs TV re-validation (current open-loop TV already only ~0.30).
+
+## Questions
+
+- (a) Is the diagnosis right — fixed-depth capture is fundamentally mismatched to MCTS's
+  shallow-early / deep-late descent, so full-sim capture can't win even though the mechanism works?
+- (b) Block capture (capture an 8-step descent block, loop with inter-block early-exit) — is this the
+  right way to get BOTH dispatch-free execution AND depth-matched work, or does the inter-block sync
+  reintroduce enough overhead to negate it? Any better granularity (capture leaf-eval/expand/backup
+  as one graph, descent steps as another)?
+- (c) Given we're now COMPUTE-bound (not dispatch-bound), is closed-loop caching actually the only
+  thing that moves the needle (it deletes the ops; block-capture only schedules them better)? Would
+  you go straight to closed-loop now?
+- (d) Or is this the point where the honest answer is "even optimally-scheduled, K-parallel deep MCTS
+  on 9x9 boards is ~the same total work as the CPU fleet does, and a single L4 just doesn't have the
+  throughput; keep mining on CPU and use the GPU only for a batched prior/eval server"?

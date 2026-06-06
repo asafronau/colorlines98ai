@@ -76,6 +76,12 @@ def main():
     p.add_argument('--nn-bench', action='store_true', help='isolated NN-forward timing at each K')
     p.add_argument('--profile', action='store_true', help='torch.profiler trace (short, K=ks[0])')
     p.add_argument('--scalar', action='store_true', help='also time scalar MCTS (slow on Colab CPU)')
+    p.add_argument('--graph', action='store_true',
+                   help='full-sim CUDA-graph spike: eager vs captured wall (fake value)')
+    p.add_argument('--block', action='store_true',
+                   help='block-capture spike: sweep block sizes, captured descent block + early-exit')
+    p.add_argument('--block-sizes', default='4,8,16')
+    p.add_argument('--max-depth', type=int, default=64)
     a = p.parse_args()
 
     dev = _device(a.device)
@@ -91,6 +97,56 @@ def main():
     from alphatrain.batched_mcts_gpu import batched_search_gpu
     net = _make_net(dev, dtype)
     fv = _load_fv()
+
+    if a.block:
+        from alphatrain.batched_mcts_gpu import batched_search_gpu_block
+        bss = [int(x) for x in a.block_sizes.split(',')]
+        print(f"--- block-capture spike (FAKE value), max_depth={a.max_depth}, sims-honest vs M5 "
+              f"(@sims4800) ---", flush=True)
+        for K in ks:
+            b, pp, c, n = _synth_states(K, a.density, K)
+            for B in bss:
+                args = (net, dev, dtype, b, pp, c, n)
+                kw = dict(sims=a.sims, top_k=a.top_k, max_depth=a.max_depth, block_size=B)
+                batched_search_gpu_block(*args, use_graph=(dev.type == 'cuda'),
+                                         **dict(kw, sims=4)); sync()       # warm/capture
+                try:
+                    t0 = time.perf_counter()
+                    batched_search_gpu_block(*args, use_graph=(dev.type == 'cuda'), **kw); sync()
+                    wall = time.perf_counter() - t0
+                except RuntimeError as e:
+                    print(f"  K={K:>5} B={B:>2}: FAILED: {str(e)[:80]}", flush=True); continue
+                tps = K / wall
+                tps4800 = tps * (a.sims / 4800.0)
+                print(f"  K={K:>5} B={B:>2}: {wall:6.1f}s | @sims{a.sims} {tps:6.2f} tr/s | "
+                      f"@sims4800 {tps4800:5.2f} = {tps4800/M5_SCALAR_TREES_PER_S:.2f}x M5", flush=True)
+        return
+
+    if a.graph:
+        from alphatrain.batched_mcts_gpu import batched_search_gpu_graph
+        print("--- full-sim CUDA-graph spike (FAKE value): eager vs captured wall ---", flush=True)
+        for K in ks:
+            b, pp, c, n = _synth_states(K, a.density, K)
+            args = (net, dev, dtype, b, pp, c, n)
+            kw = dict(sims=a.sims, top_k=a.top_k)
+            batched_search_gpu_graph(*args, use_graph=False, **dict(kw, sims=4)); sync()  # warm numba/kernels
+            t0 = time.perf_counter()
+            batched_search_gpu_graph(*args, use_graph=False, **kw); sync()
+            eager = time.perf_counter() - t0
+            try:
+                t0 = time.perf_counter()
+                batched_search_gpu_graph(*args, use_graph=True, **kw); sync()
+                graph = time.perf_counter() - t0
+                sp = f"{eager/graph:.1f}x" if graph > 0 else "-"
+                # sims-HONEST: M5's 3.56 trees/s is at the mining sims=4800; scale this run's
+                # trees/s to 4800 before comparing (wall is ~linear in sims).
+                tps4800 = (K / graph) * (a.sims / 4800.0)
+                print(f"  K={K:>5}: eager {eager:6.1f}s | graph {graph:6.1f}s | {sp} vs eager | "
+                      f"graph@sims{a.sims} {K/graph:6.2f} tr/s | @sims4800 {tps4800:5.2f} tr/s = "
+                      f"{tps4800/M5_SCALAR_TREES_PER_S:.2f}x M5", flush=True)
+            except RuntimeError as e:
+                print(f"  K={K:>5}: eager {eager:6.1f}s | CAPTURE FAILED: {str(e)[:90]}", flush=True)
+        return
 
     # isolated NN-forward timing: full-search NN cost = sims x this (a direct measurement, not <1s by assertion)
     if a.nn_bench:
