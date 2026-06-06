@@ -442,3 +442,65 @@ ops (CC + reachability + apply_move's 4 clears), executed depth x sims times.**
 - (d) Or is this the point where the honest answer is "even optimally-scheduled, K-parallel deep MCTS
   on 9x9 boards is ~the same total work as the CPU fleet does, and a single L4 just doesn't have the
   throughput; keep mining on CPU and use the GPU only for a batched prior/eval server"?
+
+---
+
+# UPDATE 4 — Closed-loop caching: throughput lever works, but the determinized teacher looks UNFAITHFUL.
+
+We built closed-loop node-board caching (your option 2 / the post-block-capture lever). It does what
+you predicted on *speed*, but the *fidelity* gate is the deciding factor and the early signal is bad.
+
+## What we built
+Each node CACHES its board + its legal top-k children (computed once, at expansion). Descent is then
+a pure gather + PUCT walk down cached nodes — **no per-step CC / reachability / apply_move**. The
+engine ops (1 apply_move + 1 CC + 1 NN forward + 1 legal_priors) run **once per sim**, at the single
+expansion, instead of depth-times. Board cache is cheap (`node_board [K,N,9,9]` int8, ~0.2 GB).
+**Semantic change:** spawns are determinized per node (a node's board is sampled once at creation and
+reused on every revisit).
+
+## Throughput (L4, eager, real value) — the engine cut is real
+| | @sims4800 vs M5 |
+|---|---|
+| open-loop eager (production) | ~0.08x |
+| open-loop block-capture (best) | 0.81x |
+| **closed-loop EAGER** K=512 / K=1024 | 0.44x / 0.52x |
+
+Closed-loop eager is **3.5x faster than open-loop eager** (K=256: 5.3 s vs 18.4 s) — deleting the
+per-step engine ops worked. It's *below* block-capture's 0.81x only because it's still **eager**
+(dispatch-bound: 64 cheap gather steps + the expansion, all eager-dispatched, + a per-sim feature-value
+`.cpu()`). **Key point:** closed-loop's descent is gather-only, so the fixed-depth full-sim capture
+that *backfired* on open-loop (64 expensive engine steps) is now 64 *cheap* steps. closed-loop (cuts
+compute) + capture (cuts dispatch) together should clear M5 by several×. So speed is not the blocker.
+
+## The fidelity gate — the actual blocker (preliminary, UNFAVORABLE)
+Closed-loop vs scalar (re-sampling) MCTS, mps, sims=200-400, 1 scalar seed, on real crisis band states:
+**0/N argmax agreement, meanTV ~0.63** — vs open-loop's ~0.27 (open-loop re-samples like scalar). So
+closed-loop diverges ~2.3x more from the faithful (scalar) teacher.
+
+We think this is a **real bias, not low-sims noise**: the true game is stochastic, and open-loop /
+scalar MCTS average value over the spawn *distribution* (E[value | move]). Closed-loop freezes ONE
+spawn per node, so each subtree explores a single realized future — the root's 300 children each get
+one frozen spawn and revisits can't average them out. The visit distribution then reflects "value
+under this one sampled future," which is a different (biased) objective. For a *teacher we distill
+into the policy*, that bias could mislead.
+
+Proper gate (sims=4800, 3 scalar seeds, n=8) is queued; more sims/seeds may pull TV down some, but we
+expect the structural bias to persist.
+
+## Questions
+- (a) Is the determinization-bias diagnosis right — closed-loop optimizes a single spawn realization
+  rather than the expectation, so for a *stochastic* game it's a systematically biased teacher (not
+  just noisier), and the ~0.63 TV reflects that?
+- (b) Middle grounds worth it, or do they kill the speed win? (i) **M determinizations per node**
+  (sample M spawns at expansion, average their value / store M boards) — restores expectation but
+  re-introduces ~M× the expansion compute + storage; (ii) **open-loop near the root, closed-loop in
+  the deep tail** (where spawn-averaging may matter less); (iii) accept the bias because *crisis* move
+  choice is more forced (escape-or-die) and less spawn-dependent than mid-game.
+- (c) If the full gate confirms TV ~0.5+, is the honest conclusion "for this stochastic game a single
+  L4 can't be both fast AND a faithful deep-MCTS teacher — keep mining on the CPU fleet, use the GPU
+  as a batched prior/eval server"? Open-loop tops out at 0.8x M5 (faithful but slow); closed-loop is
+  fast but biased. Is there a fourth option we're missing?
+- (d) Or: is determinized (closed-loop) MCTS actually a *defensible* teacher for distillation on its
+  own terms (afterstate-style), such that we should judge it by downstream policy improvement (does
+  distilling its labels lift the floor?) rather than by TV-vs-open-loop — i.e., is TV-vs-scalar even
+  the right gate here?
