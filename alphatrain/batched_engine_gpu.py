@@ -104,13 +104,12 @@ def build_observation_t(boards, next_pos, next_col, next_n, labels=None):
     obs[:, 7] = (b == 0).float()                                     # empty
     kar = torch.arange(K, device=dev)
     for i in range(next_pos.shape[1]):                              # 8-10 color/7, 11 mask
-        act = i < next_n
-        if not bool(act.any()):
-            continue
-        pr = next_pos[:, i, 0].long(); pc = next_pos[:, i, 1].long()
-        ka = kar[act]
-        obs[ka, 8 + i, pr[act], pc[act]] = next_col[act, i].float() / 7.0
-        obs[ka, 11, pr[act], pc[act]] = 1.0
+        act = (i < next_n)                                         # [K] — masked full-K writes
+        pr = next_pos[:, i, 0].long(); pc = next_pos[:, i, 1].long()  # (no bool(.any())/boolean-index:
+        cur_c = obs[kar, 8 + i, pr, pc]                            #  capture-safe; identical eager result)
+        obs[kar, 8 + i, pr, pc] = torch.where(act, next_col[:, i].float() / 7.0, cur_c)
+        cur_m = obs[kar, 11, pr, pc]
+        obs[kar, 11, pr, pc] = torch.where(act, torch.ones_like(cur_m), cur_m)
     if labels is None:                                              # 12 empty-component size/81
         labels = label_components_sv(boards)
     lf = labels.reshape(K, BOARD * BOARD)
@@ -315,6 +314,76 @@ def apply_move_t(boards, next_pos, next_col, next_n, src, tgt,
             new_pos[:, i, 1] = torch.where(sel, (cell % BOARD).to(new_pos.dtype), new_pos[:, i, 1])
             new_col[:, i] = torch.where(sel, cols[:, i].to(new_col.dtype), new_col[:, i])
         new_n = torch.where(spawn, want.to(new_n.dtype), new_n)
+    return game_over, new_pos, new_col, new_n
+
+
+def _det_empty_order(boards):
+    """RNG-FREE empty-cell ordering (capture-safe): empty cells first in ascending index order,
+    balls last. Same return shape as _rand_empty_order. For the CUDA-graph perf spike — randomness
+    doesn't affect op count/timing, and torch.rand can't run inside a captured region."""
+    K = boards.shape[0]
+    dev = boards.device
+    empty = (boards == 0).reshape(K, BOARD * BOARD)
+    idx = torch.arange(BOARD * BOARD, device=dev).float().unsqueeze(0).expand(K, -1)
+    keys = torch.where(empty, idx, torch.full_like(idx, 1e9))
+    return keys.argsort(dim=1, descending=False), empty.sum(dim=1)
+
+
+def apply_move_nosync_t(boards, next_pos, next_col, next_n, src, tgt,
+                        active=None, num_colors=NUM_COLORS, generator=None, deterministic=False):
+    """Sync-free apply_move_t for CUDA-graph capture: NO bool(.any()) guards and NO variable-size
+    boolean-index writes (both force a host sync / break capture). Every op runs masked over all K
+    (a no-op where inactive). Move+clear is identical to apply_move_t; the spawn loop now draws RNG
+    unconditionally so the spawn *sequence* differs (fine — open-loop is stochastic anyway). Pass
+    generator=None to use the default (graph-safe) RNG inside a captured region."""
+    K = boards.shape[0]
+    dev = boards.device
+    kar = torch.arange(K, device=dev)
+    act0 = torch.ones(K, dtype=torch.bool, device=dev) if active is None else active
+    sr, sc, tr, tc = src[:, 0], src[:, 1], tgt[:, 0], tgt[:, 1]
+    color = torch.where(act0, boards[kar, sr, sc], torch.zeros_like(boards[:, 0, 0]))
+    cur_s = boards[kar, sr, sc]                                          # move (masked full-K writes)
+    boards[kar, sr, sc] = torch.where(act0, torch.zeros_like(cur_s), cur_s)
+    cur_t = boards[kar, tr, tc]
+    boards[kar, tr, tc] = torch.where(act0, color, cur_t)
+    cleared = clear_lines_at_t(boards, tr, tc, active=act0)
+    spawn = act0 & (cleared == 0)
+
+    new_pos = next_pos.clone(); new_col = next_col.clone(); new_n = next_n.clone()
+    for i in range(next_pos.shape[1]):
+        act = spawn & (i < next_n)
+        pr = next_pos[:, i, 0].long(); pc = next_pos[:, i, 1].long()
+        pcol = next_col[:, i]
+        intended_empty = boards[kar, pr, pc] == 0
+        land_r, land_c = pr.clone(), pc.clone()
+        disp = act & ~intended_empty
+        order, n_emp = (_det_empty_order(boards) if deterministic
+                        else _rand_empty_order(boards, generator))     # always (no disp guard)
+        cell = order[:, 0]
+        use = disp & (n_emp > 0)
+        land_r = torch.where(use, cell // BOARD, land_r)
+        land_c = torch.where(use, cell % BOARD, land_c)
+        place = (act & intended_empty) | use
+        cur = boards[kar, land_r, land_c]
+        boards[kar, land_r, land_c] = torch.where(place, pcol.to(boards.dtype), cur)
+        clear_lines_at_t(boards, land_r, land_c, active=place)
+
+    filled = (boards.reshape(K, -1) != 0).all(dim=1)                   # final spawn (no guard)
+    game_over = spawn & filled
+    order, n_emp = (_det_empty_order(boards) if deterministic
+                    else _rand_empty_order(boards, generator))
+    want = n_emp.clamp(max=BALLS_PER_TURN)
+    if deterministic:
+        cols = (torch.arange(BALLS_PER_TURN, device=dev) % num_colors + 1).unsqueeze(0).expand(K, -1)
+    else:
+        cols = torch.randint(1, num_colors + 1, (K, BALLS_PER_TURN), device=dev, generator=generator)
+    for i in range(BALLS_PER_TURN):
+        sel = spawn & (i < want)
+        cell = order[:, i]
+        new_pos[:, i, 0] = torch.where(sel, (cell // BOARD).to(new_pos.dtype), new_pos[:, i, 0])
+        new_pos[:, i, 1] = torch.where(sel, (cell % BOARD).to(new_pos.dtype), new_pos[:, i, 1])
+        new_col[:, i] = torch.where(sel, cols[:, i].to(new_col.dtype), new_col[:, i])
+    new_n = torch.where(spawn, want.to(new_n.dtype), new_n)
     return game_over, new_pos, new_col, new_n
 
 

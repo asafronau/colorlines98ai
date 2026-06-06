@@ -276,3 +276,357 @@ def batched_search_gpu(net, dev, dtype, boards0_np, npos0_np, ncol0_np, nn0_np,
         if tot > 0:
             dist[k, acts0[k, :cnt]] = v / tot
     return dist
+
+
+@torch.no_grad()
+def batched_search_gpu_graph(net, dev, dtype, boards0_np, npos0_np, ncol0_np, nn0_np,
+                             sims=100, top_k=300, c_puct=2.5, q_weight=2.0, max_depth=64,
+                             use_graph=True, _timer=None):
+    """Full-sim CUDA-GRAPH spike. The per-sim body is made fully sync-free (nosync apply_move +
+    fixed-depth descent + FAKE gpu value + default RNG), captured ONCE and replayed `sims` times.
+    Measures whether capturing the WHOLE sim (not just the engine bundle) cuts the eager-dispatch
+    wall. FAKE value => the result is NOT a valid search (perf only). use_graph=False runs eager
+    (logic/shape check on mps/cpu). Persistent tree state is updated IN PLACE so replay accumulates."""
+    K = boards0_np.shape[0]
+    W = top_k
+    # graph path expands once per (warmup + capture + replay) call, NOT just `sims` times, so size
+    # N with headroom and clamp the slot index — else n_nodes runs past N over the replays (OOB).
+    N = sims + 16
+    ti, tl, tb = torch.int64, torch.float32, torch.bool
+    t16, tp = torch.int16, torch.float16
+    boards0 = torch.from_numpy(boards0_np.astype(np.int64)).to(dev)
+    npos0 = torch.from_numpy(npos0_np.astype(np.int64)).to(dev)
+    ncol0 = torch.from_numpy(ncol0_np.astype(np.int64)).to(dev)
+    nn0 = torch.from_numpy(nn0_np.astype(np.int64)).to(dev)
+    kar = torch.arange(K, device=dev)
+    slot_idx = torch.arange(W, device=dev).unsqueeze(0)
+
+    # persistent tree state (mutated in place across sims/replays)
+    node_visits = torch.zeros((K, N), dtype=tl, device=dev)
+    node_vsum = torch.zeros((K, N), dtype=tl, device=dev)
+    ch_action = torch.full((K, N, W), -1, dtype=t16, device=dev)
+    ch_prior = torch.zeros((K, N, W), dtype=tp, device=dev)
+    ch_visits = torch.zeros((K, N, W), dtype=tl, device=dev)
+    ch_vsum = torch.zeros((K, N, W), dtype=tl, device=dev)
+    ch_nodeid = torch.full((K, N, W), -1, dtype=t16, device=dev)
+    n_children = torch.zeros((K, N), dtype=ti, device=dev)
+    n_nodes = torch.ones(K, dtype=ti, device=dev)
+    min_q = torch.zeros(K, dtype=tl, device=dev)
+    max_q = torch.ones(K, dtype=tl, device=dev)
+
+    def _fake_value(board):
+        return (board == 0).float().sum(dim=(1, 2)) * 0.05      # cheap GPU leaf value (perf spike)
+
+    # root expansion (eager, once)
+    labels0 = beg.label_components_sv(boards0, iters=8)
+    obs0 = beg.build_observation_t(boards0, npos0, ncol0, nn0, labels=labels0)
+    logits0 = net(obs0.to(dtype)).float()
+    cnt0, idx0, pri0 = beg.legal_priors_t(boards0, logits0, top_k, labels=labels0)
+    ch_action[:, 0] = idx0.to(t16); ch_prior[:, 0] = pri0.to(tp); n_children[:, 0] = cnt0.to(ti)
+    v0 = _fake_value(boards0)
+    node_visits[:, 0] = 1.0; node_vsum[:, 0] = v0
+    min_q.copy_(v0); max_q.copy_(v0)
+
+    def per_sim():
+        cur_board = boards0.clone()
+        cur_pos = npos0.clone(); cur_col = ncol0.clone(); cur_n = nn0.clone()
+        cur_node = torch.zeros(K, dtype=ti, device=dev)
+        active = torch.ones(K, dtype=tb, device=dev)
+        path_nodes = torch.full((K, max_depth), -1, dtype=ti, device=dev)
+        path_slots = torch.full((K, max_depth), -1, dtype=ti, device=dev)
+        plen = torch.zeros(K, dtype=ti, device=dev)
+        leaf_node = torch.full((K,), -1, dtype=ti, device=dev)
+        expand_parent = torch.full((K,), -1, dtype=ti, device=dev)
+        expand_slot = torch.full((K,), -1, dtype=ti, device=dev)
+        terminal = torch.zeros(K, dtype=tb, device=dev)
+        for _d in range(max_depth):                            # fixed length (no early-exit sync)
+            cn = cur_node
+            nch = n_children[kar, cn]
+            slot_valid = slot_idx < nch.unsqueeze(1)
+            ch_act = ch_action[kar, cn].long()
+            ch_pri = ch_prior[kar, cn].float()
+            ch_vis = ch_visits[kar, cn]; ch_vs = ch_vsum[kar, cn]
+            ch_nid = ch_nodeid[kar, cn].long()
+            sf = ch_act // 81; tf = ch_act % 81
+            sr = (sf // 9).clamp(0, 8); sc = (sf % 9).clamp(0, 8)
+            tr = (tf // 9).clamp(0, 8); tc = (tf % 9).clamp(0, 8)
+            kk = kar.unsqueeze(1)
+            occ = (cur_board[kk, sr, sc] != 0) & (cur_board[kk, tr, tc] == 0)
+            labels = beg.label_components_sv(cur_board, iters=8)
+            reach = beg.reachable_many_t(labels, torch.stack([sr, sc], -1), torch.stack([tr, tc], -1))
+            legal = slot_valid & occ & reach & active.unsqueeze(1)
+            nv = node_visits[kar, cn]
+            sqrt_n = torch.sqrt(nv).unsqueeze(1)
+            qr = (max_q - min_q)
+            qpos = ch_vis > 0
+            q = torch.where(qpos, ch_vs / torch.where(qpos, ch_vis, torch.ones_like(ch_vis)),
+                            torch.zeros_like(ch_vis))
+            q_norm = (q - min_q.unsqueeze(1)) / torch.where(qr > 0, qr, torch.ones_like(qr)).unsqueeze(1)
+            q_norm = torch.where(qpos & (qr.unsqueeze(1) > 0), q_norm, torch.full_like(q_norm, 0.5))
+            u = c_puct * ch_pri * sqrt_n / (1.0 + ch_vis)
+            score = torch.where(legal, q_weight * q_norm + u, torch.full_like(q_norm, -1e30))
+            best = torch.argmax(score, dim=1)
+            has_legal = legal.any(dim=1)
+            move_mask = active & has_legal
+            no_legal = active & ~has_legal
+            leaf_node = torch.where(no_legal, cur_node, leaf_node)
+            wp = plen.clamp(max=max_depth - 1)
+            path_nodes[kar, wp] = torch.where(move_mask, cn, path_nodes[kar, wp])
+            path_slots[kar, wp] = torch.where(move_mask, best, path_slots[kar, wp])
+            plen = plen + move_mask.to(ti)
+            best_act = ch_act[kar, best]
+            bsf = best_act // 81; btf = best_act % 81
+            mv_src = torch.stack([(bsf // 9).clamp(0, 8), (bsf % 9).clamp(0, 8)], -1)
+            mv_tgt = torch.stack([(btf // 9).clamp(0, 8), (btf % 9).clamp(0, 8)], -1)
+            chosen_nid = ch_nid[kar, best]
+            go, cur_pos, cur_col, cur_n = beg.apply_move_nosync_t(
+                cur_board, cur_pos, cur_col, cur_n, mv_src, mv_tgt, active=move_mask,
+                deterministic=True)                            # RNG-free => capture-safe
+            unexp = move_mask & (chosen_nid < 0)
+            exp = move_mask & (chosen_nid >= 0)
+            exp_term = exp & go; exp_cont = exp & ~go
+            expand_parent = torch.where(unexp, cur_node, expand_parent)
+            expand_slot = torch.where(unexp, best, expand_slot)
+            terminal = terminal | (unexp & go) | exp_term
+            leaf_node = torch.where(exp_term, chosen_nid, leaf_node)
+            cur_node = torch.where(exp_cont, chosen_nid, cur_node)
+            active = exp_cont
+        leaf_node = torch.where(active, cur_node, leaf_node)
+        # leaf eval (FAKE value), expand, backup — all sync-free, persistent updates IN PLACE
+        labels_leaf = beg.label_components_sv(cur_board, iters=8)
+        obs = beg.build_observation_t(cur_board, cur_pos, cur_col, cur_n, labels=labels_leaf)
+        logits = net(obs.to(dtype)).float()
+        cnt_l, idx_l, pri_l = beg.legal_priors_t(cur_board, logits, top_k, labels=labels_leaf)
+        value_t = _fake_value(cur_board)
+        expand_mask = (expand_parent >= 0) & ~terminal
+        new_id = n_nodes.clamp(max=N - 1)                      # never index past the buffer
+        ch_action[kar, new_id] = idx_l.to(t16)
+        ch_prior[kar, new_id] = pri_l.to(tp)
+        n_children[kar, new_id] = cnt_l.to(ti)
+        ep_c = expand_parent.clamp(min=0); es_c = expand_slot.clamp(min=0)
+        cur_link = ch_nodeid[kar, ep_c, es_c]
+        ch_nodeid[kar, ep_c, es_c] = torch.where(expand_mask, new_id.to(t16), cur_link)
+        leaf_node = torch.where(expand_mask, new_id, leaf_node)
+        n_nodes.add_(expand_mask.to(ti))                       # IN PLACE (accumulate across replays)
+        depth_ar = torch.arange(max_depth, device=dev).unsqueeze(0)
+        on = (depth_ar < plen.unsqueeze(1)) & (path_nodes >= 0)
+        pn = path_nodes.clamp(min=0); ps = path_slots.clamp(min=0)
+        vrow = value_t.unsqueeze(1)
+        onv = on.float(); onval = torch.where(on, vrow, torch.zeros_like(vrow))
+        node_visits.scatter_add_(1, pn, onv); node_vsum.scatter_add_(1, pn, onval)
+        flat = pn * W + ps
+        ch_visits.view(K, N * W).scatter_add_(1, flat, onv)
+        ch_vsum.view(K, N * W).scatter_add_(1, flat, onval)
+        lnv = leaf_node >= 0
+        node_visits[kar, leaf_node.clamp(min=0)] += lnv.float()
+        node_vsum[kar, leaf_node.clamp(min=0)] += torch.where(lnv, value_t, torch.zeros_like(value_t))
+        torch.minimum(min_q, value_t, out=min_q)               # IN PLACE
+        torch.maximum(max_q, value_t, out=max_q)
+
+    if not (use_graph and dev.type == 'cuda'):
+        for _ in range(sims):                                  # eager (logic/shape check)
+            per_sim()
+        return None
+    # CUDA-graph capture of one per-sim, replayed `sims` times
+    s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            per_sim()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        per_sim()
+    if _timer is not None:
+        _timer(g, sims)
+    for _ in range(sims):
+        g.replay()
+    return None
+
+
+@torch.no_grad()
+def batched_search_gpu_block(net, dev, dtype, boards0_np, npos0_np, ncol0_np, nn0_np,
+                             sims=100, top_k=300, c_puct=2.5, q_weight=2.0, max_depth=64,
+                             block_size=8, use_graph=True):
+    """BLOCK-capture spike. Fixes the full-sim capture's flaw (it ran all max_depth steps every sim,
+    but MCTS early sims are shallow). Per-sim descent state is PERSISTENT and updated IN PLACE; a
+    B-step descent block is captured ONCE and replayed with an inter-block early-exit
+    (bool(active.any()), one sync per B steps) so shallow sims stop early. Leaf-eval+expand+backup is
+    a second captured graph. FAKE gpu value (perf only). use_graph=False = eager logic/shape check."""
+    K = boards0_np.shape[0]
+    W = top_k
+    N = sims + 16
+    B = block_size
+    ti, tl, tb = torch.int64, torch.float32, torch.bool
+    t16, tp = torch.int16, torch.float16
+    boards0 = torch.from_numpy(boards0_np.astype(np.int64)).to(dev)
+    npos0 = torch.from_numpy(npos0_np.astype(np.int64)).to(dev)
+    ncol0 = torch.from_numpy(ncol0_np.astype(np.int64)).to(dev)
+    nn0 = torch.from_numpy(nn0_np.astype(np.int64)).to(dev)
+    kar = torch.arange(K, device=dev)
+    slot_idx = torch.arange(W, device=dev).unsqueeze(0)
+    depth_ar = torch.arange(max_depth, device=dev).unsqueeze(0)
+
+    # persistent tree state
+    node_visits = torch.zeros((K, N), dtype=tl, device=dev)
+    node_vsum = torch.zeros((K, N), dtype=tl, device=dev)
+    ch_action = torch.full((K, N, W), -1, dtype=t16, device=dev)
+    ch_prior = torch.zeros((K, N, W), dtype=tp, device=dev)
+    ch_visits = torch.zeros((K, N, W), dtype=tl, device=dev)
+    ch_vsum = torch.zeros((K, N, W), dtype=tl, device=dev)
+    ch_nodeid = torch.full((K, N, W), -1, dtype=t16, device=dev)
+    n_children = torch.zeros((K, N), dtype=ti, device=dev)
+    n_nodes = torch.ones(K, dtype=ti, device=dev)
+    min_q = torch.zeros(K, dtype=tl, device=dev)
+    max_q = torch.ones(K, dtype=tl, device=dev)
+    # PERSISTENT per-sim descent state (reset each sim, mutated in place by the captured block)
+    cur_board = boards0.clone(); cur_pos = npos0.clone(); cur_col = ncol0.clone(); cur_n = nn0.clone()
+    cur_node = torch.zeros(K, dtype=ti, device=dev)
+    active = torch.ones(K, dtype=tb, device=dev)
+    path_nodes = torch.full((K, max_depth), -1, dtype=ti, device=dev)
+    path_slots = torch.full((K, max_depth), -1, dtype=ti, device=dev)
+    plen = torch.zeros(K, dtype=ti, device=dev)
+    leaf_node = torch.full((K,), -1, dtype=ti, device=dev)
+    expand_parent = torch.full((K,), -1, dtype=ti, device=dev)
+    expand_slot = torch.full((K,), -1, dtype=ti, device=dev)
+    terminal = torch.zeros(K, dtype=tb, device=dev)
+
+    def _fake_value(board):
+        return (board == 0).float().sum(dim=(1, 2)) * 0.05
+
+    # root expansion (eager, once)
+    labels0 = beg.label_components_sv(boards0, iters=8)
+    obs0 = beg.build_observation_t(boards0, npos0, ncol0, nn0, labels=labels0)
+    logits0 = net(obs0.to(dtype)).float()
+    cnt0, idx0, pri0 = beg.legal_priors_t(boards0, logits0, top_k, labels=labels0)
+    ch_action[:, 0] = idx0.to(t16); ch_prior[:, 0] = pri0.to(tp); n_children[:, 0] = cnt0.to(ti)
+    v0 = _fake_value(boards0)
+    node_visits[:, 0] = 1.0; node_vsum[:, 0] = v0; min_q.copy_(v0); max_q.copy_(v0)
+
+    def reset_sim():
+        cur_board.copy_(boards0); cur_pos.copy_(npos0); cur_col.copy_(ncol0); cur_n.copy_(nn0)
+        cur_node.zero_(); active.fill_(True)
+        path_nodes.fill_(-1); path_slots.fill_(-1); plen.zero_()
+        leaf_node.fill_(-1); expand_parent.fill_(-1); expand_slot.fill_(-1); terminal.zero_()
+
+    def descent_step():
+        cn = cur_node
+        nch = n_children[kar, cn]
+        slot_valid = slot_idx < nch.unsqueeze(1)
+        ch_act = ch_action[kar, cn].long()
+        ch_pri = ch_prior[kar, cn].float()
+        ch_vis = ch_visits[kar, cn]; ch_vs = ch_vsum[kar, cn]
+        ch_nid = ch_nodeid[kar, cn].long()
+        sf = ch_act // 81; tf = ch_act % 81
+        sr = (sf // 9).clamp(0, 8); sc = (sf % 9).clamp(0, 8)
+        tr = (tf // 9).clamp(0, 8); tc = (tf % 9).clamp(0, 8)
+        kk = kar.unsqueeze(1)
+        occ = (cur_board[kk, sr, sc] != 0) & (cur_board[kk, tr, tc] == 0)
+        labels = beg.label_components_sv(cur_board, iters=8)
+        reach = beg.reachable_many_t(labels, torch.stack([sr, sc], -1), torch.stack([tr, tc], -1))
+        legal = slot_valid & occ & reach & active.unsqueeze(1)
+        nv = node_visits[kar, cn]
+        sqrt_n = torch.sqrt(nv).unsqueeze(1)
+        qr = (max_q - min_q)
+        qpos = ch_vis > 0
+        q = torch.where(qpos, ch_vs / torch.where(qpos, ch_vis, torch.ones_like(ch_vis)),
+                        torch.zeros_like(ch_vis))
+        q_norm = (q - min_q.unsqueeze(1)) / torch.where(qr > 0, qr, torch.ones_like(qr)).unsqueeze(1)
+        q_norm = torch.where(qpos & (qr.unsqueeze(1) > 0), q_norm, torch.full_like(q_norm, 0.5))
+        u = c_puct * ch_pri * sqrt_n / (1.0 + ch_vis)
+        score = torch.where(legal, q_weight * q_norm + u, torch.full_like(q_norm, -1e30))
+        best = torch.argmax(score, dim=1)
+        has_legal = legal.any(dim=1)
+        move_mask = active & has_legal
+        no_legal = active & ~has_legal
+        leaf_node.copy_(torch.where(no_legal, cur_node, leaf_node))
+        wp = plen.clamp(max=max_depth - 1)
+        path_nodes[kar, wp] = torch.where(move_mask, cn, path_nodes[kar, wp])
+        path_slots[kar, wp] = torch.where(move_mask, best, path_slots[kar, wp])
+        plen.add_(move_mask.to(ti))
+        best_act = ch_act[kar, best]
+        bsf = best_act // 81; btf = best_act % 81
+        mv_src = torch.stack([(bsf // 9).clamp(0, 8), (bsf % 9).clamp(0, 8)], -1)
+        mv_tgt = torch.stack([(btf // 9).clamp(0, 8), (btf % 9).clamp(0, 8)], -1)
+        chosen_nid = ch_nid[kar, best]
+        go, np_, nc_, nn_ = beg.apply_move_nosync_t(cur_board, cur_pos, cur_col, cur_n,
+                                                    mv_src, mv_tgt, active=move_mask, deterministic=True)
+        cur_pos.copy_(np_); cur_col.copy_(nc_); cur_n.copy_(nn_)
+        unexp = move_mask & (chosen_nid < 0)
+        exp = move_mask & (chosen_nid >= 0)
+        exp_term = exp & go; exp_cont = exp & ~go
+        expand_parent.copy_(torch.where(unexp, cur_node, expand_parent))
+        expand_slot.copy_(torch.where(unexp, best, expand_slot))
+        terminal.copy_(terminal | (unexp & go) | exp_term)
+        leaf_node.copy_(torch.where(exp_term, chosen_nid, leaf_node))
+        cur_node.copy_(torch.where(exp_cont, chosen_nid, cur_node))
+        active.copy_(exp_cont)
+
+    def descent_block():
+        for _ in range(B):
+            descent_step()
+
+    def finish():
+        leaf_node.copy_(torch.where(active, cur_node, leaf_node))
+        labels_leaf = beg.label_components_sv(cur_board, iters=8)
+        obs = beg.build_observation_t(cur_board, cur_pos, cur_col, cur_n, labels=labels_leaf)
+        logits = net(obs.to(dtype)).float()
+        cnt_l, idx_l, pri_l = beg.legal_priors_t(cur_board, logits, top_k, labels=labels_leaf)
+        value_t = _fake_value(cur_board)
+        expand_mask = (expand_parent >= 0) & ~terminal
+        new_id = n_nodes.clamp(max=N - 1)
+        ch_action[kar, new_id] = idx_l.to(t16)
+        ch_prior[kar, new_id] = pri_l.to(tp)
+        n_children[kar, new_id] = cnt_l.to(ti)
+        ep_c = expand_parent.clamp(min=0); es_c = expand_slot.clamp(min=0)
+        cur_link = ch_nodeid[kar, ep_c, es_c]
+        ch_nodeid[kar, ep_c, es_c] = torch.where(expand_mask, new_id.to(t16), cur_link)
+        leaf_node.copy_(torch.where(expand_mask, new_id, leaf_node))
+        n_nodes.add_(expand_mask.to(ti))
+        on = (depth_ar < plen.unsqueeze(1)) & (path_nodes >= 0)
+        pn = path_nodes.clamp(min=0); ps = path_slots.clamp(min=0)
+        vrow = value_t.unsqueeze(1)
+        onv = on.float(); onval = torch.where(on, vrow, torch.zeros_like(vrow))
+        node_visits.scatter_add_(1, pn, onv); node_vsum.scatter_add_(1, pn, onval)
+        flat = pn * W + ps
+        ch_visits.view(K, N * W).scatter_add_(1, flat, onv)
+        ch_vsum.view(K, N * W).scatter_add_(1, flat, onval)
+        lnv = leaf_node >= 0
+        node_visits[kar, leaf_node.clamp(min=0)] += lnv.float()
+        node_vsum[kar, leaf_node.clamp(min=0)] += torch.where(lnv, value_t, torch.zeros_like(value_t))
+        torch.minimum(min_q, value_t, out=min_q)
+        torch.maximum(max_q, value_t, out=max_q)
+
+    n_blocks = (max_depth + B - 1) // B
+
+    if not (use_graph and dev.type == 'cuda'):
+        for _ in range(sims):                                  # eager (logic/shape check)
+            reset_sim()
+            for _blk in range(n_blocks):
+                descent_block()
+                if not bool(active.any()):
+                    break
+            finish()
+        return None
+
+    def _capture(fn):
+        st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st):
+            for _ in range(3):
+                fn()
+        torch.cuda.current_stream().wait_stream(st)
+        gr = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gr):
+            fn()
+        return gr
+    # capture from a clean reset so the warmup's mutations don't poison the persistent state
+    reset_sim()
+    g_block = _capture(descent_block)
+    g_finish = _capture(finish)
+    for _ in range(sims):
+        reset_sim()
+        for _blk in range(n_blocks):
+            g_block.replay()
+            if not bool(active.any()):
+                break
+        g_finish.replay()
+    return None
