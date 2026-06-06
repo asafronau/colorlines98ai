@@ -1,6 +1,6 @@
 # GPU batched-MCTS throughput — request for ideas
 
-> **READING NOTE: UPDATE 3 (bottom) is the CURRENT state. Sections 5-6, 'RESULT', and UPDATE 1-2 are historical/superseded — kept for the trail.**
+> **STATUS: PARKED 2026-06-06.** GPU batched-MCTS miner thoroughly characterized; no throughput win over the M5 CPU miner shipped. Open-loop tops at ~0.8x M5 (compute-saturated); closed-loop is fast but a biased teacher (TV ~0.63 vs scalar's 0.27). CPU miner stays production. **UPDATE 4 (bottom) is the final state; UPDATE 3 / RESULT / UPDATE 1-2 / sec 5-6 are the historical trail.** Resume: the closed-loop ensemble test (scripts/test_closed_ensemble.py, built, not run).
 
 
 We built a GPU batched-tree MCTS to speed up "teacher" search for a Color Lines 98 RL agent.
