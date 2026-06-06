@@ -61,6 +61,7 @@ def main():
     p.add_argument('--device', default='mps')
     p.add_argument('--smoke', action='store_true', help='tiny run, no scalar compare')
     p.add_argument('--gpu', action='store_true', help='use batched_mcts_gpu (torch) search')
+    p.add_argument('--closed', action='store_true', help='use batched_mcts_closed (determinized) search')
     a = p.parse_args()
 
     from alphatrain.evaluate import load_model
@@ -69,6 +70,10 @@ def main():
         from alphatrain.batched_mcts_gpu import batched_search_gpu
         def batched_search(net, dev, dtype, b, p_, c, n, fv, rng, sims, top_k):  # noqa
             return batched_search_gpu(net, dev, dtype, b, p_, c, n, fv, sims=sims, top_k=top_k)
+    if a.closed:
+        from alphatrain.batched_mcts_closed import batched_search_closed
+        def batched_search(net, dev, dtype, b, p_, c, n, fv, rng, sims, top_k):  # noqa
+            return batched_search_closed(net, dev, dtype, b, p_, c, n, fv, sims=sims, top_k=top_k)
     dev = torch.device(a.device)
     net, _ = load_model(a.model, dev, fp16=(dev.type != 'cpu'))
     dtype = next(net.parameters()).dtype
