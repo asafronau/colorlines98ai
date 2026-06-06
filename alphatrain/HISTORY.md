@@ -2769,3 +2769,76 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Phase 2 (aggregate diagnostic across 100-300 clear-available
      states) still worth running with corrected framing — but
      priors now strongly suggest no systematic clear-undervaluation.
+
+163. **pillar3d-v2.2 — data-scaling iteration (2026-06-06, launched).**
+     The crisis-corrections floor pipeline as a *repeating pattern*:
+     mine more crises → rebuild corpus → retrain (recipe fixed) →
+     compare. v2.1 was iteration #1; v2.2 is #2.
+
+     Rebuilt `crisis/corrections_corpus.pt` from all mined
+     corrections (new crises on fresh seeds, corr_50xxx/51xxx):
+
+     | corpus | games | anchors | size |
+     |---|---|---|---|
+     | v2.1   | 956   | 16,547  | 5.4 MB |
+     | **v2.2** | **1,520** | **26,310** | **9.0 MB** |
+
+     +59% data. Recipe **byte-identical to v2.1** (warm-start
+     pillar3b_epoch_20, `train_path_b.py`, lr 5e-5 gentle throughout,
+     target-temperature 0.5, aux-lambda 0.03, 10 epochs) — only the
+     corpus changed, so it's a clean *data*-scaling measurement.
+     Notebook `train_pillar3d_v2_2_colab.ipynb`, plan
+     `docs/pillar3d_v2_2_plan.md`.
+
+     Bar to beat (same 777k held-out, 777000..778999):
+     - control pillar3b: mean 17,581, P10 2,377, <1000 2.9%
+     - v2.1 (deployed): mean **20,609** (+17.2%), P10 2,736,
+       <1000 2.5%, `<500` tail untouched
+
+     Read (results pending): beats v2.1 (esp. `<500` moves) → more
+     data still helps, keep the loop; plateaus → saturation is a
+     *method* limit (next lever = teacher/objective, not corpus);
+     regresses → marginal-data dilution (raise `--min-margin` /
+     lower `--aux-lambda`).
+
+164. **GPU batched-MCTS miner — PARKED (2026-06-06), no win shipped.**
+     A multi-day effort to lift crisis-fork mining throughput by
+     running K MCTS trees as GPU tensors (one L4 vs the M5 16-worker
+     CPU miner @ 3.56 trees/s). Thoroughly characterized; **shipped
+     no throughput win**. All code isolated in `batched_*_gpu.py` /
+     `batched_mcts_closed.py` — the CPU scalar miner
+     (`gen_corrections_parallel.py`) was never touched and remains
+     production. Full trail: `docs/batched_mcts_perf_for_chatgpt.md`.
+
+     What was learned (all measured, nothing hand-waved):
+     - Engine + search ported to torch, golden-tested bit-identical
+       (`legal_priors_t`, `build_observation_t` EXACT vs numba).
+     - **Open-loop** GPU search is eager-**dispatch**-bound (L4:
+       46k tiny ops/sim, GPU ~13% utilized). CUDA-graph capture
+       works (block-capture 8× over eager) but the search then
+       **compute-saturates at ~0.8× M5** — flat in K *and* W,
+       because fixed-depth descent re-runs CC + reachability +
+       apply_move every step. Can't beat M5 while faithful.
+     - **Closed-loop** (cache board + legal children per node;
+       descent = pure gather; one expansion/sim) cuts the engine
+       ~depth-fold → 3.5× faster eager, and + capture would beat M5
+       on *speed*. BUT it determinizes spawns per node →
+       **biased teacher**: TV ~0.63 vs scalar's ~0.27 (it optimizes
+       one frozen future, not the spawn expectation). ChatGPT
+       confirmed bias, not noise. Single closed-loop labels are
+       **not safe to distill**.
+
+     Resume point if revisited: run
+     `scripts/test_closed_ensemble.py` (built, not yet run) — M
+     independent closed-loop determinizations/root, averaged, vs
+     scalar. Ensemble TV → ~0.27 ⇒ viable with M-batching (then
+     build capture); stays > 0.45 ⇒ semantics wrong for this
+     stochastic game (keep CPU miner; GPU only as a batched prior
+     server). Untried levers: open-loop prefix (1-3 plies) + cached
+     closed-loop tail; judging a determinized teacher by downstream
+     floor-lift rather than TV-vs-scalar.
+
+     Lesson: micro-benchmarks (the 9.5× "bundle" graph speedup)
+     overpromised; only the full sims-honest end-to-end number
+     (×M5 at the real 4800 sims) told the truth. Measure end-to-end
+     before celebrating a kernel-level win.
