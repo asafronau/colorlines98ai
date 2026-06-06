@@ -82,6 +82,8 @@ def main():
                    help='block-capture spike: sweep block sizes, captured descent block + early-exit')
     p.add_argument('--block-sizes', default='4,8,16')
     p.add_argument('--max-depth', type=int, default=64)
+    p.add_argument('--closed', action='store_true',
+                   help='closed-loop search throughput (gather-only descent, 1 expansion/sim)')
     a = p.parse_args()
 
     dev = _device(a.device)
@@ -97,6 +99,30 @@ def main():
     from alphatrain.batched_mcts_gpu import batched_search_gpu
     net = _make_net(dev, dtype)
     fv = _load_fv()
+
+    if a.closed:
+        from alphatrain.batched_mcts_closed import batched_search_closed
+        print(f"--- closed-loop search throughput (real value), sims-honest vs M5 (@sims4800) ---",
+              flush=True)
+        for K in ks:
+            b, pp, c, n = _synth_states(K, a.density, K)
+            batched_search_closed(net, dev, dtype, b, pp, c, n, fv, sims=8, top_k=a.top_k,
+                                  max_depth=a.max_depth); sync()         # warm
+            if dev.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats(); torch.cuda.empty_cache()
+            try:
+                t0 = time.perf_counter()
+                batched_search_closed(net, dev, dtype, b, pp, c, n, fv, sims=a.sims, top_k=a.top_k,
+                                      max_depth=a.max_depth); sync()
+                wall = time.perf_counter() - t0
+            except RuntimeError as e:
+                print(f"  K={K:>5}: FAILED/OOM: {str(e)[:70]}", flush=True); continue
+            tps = K / wall; tps4800 = tps * (a.sims / 4800.0)
+            peak = (torch.cuda.max_memory_allocated() / 1e9) if dev.type == 'cuda' else float('nan')
+            print(f"  K={K:>5}: {wall:6.1f}s | @sims{a.sims} {tps:6.2f} tr/s | @sims4800 "
+                  f"{tps4800:5.2f} = {tps4800/M5_SCALAR_TREES_PER_S:.2f}x M5 | peakGB {peak:.1f}",
+                  flush=True)
+        return
 
     if a.block:
         from alphatrain.batched_mcts_gpu import batched_search_gpu_block
