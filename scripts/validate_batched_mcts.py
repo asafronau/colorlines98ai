@@ -16,6 +16,29 @@ MODEL = 'alphatrain/data/pillar3b_epoch_20.pt'
 FV = 'alphatrain/data/feature_value_weights_2y_nb.npz'
 
 
+def _load_model(model_path, dev, fp16=False):
+    """Self-contained PolicyNet loader (no alphatrain.evaluate dep, so the validation tarball
+    needn't ship it). map_location='cpu' first then .to(dev) — avoids the torch.mps current_device
+    bug when loading a CUDA-saved checkpoint on mps."""
+    from alphatrain.model import PolicyNet
+    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    state = ckpt['model']
+    if any(k.startswith('_orig_mod.') for k in state):
+        state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
+    in_ch = state['stem.0.weight'].shape[1]
+    nb = sum(1 for k in state if k.endswith('.conv1.weight') and k.startswith('blocks.'))
+    ch = state['stem.0.weight'].shape[0]
+    state = {k: v for k, v in state.items() if not k.startswith('value_')}
+    net = PolicyNet(in_channels=in_ch, num_blocks=nb, channels=ch)
+    net.load_state_dict(state)
+    net.train(False)
+    net = net.to(dev)
+    if fp16 and dev.type in ('mps', 'cuda'):
+        net = net.half()
+    print(f"loaded {model_path}: {nb}b x {ch}ch [{'fp16' if fp16 else 'fp32'}]", flush=True)
+    return net
+
+
 def _states(death_glob, n, depths):
     out = []
     for f in sorted(glob.glob(death_glob)):
@@ -64,18 +87,18 @@ def main():
     p.add_argument('--closed', action='store_true', help='use batched_mcts_closed (determinized) search')
     a = p.parse_args()
 
-    from alphatrain.evaluate import load_model
-    from alphatrain.batched_mcts import batched_search
-    if a.gpu:
-        from alphatrain.batched_mcts_gpu import batched_search_gpu
-        def batched_search(net, dev, dtype, b, p_, c, n, fv, rng, sims, top_k):  # noqa
-            return batched_search_gpu(net, dev, dtype, b, p_, c, n, fv, sims=sims, top_k=top_k)
     if a.closed:
         from alphatrain.batched_mcts_closed import batched_search_closed
         def batched_search(net, dev, dtype, b, p_, c, n, fv, rng, sims, top_k):  # noqa
             return batched_search_closed(net, dev, dtype, b, p_, c, n, fv, sims=sims, top_k=top_k)
+    elif a.gpu:
+        from alphatrain.batched_mcts_gpu import batched_search_gpu
+        def batched_search(net, dev, dtype, b, p_, c, n, fv, rng, sims, top_k):  # noqa
+            return batched_search_gpu(net, dev, dtype, b, p_, c, n, fv, sims=sims, top_k=top_k)
+    else:
+        from alphatrain.batched_mcts import batched_search   # numpy reference (needs batched_mcts.py)
     dev = torch.device(a.device)
-    net, _ = load_model(a.model, dev, fp16=(dev.type != 'cpu'))
+    net = _load_model(a.model, dev, fp16=(dev.type != 'cpu'))
     dtype = next(net.parameters()).dtype
     d = np.load(FV)
     fv = (d['coefs'].astype(np.float32), d['means'].astype(np.float32),
