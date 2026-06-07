@@ -114,8 +114,10 @@ for EP in [2, 3, 4, 5]:
     print(f"wrote {out} ({len(cells)} cells)")
 
 
-FULL = ('corrections_corpus.pt', 'FULL 31.8k (min_margin 0)', 24000, 44000, 0.0)
-DEC = ('corrections_corpus_mm05.pt', 'DECISIVE 13.8k (min_margin 0.05)', 9000, 20000, 0.05)
+# size bounds widened for the 3.5k/5k-game data-scaling study (decisive grows ~7.5/game →
+# ~26k @3.5k games, ~37k @5k games; full ~2.4x that). Just sanity asserts, kept generous.
+FULL = ('corrections_corpus.pt', 'FULL (min_margin 0)', 20000, 130000, 0.0)
+DEC = ('corrections_corpus_mm05.pt', 'DECISIVE (min_margin 0.05)', 9000, 60000, 0.05)
 if __name__ == '__main__':
     build('mA_full_T05',     *FULL, aux_t=0.5, weighted=True)
     build('mB_full_T03',     *FULL, aux_t=0.3, weighted=True)    # KEY: use-all + sharpen
