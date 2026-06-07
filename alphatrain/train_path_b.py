@@ -121,9 +121,12 @@ def _aux_lambda_schedule(step_in_epoch, steps_per_epoch, epoch,
     return target_lambda * min(1.0, global_step / warmup_steps)
 
 
+_GRAD_AUDIT = []   # accumulates (|g_main|, |g_aux|, lam, cos) for --grad-audit
+
+
 def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                  log_interval=100, blend_alpha=1.0, target_temperature=1.0,
-                 aux=None, epoch=0):
+                 aux=None, epoch=0, grad_audit=0):
     """One epoch. Optionally adds the listwise margin aux loss.
 
     `aux`, when not None, is a dict with:
@@ -204,6 +207,41 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                     loss = main_loss
             else:
                 loss = main_loss
+
+        # --- gradient audit: measure main vs aux gradient magnitude + alignment ---
+        # Is the aux stream a gentle nudge or a sledgehammer? Run with --grad-audit N
+        # (no --amp, fp32). Computes |g_main|, |g_aux|, the effective share
+        # λ|g_aux|/|g_main|, and cos(g_main, g_aux) over N batches, then exits.
+        if grad_audit and aux is not None and lam > 0.0:
+            params = [p for p in model.parameters() if p.requires_grad]
+
+            def _flat():
+                return torch.cat([(p.grad.detach().flatten() if p.grad is not None
+                                   else torch.zeros(p.numel(), device=device))
+                                  for p in params])
+            model.zero_grad(set_to_none=True)
+            main_loss.backward(retain_graph=True)
+            g_main = _flat(); n_main = g_main.norm().item()
+            model.zero_grad(set_to_none=True)
+            aux_loss.backward()
+            g_aux = _flat(); n_aux = g_aux.norm().item()
+            cos = float(torch.dot(g_main, g_aux) / (n_main * n_aux + 1e-12))
+            _GRAD_AUDIT.append((n_main, n_aux, lam, cos))
+            print(f"  [grad-audit {len(_GRAD_AUDIT)}/{grad_audit}] |g_main|={n_main:.4f} "
+                  f"|g_aux|={n_aux:.4f} λ={lam:.3f}  λ|g_aux|/|g_main|="
+                  f"{lam*n_aux/max(n_main,1e-9):.3f}  cos(main,aux)={cos:+.3f}", flush=True)
+            model.zero_grad(set_to_none=True)
+            if len(_GRAD_AUDIT) >= grad_audit:
+                import numpy as _np, sys as _sys
+                a = _np.array(_GRAD_AUDIT)
+                print(f"\n=== GRAD AUDIT ({len(_GRAD_AUDIT)} batches, λ={a[:,2].mean():.3f}) ===\n"
+                      f"  mean |g_main|={a[:,0].mean():.4f}  mean |g_aux|={a[:,1].mean():.4f}\n"
+                      f"  effective aux share λ|g_aux|/|g_main| = {(a[:,2]*a[:,1]/a[:,0]).mean():.3f}"
+                      f"   (>~0.15-0.2 => NOT a gentle nudge)\n"
+                      f"  cos(main,aux) = {a[:,3].mean():+.3f}   "
+                      f"(<0 aux fights main; ~0 orthogonal; >0 aligned)", flush=True)
+                _sys.exit(0)
+            continue   # skip the real optimizer step during the audit
 
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
@@ -397,6 +435,9 @@ def main():
                         '"extra" pass over the same base state gets a '
                         'different random transform.')
     p.add_argument('--amp', action='store_true')
+    p.add_argument('--grad-audit', type=int, default=0,
+                   help='Diagnostic: measure main vs aux gradient norm + cosine over N batches '
+                        'then exit (run without --amp for fp32). 0=off.')
     p.add_argument('--compile', action='store_true',
                    help='torch.compile for faster forward/backward')
     p.add_argument('--resume', type=str, default=None)
@@ -822,7 +863,7 @@ def main():
                                   scaler, amp_dtype,
                                   blend_alpha=args.blend_alpha,
                                   target_temperature=args.target_temperature,
-                                  aux=aux, epoch=epoch)
+                                  aux=aux, epoch=epoch, grad_audit=args.grad_audit)
         vl = validate(model, val_loader, device, amp_dtype=amp_dtype)
         scheduler.step()
 
