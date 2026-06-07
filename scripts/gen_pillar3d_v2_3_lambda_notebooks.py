@@ -25,7 +25,7 @@ def code(t):
 
 
 def build(lam, suf, share, corpus_file='corrections_corpus_mm05.pt',
-          corpus_label='decisive (v2.3 filter, 11,702)', n_lo=9000, n_hi=14000, mm_assert=0.05):
+          corpus_label='decisive (v2.3 filter, 11,702)', n_lo=9000, n_hi=20000, mm_assert=0.05):
     cells = []
     cells.append(md(f"""
 # Pillar3d-v2.3-{suf}: aux λ sweep on the decisive corpus (λ={lam})
@@ -155,4 +155,4 @@ if __name__ == '__main__':
     # Tests whether the decisive filter was just a workaround for the over-strong λ=0.03.
     build(0.01, 'lam0.01_FULL', '~0.70', corpus_file='corrections_corpus.pt',
           corpus_label='FULL (all 27,103 corrections, min_margin 0)',
-          n_lo=24000, n_hi=32000, mm_assert=0.0)
+          n_lo=24000, n_hi=44000, mm_assert=0.0)
