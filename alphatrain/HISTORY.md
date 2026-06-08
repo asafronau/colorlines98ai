@@ -2842,3 +2842,42 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      overpromised; only the full sims-honest end-to-end number
      (×M5 at the real 4800 sims) told the truth. Measure end-to-end
      before celebrating a kernel-level win.
+
+165. **pillar3d-mC = new deployable best (2026-06-07). Crisis
+     distillation, median-targeted recipe.** `pillar3d_mC_dec_T05_epoch_2`.
+     5k held-out (775000-779999): **mean 23,434, median 16,504,
+     P10 2,855, <1000 2.0%, <500 0.3%, >10k 66%, max 297,214.**
+     vs pillar3b base (mean 17,255): **+36% mean.** vs the prior
+     deployed v2.1-ep2 (5k: mean 21,195 / median 15,121 / <1000
+     2.6%): **~+10% mean, +9% median, floor improved.**
+
+     **Recipe (the keeper):** warm-start pillar3b_epoch_20, lr 5e-5,
+     re-distill V13 + aux crisis corrections, **decisive corpus only**
+     (`build_corrections_corpus --min-margin 0.05`, ~13.8k from 1837
+     games), **λ=0.01, aux_T=0.5, aux-warmup 0.5**, 6 epochs, peak ep2.
+
+     **How we got here (the path that mattered):**
+     - **Target pivot:** stopped chasing the floor as a special
+       target (it's RNG-chaotic — a better move can draw a worse
+       spawn; the policy plays the best move at the cliff). Switched
+       to optimizing the **median**. Result: the floor *followed the
+       median up* (<1000 2.6%→2.0%) — no floor-targeting needed.
+     - **Grad-audit** (`train_path_b --grad-audit`): the supposedly-
+       gentle λ=0.03 was **aux-dominated** (effective share
+       λ|g_aux|/|g_main| = 2.09; |g_main|≈0.23 since pillar3b is
+       converged). Right-sizing to λ=0.01 (~0.7 share) was the
+       unlock; v2.2's "more data" regression was over-indexing, not
+       bad labels.
+     - **Decisive filter beats "use them all":** across a full run
+       matrix, decisive corpus ≫ full (~22-23k vs ~19-21k mean) and
+       sharpening the full corpus (aux_T 0.3) *hurt* (it peaks the
+       marginal corrections' weak preferences into confident-bad
+       targets). The low-margin 26% genuinely drag.
+     - **Evals must be 5k+** (2k misled us on v2.2 — reversed at 5k).
+
+     **Next:** data-scaling study — mine pillar3b to 3.5k/5k games,
+     same recipe, median-vs-#games curve (coverage-limited or method
+     ceiling?). Then compounding (warm-start the improved policy) +
+     self-play re-anchor. The teacher's saturated linear leaf value
+     remains the label-quality ceiling (rollout-grounded/learned
+     value = the bigger future lever).
