@@ -118,8 +118,14 @@ for EP in [2, 3, 4, 5]:
 # ~26k @3.5k games, ~37k @5k games; full ~2.4x that). Just sanity asserts, kept generous.
 FULL = ('corrections_corpus.pt', 'FULL (min_margin 0)', 20000, 130000, 0.0)
 DEC = ('corrections_corpus_mm05.pt', 'DECISIVE (min_margin 0.05)', 9000, 60000, 0.05)
+DEC10 = ('corrections_corpus_mm10.pt', 'DECISIVE-0.10 (min_margin 0.10, strongest only)',
+         5000, 45000, 0.10)
 if __name__ == '__main__':
     build('mA_full_T05',     *FULL, aux_t=0.5, weighted=True)
     build('mB_full_T03',     *FULL, aux_t=0.3, weighted=True)    # KEY: use-all + sharpen
     build('mC_dec_T05',      *DEC,  aux_t=0.5, weighted=True)    # CONTROL
     build('mD_full_T03_unw', *FULL, aux_t=0.3, weighted=False)   # optional
+    # margin-threshold ablation: keep only the STRONGEST corrections (min_margin 0.10).
+    # Same mC recipe; tests whether harder selection beats 0.05 at fixed games (eval ep1-3, overfits
+    # faster since the corpus is ~half-size = ~2x replays/anchor).
+    build('mE_dec10_T05',    *DEC10, aux_t=0.5, weighted=True)
