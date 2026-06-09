@@ -129,3 +129,9 @@ if __name__ == '__main__':
     # Same mC recipe; tests whether harder selection beats 0.05 at fixed games (eval ep1-3, overfits
     # faster since the corpus is ~half-size = ~2x replays/anchor).
     build('mE_dec10_T05',    *DEC10, aux_t=0.5, weighted=True)
+    # λ-SCALING test (ChatGPT): per-correction weight = (steps/N)·λ, so as the corpus grew 13.8k→19.6k
+    # (×1.42) the per-correction weight dropped ∝1/N. Scaling λ by ~1.42 (0.01→0.014) holds it
+    # constant — the direct test of "fixed budget spread thinner". (NOT aux-batch — the 1/B cancels.)
+    # Same 19.6k decisive corpus + recipe; eval ep2-3 @5k vs mC's 16,504. Recovers ⇒ under-distillation.
+    build('mF_dec_lam0.012', *DEC, aux_t=0.5, weighted=True, lam=0.012)
+    build('mG_dec_lam0.014', *DEC, aux_t=0.5, weighted=True, lam=0.014)
