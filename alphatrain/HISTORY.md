@@ -2943,8 +2943,14 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
         P10 up to 4,932, <1000 down to 1.0%, max 288,695 (1k seeds,
         ft_epoch_15 vector). vs the mC bar (16,738/24,249): **+37%
         median, +35% mean. vs base: +71% median, +73% mean.**
-     The corrections were never the limit — the channel was. 5k
-     confirmation of α=0.4 vs α=0.7 pending (paired). Reopened in
+     The corrections were never the limit — the channel was.
+     **5k CONFIRMED (775000-779999):** α=0.4 mean 31,790 / median
+     21,591; α=0.7 mean 31,617 / median 22,181 / max 301,050; both
+     <1000 1.6%, P10 ~3.9k. vs the mC bar's 5k (16,504 / 23,434 —
+     exactly reproducing HISTORY 165's numbers, so old and new
+     protocols agree on this list): **+34% median, +36% mean, equal
+     floor. NEW DEPLOYABLE BEST.** α 0.4-vs-0.7 statistically tied;
+     pick via the paired per-seed compare. Reopened in
      the new channel (now ~10-min LOCAL trainings): full-63.8k
      corpus ("use them all"), corpus-size scaling, scrambled-label
      control (content vs perturbation), Q-advantage weighting.
