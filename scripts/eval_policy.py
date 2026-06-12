@@ -98,6 +98,12 @@ def main():
     p.add_argument('--fp32', action='store_true',
                    help='Batch-invariant (config-independent) scores; slower.')
     p.add_argument('--max-turns', type=int, default=1_000_000)
+    p.add_argument('--no-save-scores', action='store_true',
+                   help='Skip the per-seed score JSON (saved by default to '
+                        'logs/eval_scores/<model>_<start>_<end>.json — enables '
+                        'PAIRED model comparisons on a common seed list, which '
+                        'cancel per-seed luck and are far more sensitive than '
+                        'comparing aggregate medians).')
     a = p.parse_args()
     dev = torch.device(a.device)
     fp16 = (not a.fp32) and dev.type != 'cpu'
@@ -111,6 +117,14 @@ def main():
     dt = time.perf_counter() - t0
     print(f"\nDone: {len(res)} games in {dt:.0f}s", flush=True)
     _stats([s for s, _ in res.values()])
+    if not a.no_save_scores:
+        import json
+        os.makedirs('logs/eval_scores', exist_ok=True)
+        tag = os.path.splitext(os.path.basename(a.model))[0]
+        out = f'logs/eval_scores/{tag}_{a.seed_start}_{a.seed_end}.json'
+        json.dump({str(k): [int(v[0]), int(v[1])] for k, v in res.items()},
+                  open(out, 'w'))
+        print(f"per-seed scores -> {out}", flush=True)
 
 
 if __name__ == '__main__':

@@ -25,10 +25,17 @@ def main():
     p.add_argument('--min-margin', type=float, default=0.0,
                    help='Drop corrections whose (top_share - pol_share) is below '
                         'this (0..1). 0 = keep all (weighting handles marginals).')
+    p.add_argument('--first-n-by-mtime', type=int, default=0,
+                   help='Use only the first N corr files by mining chronology '
+                        '(mtime order). Reconstructs historical corpora exactly, '
+                        'e.g. 1837 = the original 13.8k "bar" corpus. 0 = all.')
     p.add_argument('--out', default='crisis/corrections_corpus.pt')
     a = p.parse_args()
 
     files = sorted(glob.glob(a.glob))
+    if a.first_n_by_mtime:
+        files.sort(key=os.path.getmtime)
+        files = files[:a.first_n_by_mtime]
     boards, npos, ncol, nnext = [], [], [], []
     tgt_idx, tgt_prob, weights, seeds = [], [], [], []
     n_files = n_corr = n_dropped = 0
