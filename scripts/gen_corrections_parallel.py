@@ -73,6 +73,13 @@ def _crisis_worker(slot_id, seed_queue, result_queue,
             n_states += 1
             pol_idx = _flat(fr['chosen_move'])
             visit_sum = np.zeros(6561, dtype=np.float64)
+            # Root Q accumulators across determinizations: Q(a) = sum_s value_sum
+            # / sum_s visit_count (visit-weighted; virtual loss nets out by end of
+            # search). q_lo/q_hi give the per-state value range for later
+            # normalization (Q-softmax targets).
+            vc_sum = np.zeros(6561, dtype=np.float64)
+            vsum_sum = np.zeros(6561, dtype=np.float64)
+            q_lo, q_hi = float('inf'), float('-inf')
             for s in range(mcts_seeds):
                 game = ColorLinesGame()
                 game.reset(board=np.array(fr['board'], dtype=np.int8),
@@ -81,6 +88,12 @@ def _crisis_worker(slot_id, seed_queue, result_queue,
                 _, pt = mcts.search(game, temperature=0.0, dirichlet_alpha=0.3,
                                     dirichlet_weight=0.25, return_policy=True)
                 visit_sum += np.asarray(pt, dtype=np.float64)
+                for act, child in mcts._last_root.children.items():
+                    if child.visit_count > 0:
+                        vc_sum[act] += child.visit_count
+                        vsum_sum[act] += child.value_sum
+                q_lo = min(q_lo, mcts._last_min_q)
+                q_hi = max(q_hi, mcts._last_max_q)
             visits = visit_sum / visit_sum.sum()
             top_idx = int(visits.argmax())
             if top_idx != pol_idx:
@@ -89,7 +102,10 @@ def _crisis_worker(slot_id, seed_queue, result_queue,
                              'board': fr['board'], 'next_balls': fr['next_balls'],
                              'pol_idx': pol_idx, 'pol_share': float(visits[pol_idx]),
                              'mcts_top_idx': top_idx, 'mcts_top_share': float(visits[top_idx]),
-                             'visits': [[int(j), float(visits[j])] for j in order if visits[j] > 0]})
+                             'visits': [[int(j), float(visits[j])] for j in order if visits[j] > 0],
+                             'q': [[int(j), float(vsum_sum[j] / vc_sum[j])]
+                                   for j in order if vc_sum[j] > 0],
+                             'q_min': q_lo, 'q_max': q_hi})
         json.dump({'seed': seed, 'n_band_states': n_states, 'corrections': corr},
                   open(os.path.join(out_dir, f'corr_{seed}.json'), 'w'), default=float)
         result_queue.put((seed, len(corr), n_states))

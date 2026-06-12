@@ -2881,3 +2881,73 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      self-play re-anchor. The teacher's saturated linear leaf value
      remains the label-quality ceiling (rollout-grounded/learned
      value = the bigger future lever).
+
+166. **Eval-protocol reset + the channel autopsy (2026-06-08..10).
+     Three confounds excavated; pillar3d channel declared saturated.**
+     - **Seed-list confound:** the matrix notebooks evaluated on
+       777000.. while the deployable-best bar lived on 775000.. —
+       batched-fp16 path divergence makes cross-list medians
+       incomparable. Every conclusion drawn across lists (incl. the
+       "19.6k regressed vs 13.8k" scare AND entry 165's "decisive ≫
+       full" matrix read) was suspect. Fix: ONE protocol —
+       scripts/eval_policy.py (single-process batched greedy player,
+       fp16, batch 256), fixed 1k list 775000-775999 on the M5, 5k
+       (775000-779999) for finalists; per-seed scores saved
+       (logs/eval_scores/) + scripts/compare_evals.py paired test.
+     - **ctrl0 (λ=0 control):** the gentle re-distill alone = ZERO
+       (13,316 vs base 13,421). mC's +25% median is 100% corrections.
+       (Nobody had ever run the control.)
+     - **Clean ladder (1k):** base 13,421 / mC-13.8k **16,738** /
+       mC-19.6k 15,924 / mC-27.6k 14,943; λ axis flat (mF .012 →
+       14,782, mG .014 → 16,008). mF-vs-mG = near-replicates 1,226
+       apart ⇒ **σ_train ≈ 1k** (trainer unseeded); the whole
+       corpus-size "regression" is at/below the noise floor.
+     - **Trust-region (pillar3e) NEGATIVE:** teacher-primary CE +
+       β·KL(pillar3b‖student) on sampled broad anchors, NO V13
+       rehearsal (alphatrain/train_trust_region.py). All β∈{5,15,45}
+       lost to mC by ~2k; β=45@ep120 collapsed to 8,787 (cosine-lr
+       endgame: Adam favors the consistent anchor gradient,
+       un-learns the teacher). Held-out corr match hit 0.27 > mC's
+       0.215 yet played worse ⇒ held match ≠ gameplay; full-coverage
+       rehearsal ≫ KL-regularization on samples (replay > EWC).
+     - **Forensics tools:** fingerprint_corpus_membership.py
+       (behavioral which-corpus-trained-this test; rescued the
+       19.6k checkpoint identity), diag_corpus_slices.py (mining
+       slices statistically identical — composition ruled out),
+       margin_diagnostics.py (27.6k model = best softCE/margin,
+       worst match: calibrated-but-less-decisive; λ raises
+       commitment and drift in equal measure).
+     - Miner now records per-candidate **root Q** (q/q_min/q_max;
+       visits-Q corr 0.79) — zero changes to mcts.py.
+
+167. **TASK ARITHMETIC = the breakthrough (2026-06-10..11).
+     +37% median over the bar from the SAME corrections.**
+     Gemini peer review (docs/crisis_distill_review_for_gemini.md)
+     named the disease: gradient competition. mC's dual loss made
+     the tiny aux fight a 32k-batch status-quo gradient (and
+     pillar3e's KL anchor was a rubber band). Cure (Ilharco et al.,
+     task arithmetic): **decouple learning from preservation.**
+     1. scripts/train_crisis_ft.py — fine-tune pillar3b ONLY on the
+        27.6k decisive corrections (soft-CE T0.5, weighted, lr 1e-4,
+        **frozen-BN so running stats stay bit-identical to base**).
+        ~17s/epoch on the M5. Held-out match 0.350 @ep15 — best ever
+        (mC 0.215, trust-region 0.28). Let it forget general play.
+     2. scripts/merge_checkpoints.py — θ(α) = θ_base + α·(θ_crisis −
+        θ_base); BN stats verified identical; each merge = seconds.
+     3. Sweep α with the 12-min local eval. **Noiseless dose-response**
+        (same two endpoints, deterministic merge):
+        α:      0    0.1    0.2    0.4    0.5    0.6    0.7    0.8
+        median: 13.4k 17.0k 19.4k 22.1k  22.8k  22.5k  23.0k  19.7k
+        mean:   18.9k 23.6k 26.7k 32.7k  32.7k  32.2k  32.1k  27.2k
+        Broad plateau α∈[0.4,0.7]: median ~22-23k, mean ~32-33k,
+        P10 up to 4,932, <1000 down to 1.0%, max 288,695 (1k seeds,
+        ft_epoch_15 vector). vs the mC bar (16,738/24,249): **+37%
+        median, +35% mean. vs base: +71% median, +73% mean.**
+     The corrections were never the limit — the channel was. 5k
+     confirmation of α=0.4 vs α=0.7 pending (paired). Reopened in
+     the new channel (now ~10-min LOCAL trainings): full-63.8k
+     corpus ("use them all"), corpus-size scaling, scrambled-label
+     control (content vs perturbation), Q-advantage weighting.
+     V14 retention per review: 5% permanent crisis replay in every
+     batch, not a low-λ aux. Old-channel experiments (E1 subsample,
+     mCrep replicates, mE2 λ-scaling) cancelled as moot.

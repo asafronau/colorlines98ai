@@ -220,7 +220,7 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                                    else torch.zeros(p.numel(), device=device))
                                   for p in params])
             model.zero_grad(set_to_none=True)
-            main_loss.backward(retain_graph=True)
+            main_loss.backward()       # frees the main graph before the aux pass (mps memory)
             g_main = _flat(); n_main = g_main.norm().item()
             model.zero_grad(set_to_none=True)
             aux_loss.backward()

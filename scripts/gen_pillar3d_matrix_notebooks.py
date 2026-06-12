@@ -91,20 +91,24 @@ for f in sorted(glob.glob('/content/checkpoints/pillar3d_{suf}/epoch_*.pt')):
 shutil.copy('/content/pillar3d_{suf}_train.log', f'{{DRIVE}}/pillar3d_{suf}_train.log')
 """.strip()))
     cells.append(md(r"""
-## Eval — 5,000 games, judged on **MEDIAN (+ mean)**; floor = no-regress guardrail
-Bar (5k 777000..781999): v2.1-ep2 median 15,121 / mean 21,195 / <1000 2.6%.
-Decisive λ=0.01 ep2 (5k 775000..779999): median 15,447 / mean 22,203 (current best).
-Sweep ep2/3/4/5 (aux-warmup 0.5 → full λ early, but median may still peak mid-run).
+## Eval — 5,000 games on the CANONICAL list 775000..779999, **`scripts.eval_policy`** (fp16, batch 256)
+Uses `scripts.eval_policy` (single-process batched policy player, constant GPU batch, no workers/IPC) —
+prints its own progress + full percentile stats. fp16 is fine: scores are reproducible for a fixed
+(seed-list, batch), so comparing models on the SAME (775000..779999, batch 256) is clean — the per-game
+fp16 noise averages out over 5k games. The bug that bit us was the LIST (775k vs 777k), not the precision.
+Needs the top-level `scripts/` package in the tarball (eval_policy.py, batched_rollout.py, __init__.py).
+NOTE: the old 16,504 bar was `eval_parallel` — NOT directly comparable. Re-establish the bar by running
+the 13.8k mC checkpoint through `eval_policy` on these same seeds+batch, then judge mH/mI against that.
+Judge on **MEDIAN (P50) + mean**; floor (<1000) = no-regress guardrail. Sweep ep2/3/4/5.
 """.strip()))
     cells.append(code(f"""
 %cd /content
 for EP in [2, 3, 4, 5]:
     m = f'/content/checkpoints/pillar3d_{suf}/epoch_{{EP}}.pt'
     if not os.path.exists(m): continue
-    print(f'===== {suf} epoch {{EP}}  (5k) =====')
-    !python -m alphatrain.scripts.eval_parallel --model {{m}} --policy-only \\
-        --seeds $(seq 777000 781999) --device cuda --workers 8 \\
-        2>&1 | grep -E 'P5|P10|mean|P50|<1000|<500|>10000'
+    print(f'===== {suf} epoch {{EP}}  (5k 775000..779999) =====', flush=True)
+    !python -m scripts.eval_policy --model {{m}} \\
+        --seed-start 775000 --seed-end 779999 --device cuda --batch 256
 """.strip()))
     out = os.path.join(DIR, f'train_pillar3d_{suf}_colab.ipynb')
     nb = {"cells": cells, "metadata": {"accelerator": "GPU", "colab": {"provenance": []},
@@ -135,3 +139,12 @@ if __name__ == '__main__':
     # Same 19.6k decisive corpus + recipe; eval ep2-3 @5k vs mC's 16,504. Recovers ⇒ under-distillation.
     build('mF_dec_lam0.012', *DEC, aux_t=0.5, weighted=True, lam=0.012)
     build('mG_dec_lam0.014', *DEC, aux_t=0.5, weighted=True, lam=0.014)
+    # USE-THEM-ALL at PROPERLY-SCALED λ (the un-confounded test). Per-correction weight = (steps/N)·λ,
+    # so the FULL corpus (~44.8k @2593 games) at λ0.01 was the MOST under-distilled config in the matrix
+    # — the whole "decisive > full" result compared corpora at FIXED λ, biased toward the smaller one.
+    # Match mC's known-good per-correction weight (13.8k@λ0.01): λ_full ≈ 0.01·44.8/13.8 ≈ 0.03. The
+    # grad-audit "share~2 regresses" was measured on v2.2 (FEW games, low diversity) — overfit-to-few,
+    # not share, was the harm; with 2593 diverse positions high λ should distill, not memorize. The V13
+    # main-CE re-distill stays as the general-play guardrail. Sweep λ {0.02, 0.03}, eval ep2-4 @5k.
+    build('mH_full_lam0.03', *FULL, aux_t=0.5, weighted=True, lam=0.03)
+    build('mI_full_lam0.02', *FULL, aux_t=0.5, weighted=True, lam=0.02)
