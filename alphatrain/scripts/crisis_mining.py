@@ -183,15 +183,18 @@ def _probe_worker(slot_id, seed_queue, task_queue, progress_queue,
                   request_queue, response_queue,
                   policy_max_turns, recovery_turns, recovery_sims,
                   prevention_turns, prevention_sims,
-                  existing_keys):
-    """Phase 1 worker: pull seed, play policy-only via inference server,
-    push replay tasks for the dying probes back to main.
+                  existing_keys, probe_batch):
+    """Phase 1 worker: play `probe_batch` policy-only games IN FLIGHT,
+    one batched server round-trip per step (the eval_policy pattern).
 
-    Each forward pass is batch=1 inside this worker, but the server gathers
-    across all `num_workers` slots, so the GPU sees avg batch ~num_workers.
-    Restores Phase 1 to roughly the same per-eval throughput as Phase 2.
+    vs the old 1-game-per-worker loop: K× fewer server round-trips (the
+    old latency bottleneck) and a ring buffer of only the last
+    prevention_turns+1 snapshots per game instead of the full trajectory
+    (a 12k-turn pillar3f probe used to hold 12k board copies to use two).
+    Task/progress semantics are unchanged.
     """
     torch.set_num_threads(1)
+    from collections import deque
 
     from multiprocessing.shared_memory import SharedMemory
     from alphatrain.inference_server import InferenceClient
@@ -208,66 +211,92 @@ def _probe_worker(slot_id, seed_queue, task_queue, progress_queue,
     client = InferenceClient(slot_id, obs_buf, pol_buf, val_buf,
                              request_queue, response_queue)
     existing_keys = set(existing_keys)
+    ring_len = prevention_turns + 1
+    obs_np_buf = np.empty((probe_batch, 18, 9, 9), dtype=np.float32)
 
-    while True:
-        seed = seed_queue.get()
-        if seed is None:
-            break
+    class _Probe:
+        __slots__ = ('seed', 'game', 'turn', 'ring')
 
-        # Play policy-only via server.
-        game = ColorLinesGame(seed=seed)
-        game.reset()
-        snapshots = []
-        turn = 0
-        died = False
+        def __init__(self, seed):
+            self.seed = seed
+            self.game = ColorLinesGame(seed=seed)
+            self.game.reset()
+            self.turn = 0
+            self.ring = deque(maxlen=ring_len)
 
-        while turn < policy_max_turns and not game.game_over:
-            snapshots.append({
-                'board': game.board.copy(),
-                'next_balls': list(game.next_balls),
-                'turn': turn,
-                'score': game.score,
-                'empty': int(np.sum(game.board == 0)),
-            })
-            obs_np = _build_obs_for_game(game)
-            pol_np, _ = client.evaluate(obs_np)
-            priors = _get_legal_priors_flat(game.board, pol_np, 30)
-            if not priors:
-                died = True
-                break
-            best = max(priors.items(), key=lambda x: x[1])[0]
-            sf = best // 81
-            tf = best % 81
-            game.move((sf // 9, sf % 9), (tf // 9, tf % 9))
-            turn += 1
-
-        if game.game_over and not died:
-            died = True
-
+    def _finish(p, died):
+        """Emit replay tasks (died) or a survived notice. Same semantics as
+        the old per-game path: snapshot lookup by turn == max(0, T-rewind)."""
         if not died:
-            progress_queue.put((seed, 'survived', 0, 0))
-            continue
-
-        # Build replay tasks for this dying seed.
+            progress_queue.put((p.seed, 'survived', 0, 0))
+            return
+        by_turn = {s['turn']: s for s in p.ring}
         tasks_pushed = 0
         skipped_existing = 0
         for label, rewind, sims in [
             ('recovery', recovery_turns, recovery_sims),
             ('prevention', prevention_turns, prevention_sims),
         ]:
-            rewind_idx = max(0, turn - rewind)
-            if rewind_idx >= len(snapshots):
+            want = max(0, p.turn - rewind)
+            snap = by_turn.get(want)
+            if snap is None:
                 continue
-            if (seed, label) in existing_keys:
+            if (p.seed, label) in existing_keys:
                 skipped_existing += 1
                 continue
-            snapshot = dict(snapshots[rewind_idx])
-            snapshot['original_seed'] = seed
-            replay_seed = seed * 37 + rewind
+            snapshot = dict(snap)
+            snapshot['original_seed'] = p.seed
+            replay_seed = p.seed * 37 + rewind
             task_queue.put((snapshot, replay_seed, sims, label, rewind))
             tasks_pushed += 1
+        progress_queue.put((p.seed, 'died', tasks_pushed, skipped_existing))
 
-        progress_queue.put((seed, 'died', tasks_pushed, skipped_existing))
+    slots = []
+    drained = False
+
+    def _refill():
+        nonlocal drained
+        while not drained and len(slots) < probe_batch:
+            seed = seed_queue.get()
+            if seed is None:
+                drained = True
+                break
+            slots.append(_Probe(seed))
+
+    _refill()
+    while slots:
+        for i, p in enumerate(slots):
+            p.ring.append({
+                'board': p.game.board.copy(),
+                'next_balls': list(p.game.next_balls),
+                'turn': p.turn,
+                'score': p.game.score,
+                'empty': int(np.sum(p.game.board == 0)),
+            })
+            obs_np_buf[i] = _build_obs_for_game(p.game)
+        pol_np, _ = client.evaluate_batch(obs_np_buf, len(slots))
+
+        survivors = []
+        for i, p in enumerate(slots):
+            died = False
+            priors = _get_legal_priors_flat(p.game.board, pol_np[i], 30)
+            if not priors:
+                died = True
+            else:
+                best = max(priors.items(), key=lambda x: x[1])[0]
+                sf, tf = best // 81, best % 81
+                p.game.move((sf // 9, sf % 9), (tf // 9, tf % 9))
+                p.turn += 1
+                if p.game.game_over:
+                    died = True
+            if died:
+                _finish(p, died=True)
+            elif p.turn >= policy_max_turns:
+                _finish(p, died=False)
+            else:
+                survivors.append(p)
+        slots = survivors
+        _refill()
 
     obs_shm.close()
     pol_shm.close()
@@ -362,6 +391,10 @@ def main():
     p.add_argument('--workers', type=int, default=1,
                    help='Parallel workers (1=serial, >1=GPU server)')
     p.add_argument('--batch-size', type=int, default=64)
+    p.add_argument('--probe-batch', type=int, default=16,
+                   help='Phase-1 games in flight per probe worker (one batched '
+                        'server round-trip per step, eval_policy-style). '
+                        'Server shm is sized to max(batch-size, probe-batch).')
     p.add_argument('--save-dir', default='data/crisis_v1')
     p.add_argument('--feature-value-weights', default=None,
                    help='Path to feature_value_weights.npz (linear evaluator). '
@@ -546,9 +579,10 @@ def main():
         MPQueue = mp.Queue
         Process = mp.Process
 
+        srv_batch = max(args.batch_size, args.probe_batch)
         server = InferenceServer(args.model, args.workers,
                                  device=device_str,
-                                 max_batch_per_worker=args.batch_size,
+                                 max_batch_per_worker=srv_batch,
                                  use_compile=args.compile,
                                  value_head_path=args.value_head_path)
         server.start()
@@ -575,12 +609,12 @@ def main():
                     args=(i, seed_queue, probe_task_queue, progress_queue,
                           server._obs_shm.name, server._pol_shm.name,
                           server._val_shm.name,
-                          args.workers, args.batch_size,
+                          args.workers, srv_batch,
                           server.request_queue, server.response_queues[i],
                           policy_max_turns,
                           args.recovery_turns, args.recovery_sims,
                           args.prevention_turns, args.prevention_sims,
-                          list(existing_keys)))
+                          list(existing_keys), args.probe_batch))
                 proc.start()
                 probe_workers.append(proc)
 
@@ -645,7 +679,7 @@ def main():
                     args=(i, task_queue, result_queue,
                           server._obs_shm.name, server._pol_shm.name,
                           server._val_shm.name,
-                          args.workers, args.batch_size,
+                          args.workers, srv_batch,
                           server.request_queue, server.response_queues[i],
                           args.batch_size, srv_max_score,
                           args.continue_turns, args.max_turns,
