@@ -2957,3 +2957,25 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      V14 retention per review: 5% permanent crisis replay in every
      batch, not a low-λ aux. Old-channel experiments (E1 subsample,
      mCrep replicates, mE2 λ-scaling) cancelled as moot.
+
+168. **Scrambled-label control + "use them all" verdict (2026-06-11).
+     The breakthrough is 100% content; the margin filter retires.**
+     - **Scrambled control** (same 27.6k states, labels permuted,
+       near-identical vector magnitude 0.0325 vs 0.0331, same α=0.4):
+       median 719 / mean 916 / 67.5% of games <1000 — a DESTROYED
+       policy, vs the real vector's +9k. The fine-tune couldn't even
+       fit the random labels (train match 0.002, CE 8.3). No
+       perturbation/rut-escape effect exists; every point of the
+       task-arithmetic gain is 4800-sim knowledge. Mining justified.
+     - **Full 63.8k corpus vector ≈ decisive 27.6k vector** (1k, α
+       sweep): full@0.4 = 22,048/31,389 vs decisive@0.4 =
+       22,084/32,722 — overlapping curves. The low-margin 26% that
+       hurt the AUX channel (entry 165's matrix) are harmless in the
+       MERGE channel: the filter was compensating for the channel,
+       not the data. "Use them all" vindicated where it matters.
+     - Decisions: **V14 permanent replay = the FULL corpus**;
+       canonical policy stays pillar3f (= pillar3b + 0.5·decisive
+       vector, the 5k-confirmed one). Paired-eval lesson: different
+       policies on the same seed play UNCORRELATED games (corr
+       ≈ −0.03) — per-seed pairing only helps near-identical
+       variants; cross-model comparisons need raw N.
