@@ -124,23 +124,13 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
         if result[0] is None:
             break
 
-        action, policy_target = result
+        action, _ = result
 
-        top_indices = np.argsort(policy_target)[::-1][:15]
-        top_moves = []
-        top_scores = []
-        for idx in top_indices:
-            if policy_target[idx] <= 0:
-                break
-            flat = int(idx)
-            top_moves.append({
-                'sr': int(flat // 81 // 9), 'sc': int(flat // 81 % 9),
-                'tr': int(flat % 81 // 9), 'tc': int(flat % 81 % 9),
-            })
-            top_scores.append(float(np.log(policy_target[idx] + 1e-8)))
-
+        # Same rich record as self-play (cand visits + CLEAN prior + root Q +
+        # root_value/q_min/q_max) so build_expert_v2_tensor sees one uniform schema.
+        rec = mcts_replay.last_root_record(top_k=15)
         chosen_src, chosen_tgt = action
-        moves_data.append({
+        md = {
             'board': board_snapshot,
             'next_balls': next_balls_json,
             'num_next': len(nb),
@@ -148,9 +138,10 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
                 'sr': int(chosen_src[0]), 'sc': int(chosen_src[1]),
                 'tr': int(chosen_tgt[0]), 'tc': int(chosen_tgt[1]),
             },
-            'top_moves': top_moves,
-            'top_scores': top_scores,
-        })
+        }
+        if rec is not None:
+            md.update(rec)
+        moves_data.append(md)
 
         move_result = game.move(action[0], action[1])
         if not move_result['valid']:

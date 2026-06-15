@@ -27,9 +27,44 @@ NUM_VALUE_BINS = 64
 DEFAULT_GAMMA = 0.99
 
 
+K_CAND = 10   # candidates stored per state for prior/Q/visit targets (Gumbel/advantage)
+
+
 def move_to_flat(sr, sc, tr, tc):
     """Convert (sr, sc, tr, tc) to flat index in 6561 space."""
     return sr * 9 * 9 * 9 + sc * 9 * 9 + tr * 9 + tc
+
+
+def extract_candidates(move):
+    """Return (flat[K_CAND], visits[K], prior[K], q[K], n, root_value, q_min, q_max).
+
+    New schema (selfplay/crisis with Q): move has cand_moves (flat) / cand_visits /
+    cand_prior (clean pre-Dirichlet log-prob) / cand_q (root Q) / root_value / q_min/q_max.
+    Old schema (visit-only): top_moves (sr/sc/tr/tc dicts) + top_scores (log visit prob);
+    prior := top_scores (no clean prior available), q := 0 (no Q → Gumbel unavailable).
+    """
+    flat = np.zeros(K_CAND, dtype=np.int64)
+    visits = np.zeros(K_CAND, dtype=np.float32)
+    prior = np.zeros(K_CAND, dtype=np.float32)
+    q = np.zeros(K_CAND, dtype=np.float32)
+    if 'cand_moves' in move:
+        cm = move['cand_moves'][:K_CAND]
+        n = len(cm)
+        flat[:n] = np.asarray(cm, dtype=np.int64)
+        visits[:n] = np.asarray(move['cand_visits'][:n], dtype=np.float32)
+        prior[:n] = np.asarray(move['cand_prior'][:n], dtype=np.float32)
+        q[:n] = np.asarray(move['cand_q'][:n], dtype=np.float32)
+        return (flat, visits, prior, q, n, float(move.get('root_value', 0.0)),
+                float(move.get('q_min', 0.0)), float(move.get('q_max', 0.0)))
+    top = move['top_moves'][:K_CAND]
+    ts = move['top_scores'][:K_CAND]
+    n = len(top)
+    for i in range(n):
+        m = top[i]
+        flat[i] = move_to_flat(m['sr'], m['sc'], m['tr'], m['tc'])
+        prior[i] = ts[i]
+        visits[i] = np.exp(ts[i])         # top_scores are log visit-probs
+    return flat, visits, prior, q, n, 0.0, 0.0, 0.0
 
 
 def score_to_twohot(score, max_score, num_bins):
@@ -182,6 +217,20 @@ def main():
     all_bad_boards = []
     all_margins = []
     all_pair_base_idx = []
+    # NEW: candidate-level prior/Q for Gumbel/advantage targets (the trunk recipe)
+    all_cand_idx = []
+    all_cand_visit = []
+    all_cand_prior = []
+    all_cand_q = []
+    all_cand_nnz = []
+    all_root_value = []
+    all_q_min = []
+    all_q_max = []
+
+    # SLIM: policy-only data → skip value-target (val_targets) + pairwise (good/bad
+    # boards) machinery entirely. Drops ~4GB of fields train_path_b never reads
+    # (project_slim_tensor_3j) AND sidesteps the capped-bootstrap value misuse.
+    slim = args.policy_only_data
 
     t0 = time.time()
     total_states = 0
@@ -192,7 +241,9 @@ def main():
         game = json.load(open(fpath))
         n_moves = len(game['moves'])
 
-        if args.sqrt_turns:
+        if slim:
+            td_returns = None   # value targets not built for policy-only tensors
+        elif args.sqrt_turns:
             # sqrt(remaining_turns) value target — loud survival signal
             is_capped = game.get('capped', False)
             bonus = args.sqrt_turns_bonus if is_capped else 0
@@ -221,8 +272,9 @@ def main():
             # Turns remaining until game over
             all_turns_remaining.append(n_moves - mi)
 
-            # Raw TD return scalar
-            all_td_scalars.append(td_returns[mi])
+            # Raw TD return scalar (skipped for slim/policy-only)
+            if not slim:
+                all_td_scalars.append(td_returns[mi])
 
             # Next balls
             npos = np.zeros((3, 2), dtype=np.int8)
@@ -237,40 +289,41 @@ def main():
             all_next_col.append(ncol)
             all_n_next.append(nn)
 
-            # Policy: top moves as sparse indices + softmax values
-            top = move['top_moves'][:top_k_policy]
-            top_scores = move['top_scores'][:top_k_policy]
-            n_top = len(top)
+            # Candidates: flat moves + visits + CLEAN prior + root Q (Gumbel/advantage)
+            flat, visits, prior, q, n_cand, rootv, qmin, qmax = extract_candidates(move)
+            all_cand_idx.append(flat)
+            all_cand_visit.append(visits)
+            all_cand_prior.append(prior)
+            all_cand_q.append(q)
+            all_cand_nnz.append(n_cand)
+            all_root_value.append(rootv)
+            all_q_min.append(qmin)
+            all_q_max.append(qmax)
 
+            # Visit-distribution policy target (top-5, normalized) — kept for the
+            # current/fallback distillation target and apples-to-apples with V13.
             indices = np.zeros(top_k_policy, dtype=np.int64)
             values = np.zeros(top_k_policy, dtype=np.float32)
-            for i in range(n_top):
-                m = top[i]
-                indices[i] = move_to_flat(m['sr'], m['sc'], m['tr'], m['tc'])
-                values[i] = top_scores[i]
-
-            # Normalize values to probabilities (softmax with temp=1)
-            if n_top > 0:
-                v = values[:n_top]
-                v_max = v.max()
-                exp_v = np.exp(v - v_max)
-                exp_v /= exp_v.sum()
-                values[:n_top] = exp_v
-
+            k5 = min(n_cand, top_k_policy)
+            indices[:k5] = flat[:k5]
+            if k5 > 0:
+                vv = visits[:k5].astype(np.float64)
+                s = vv.sum()
+                values[:k5] = (vv / s if s > 0 else np.ones(k5) / k5).astype(np.float32)
             all_pol_indices.append(indices)
             all_pol_values.append(values)
-            all_pol_nnz.append(n_top)
+            all_pol_nnz.append(k5)
 
-            # Pairwise: good (best move) vs bad (worst of top-5)
-            if n_top >= 2:
-                best = top[0]
-                worst = top[n_top - 1]
-                good = make_afterstate(board, best['sr'], best['sc'], best['tr'], best['tc'])
-                bad = make_afterstate(board, worst['sr'], worst['sc'], worst['tr'], worst['tc'])
-                margin = top_scores[0] - top_scores[n_top - 1]
+            # Pairwise good/bad afterstate (value-head training only) — skip in slim.
+            if not slim and n_cand >= 2:
+                bsf, wsf = int(flat[0]), int(flat[k5 - 1])
+                good = make_afterstate(board, bsf // 729, (bsf // 81) % 9,
+                                       (bsf // 9) % 9, bsf % 9)
+                bad = make_afterstate(board, wsf // 729, (wsf // 81) % 9,
+                                      (wsf // 9) % 9, wsf % 9)
                 all_good_boards.append(good)
                 all_bad_boards.append(bad)
-                all_margins.append(margin)
+                all_margins.append(float(prior[0] - prior[k5 - 1]))
                 all_pair_base_idx.append(total_states)
                 total_pairs += 1
 
@@ -302,44 +355,42 @@ def main():
             f"  - regenerate self-play with non-zero bootstrap values, or\n"
             f"  - use --sqrt-turns to compute targets from turn counts.")
 
-    # Analyze TD return distribution to determine max_score
-    td_arr = np.array(all_td_scalars, dtype=np.float32)
-    tr_arr = np.array(all_turns_remaining, dtype=np.int32)
-    print(f"\nTD returns (gamma={gamma}):", flush=True)
-    print(f"  Min:    {td_arr.min():.1f}", flush=True)
-    print(f"  P25:    {np.percentile(td_arr, 25):.1f}", flush=True)
-    print(f"  Median: {np.median(td_arr):.1f}", flush=True)
-    print(f"  Mean:   {td_arr.mean():.1f}", flush=True)
-    print(f"  P75:    {np.percentile(td_arr, 75):.1f}", flush=True)
-    print(f"  P95:    {np.percentile(td_arr, 95):.1f}", flush=True)
-    print(f"  P99:    {np.percentile(td_arr, 99):.1f}", flush=True)
-    print(f"  P99.9:  {np.percentile(td_arr, 99.9):.1f}", flush=True)
-    print(f"  Max:    {td_arr.max():.1f}", flush=True)
-    print(f"\nTurns remaining:", flush=True)
-    print(f"  Min: {tr_arr.min()}, Max: {tr_arr.max()}, "
-          f"Mean: {tr_arr.mean():.0f}, Median: {np.median(tr_arr):.0f}", flush=True)
-    endgame = (tr_arr <= 100).sum()
-    print(f"  Last 100 turns: {endgame:,} ({100*endgame/len(tr_arr):.1f}%)", flush=True)
-
-    # Set max_score: round up P99.9 to nice number with headroom
-    if args.max_score is not None:
-        max_score = args.max_score
+    if slim:
+        max_score = args.max_score or 0.0
+        print(f"\nSLIM (policy-only): skipping value targets + pairwise boards "
+              f"(~4GB of fields train_path_b ignores).", flush=True)
+        # Guard: old-schema (no-Q) games yield all-zero cand_q and would corrupt
+        # the Gumbel target. Real root Q is never exactly 0 for every candidate.
+        _cq = np.stack(all_cand_q)
+        _noq = int((_cq == 0).all(axis=1).sum())
+        if _noq:
+            print(f"  *** WARNING: {_noq}/{len(_cq)} states "
+                  f"({100*_noq/len(_cq):.1f}%) have ALL-ZERO Q — these are "
+                  f"old-schema/no-Q games and WILL corrupt the Gumbel target. "
+                  f"Remove non-Q games from the input dirs and rebuild. ***",
+                  flush=True)
     else:
-        p999 = np.percentile(td_arr, 99.9)
-        # Round up to next 50 with 20% headroom
-        max_score = float(np.ceil(p999 * 1.2 / 50) * 50)
-    print(f"\nUsing max_score={max_score} (bin width={max_score/(num_bins-1):.2f})",
-          flush=True)
-    n_clipped = (td_arr > max_score).sum()
-    print(f"  Clipped: {n_clipped:,} ({100*n_clipped/len(td_arr):.3f}%)", flush=True)
+        # Analyze TD return distribution to determine max_score
+        td_arr = np.array(all_td_scalars, dtype=np.float32)
+        tr_arr = np.array(all_turns_remaining, dtype=np.int32)
+        print(f"\nTD returns (gamma={gamma}):", flush=True)
+        print(f"  Min:    {td_arr.min():.1f}", flush=True)
+        print(f"  Median: {np.median(td_arr):.1f}  Mean: {td_arr.mean():.1f}  "
+              f"P99.9: {np.percentile(td_arr, 99.9):.1f}  Max: {td_arr.max():.1f}",
+              flush=True)
+        if args.max_score is not None:
+            max_score = args.max_score
+        else:
+            max_score = float(np.ceil(np.percentile(td_arr, 99.9) * 1.2 / 50) * 50)
+        n_clipped = (td_arr > max_score).sum()
+        print(f"Using max_score={max_score}  clipped {n_clipped:,} "
+              f"({100*n_clipped/len(td_arr):.3f}%)", flush=True)
+        print("Encoding two-hot targets...", flush=True)
+        all_val_targets = [score_to_twohot(v, max_score, num_bins)
+                           for v in all_td_scalars]
 
-    # Encode value targets as two-hot categorical
-    print("Encoding two-hot targets...", flush=True)
-    all_val_targets = []
-    for v in all_td_scalars:
-        all_val_targets.append(score_to_twohot(v, max_score, num_bins))
-
-    # Stack into tensors
+    # Stack into tensors. Candidate prior/Q (Gumbel/advantage) + visit policy
+    # target are ALWAYS written; value/pairwise fields only when not slim.
     print("Stacking tensors...", flush=True)
     data = {
         'boards': torch.tensor(np.stack(all_boards), dtype=torch.int8),
@@ -349,19 +400,30 @@ def main():
         'pol_indices': torch.tensor(np.stack(all_pol_indices), dtype=torch.int64),
         'pol_values': torch.tensor(np.stack(all_pol_values), dtype=torch.float32),
         'pol_nnz': torch.tensor(all_pol_nnz, dtype=torch.int64),
-        'val_targets': torch.tensor(np.stack(all_val_targets), dtype=torch.float32),
+        # candidate-level improvement-target fields
+        'cand_idx': torch.tensor(np.stack(all_cand_idx), dtype=torch.int64),
+        'cand_visit': torch.tensor(np.stack(all_cand_visit), dtype=torch.float32),
+        'cand_prior': torch.tensor(np.stack(all_cand_prior), dtype=torch.float32),
+        'cand_q': torch.tensor(np.stack(all_cand_q), dtype=torch.float32),
+        'cand_nnz': torch.tensor(all_cand_nnz, dtype=torch.int64),
+        'root_value': torch.tensor(all_root_value, dtype=torch.float32),
+        'q_min': torch.tensor(all_q_min, dtype=torch.float32),
+        'q_max': torch.tensor(all_q_max, dtype=torch.float32),
         'turns_remaining': torch.tensor(all_turns_remaining, dtype=torch.int32),
-        'good_boards': torch.tensor(np.stack(all_good_boards), dtype=torch.int8),
-        'bad_boards': torch.tensor(np.stack(all_bad_boards), dtype=torch.int8),
-        'margins': torch.tensor(all_margins, dtype=torch.float32),
-        'pair_base_idx': torch.tensor(all_pair_base_idx, dtype=torch.int64),
         'num_value_bins': num_bins,
         'max_score': max_score,
         'num_channels': 18,
-        'value_mode': 'pairwise',
+        'value_mode': 'policy_slim' if slim else 'pairwise',
         'gamma': gamma,
         'n_pairs': total_pairs,
+        'k_cand': K_CAND,
     }
+    if not slim:
+        data['val_targets'] = torch.tensor(np.stack(all_val_targets), dtype=torch.float32)
+        data['good_boards'] = torch.tensor(np.stack(all_good_boards), dtype=torch.int8)
+        data['bad_boards'] = torch.tensor(np.stack(all_bad_boards), dtype=torch.int8)
+        data['margins'] = torch.tensor(all_margins, dtype=torch.float32)
+        data['pair_base_idx'] = torch.tensor(all_pair_base_idx, dtype=torch.int64)
 
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     torch.save(data, args.output)

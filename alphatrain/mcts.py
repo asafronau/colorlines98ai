@@ -724,6 +724,12 @@ class MCTS:
         # (Dirichlet reduces P_max by ~25%, masking true confidence)
         raw_max_prior = max(c.prior for c in root.children.values()) if root.children else 0.0
 
+        # Stash the CLEAN (pre-Dirichlet) priors + root value for label recording.
+        # These are the noise-free improvement-target ingredients (Gumbel softmax(z+Q)):
+        # the prior here is the raw net policy, before exploration noise is mixed in.
+        self._last_raw_priors = dict(priors)
+        self._last_root_value = root_value
+
         # Dirichlet noise at root for exploration
         if dirichlet_alpha > 0 and dirichlet_weight > 0:
             noise = self._sim_rng.dirichlet(
@@ -1128,6 +1134,37 @@ class MCTS:
         if return_policy:
             return action, policy_target
         return action
+
+    def last_root_record(self, top_k=20):
+        """Rich per-root training record from the most recent search(), shared by
+        self-play and crisis recording so the corpus schema is uniform.
+
+        Returns a dict of top-K candidates (ranked by visit count) with, per move:
+        flat move idx, visit count, CLEAN pre-Dirichlet prior logit-proxy (log prob),
+        and root Q (value_sum/visit_count); plus root_value and the search's q_min/q_max
+        (for advantage/Gumbel normalization). Supports visit / advantage-softmax / Gumbel
+        targets and disagreement weighting without re-search.
+        """
+        root = self._last_root
+        if root is None or not root.children:
+            return None
+        raw = getattr(self, '_last_raw_priors', None) or {}
+        items = sorted(root.children.items(),
+                       key=lambda kv: kv[1].visit_count, reverse=True)[:top_k]
+        moves, visits, priors, qs = [], [], [], []
+        for action, node in items:
+            moves.append(int(action))
+            visits.append(int(node.visit_count))
+            p = raw.get(action, node.prior)
+            priors.append(float(np.log(p + 1e-8)))           # clean prior as log-prob
+            qs.append(float(node.value_sum / node.visit_count)
+                      if node.visit_count > 0 else float(self._last_root_value))
+        return {
+            'cand_moves': moves, 'cand_visits': visits,
+            'cand_prior': priors, 'cand_q': qs,
+            'root_value': float(getattr(self, '_last_root_value', 0.0)),
+            'q_min': float(self._last_min_q), 'q_max': float(self._last_max_q),
+        }
 
 
 def make_mcts_player(net, device, max_score=30000.0,

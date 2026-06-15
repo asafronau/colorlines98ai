@@ -80,6 +80,7 @@ def _crisis_worker(slot_id, seed_queue, result_queue,
             vc_sum = np.zeros(6561, dtype=np.float64)
             vsum_sum = np.zeros(6561, dtype=np.float64)
             q_lo, q_hi = float('inf'), float('-inf')
+            raw_prior = {}   # clean pre-Dirichlet prior (same per board across determinizations)
             for s in range(mcts_seeds):
                 game = ColorLinesGame()
                 game.reset(board=np.array(fr['board'], dtype=np.int8),
@@ -94,6 +95,7 @@ def _crisis_worker(slot_id, seed_queue, result_queue,
                         vsum_sum[act] += child.value_sum
                 q_lo = min(q_lo, mcts._last_min_q)
                 q_hi = max(q_hi, mcts._last_max_q)
+                raw_prior = getattr(mcts, '_last_raw_priors', None) or raw_prior
             visits = visit_sum / visit_sum.sum()
             top_idx = int(visits.argmax())
             if top_idx != pol_idx:
@@ -105,6 +107,8 @@ def _crisis_worker(slot_id, seed_queue, result_queue,
                              'visits': [[int(j), float(visits[j])] for j in order if visits[j] > 0],
                              'q': [[int(j), float(vsum_sum[j] / vc_sum[j])]
                                    for j in order if vc_sum[j] > 0],
+                             'prior': [[int(j), float(np.log(raw_prior[j] + 1e-8))]
+                                       for j in order if j in raw_prior],
                              'q_min': q_lo, 'q_max': q_hi})
         json.dump({'seed': seed, 'n_band_states': n_states, 'corrections': corr},
                   open(os.path.join(out_dir, f'corr_{seed}.json'), 'w'), default=float)

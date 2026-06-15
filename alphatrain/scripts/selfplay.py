@@ -100,23 +100,12 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
             break
         action, policy_target = result
 
-        # Top-K moves from visit count distribution
-        top_indices = np.argsort(policy_target)[::-1][:top_k_save]
-        top_moves, top_scores = [], []
-        for idx in top_indices:
-            if policy_target[idx] <= 0:
-                break
-            flat = int(idx)
-            sf = flat // 81
-            tf = flat % 81
-            top_moves.append({
-                'sr': int(sf // 9), 'sc': int(sf % 9),
-                'tr': int(tf // 9), 'tc': int(tf % 9),
-            })
-            top_scores.append(float(np.log(policy_target[idx] + 1e-8)))
-
+        # Rich per-root record: top-K candidates with visits + CLEAN (pre-Dirichlet)
+        # prior + root Q, plus root_value and q_min/q_max — the noise-separated
+        # ingredients for visit / advantage / Gumbel(z+Q) targets (no re-search needed).
+        rec = mcts.last_root_record(top_k=top_k_save)
         chosen_src, chosen_tgt = action
-        moves_data.append({
+        md = {
             'board': board_snapshot,
             'next_balls': next_balls,
             'num_next': len(nb),
@@ -124,9 +113,10 @@ def play_selfplay_game(mcts, seed, temperature_moves=15,
                 'sr': int(chosen_src[0]), 'sc': int(chosen_src[1]),
                 'tr': int(chosen_tgt[0]), 'tc': int(chosen_tgt[1]),
             },
-            'top_moves': top_moves,
-            'top_scores': top_scores,
-        })
+        }
+        if rec is not None:
+            md.update(rec)
+        moves_data.append(md)
 
         move_result = game.move(action[0], action[1])
         if not move_result['valid']:
@@ -238,6 +228,13 @@ def main():
                    help='PUCT q-weight. Default 2.0 (calibrated for the NN '
                         'value head V scale; use 0.5 for the linear '
                         'evaluator).')
+    p.add_argument('--result-timeout', type=int, default=21600,
+                   help='Seconds the main loop waits for the NEXT game to '
+                        'finish before assuming a hang and aborting (default '
+                        '6h). Must exceed the longest single-game wall time: '
+                        'at high sims / high --max-turns a game can take many '
+                        'hours (e.g. 600 sims ~1.4s/turn => a 10k-turn game ~4h). '
+                        'Too small => spurious _queue.Empty at the drain.')
     p.add_argument('--compile', action='store_true',
                    help='Use torch.compile(mode=reduce-overhead) instead of '
                         'torch.jit.trace in the inference server. CUDA only; '
@@ -377,7 +374,7 @@ def main():
 
         try:
             for i in range(n_games):
-                result = result_queue.get(timeout=7200)
+                result = result_queue.get(timeout=args.result_timeout)
 
                 save_game_json(result, args.save_dir)
 
