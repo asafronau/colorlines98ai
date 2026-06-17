@@ -2980,8 +2980,9 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
        ≈ −0.03) — per-seed pairing only helps near-identical
        variants; cross-model comparisons need raw N.
 
-169. **V14/V15 self-play TRUNK distillation FAILED; root cause = floor-poor
-     corpus, NOT the recipe/teacher (2026-06-16). Facts locked so we stop
+169. **V14/V15 self-play TRUNK distillation FAILED; root cause = OVERFITTING
+     (warm-start already fits the targets, nothing learnable), NOT the
+     recipe/teacher/data-quantity (2026-06-16). Facts locked so we stop
      relitigating.** Two attempts to distill the V14/V15 self-play teacher onto
      pillar3f both regressed: pillar3g (visit-distill, train_path_b, T=0.5) and
      pillar3g2 (completed-Q "Gumbel" target). pillar3g2 eval (eval_policy, 200
@@ -3018,16 +3019,38 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      (P1-P25) is meaningful. (c) NEVER per-seed/paired (RNG forks the game once
      players differ); distribution-over-a-seed-range only ([[feedback_eval_path_divergence]]).
 
-     **ROOT CAUSE (data-backed): the V14/V15 corpus is FLOOR-POOR.** Self-play
-     floor V14 P5 4,956 / P10 10,348 vs V13 P5 2,561 / P10 5,130 — ~2× HIGHER, i.e.
-     far fewer hard/early-death states. Crisis 13% of states (V14) vs 18% (V13).
-     pillar3f is a strong enough PLAYER that its self-play rarely visits trouble →
-     the corpus is dominated by safe high-floor states → the teacher's 2×-floor
-     advantage exists but the data doesn't CONTAIN enough floor states to distill
-     it. The stronger the generator, the cleaner (floor-poorer) its self-play, the
-     weaker the floor signal. **Fix = enrich the corpus with hard/floor states**
-     (more crisis mining, hard-seed self-play, oversample low-floor games) — "feed
-     better data," not change the recipe.
+     **"Floor-poor corpus" was WRONG (retracted).** V14 self-play floor is HIGHER
+     than V13 (P10 10,348 vs 5,130) — but that's just the stronger generator
+     (everything scales up); same distribution SHAPE, strictly-better data. A higher
+     floor is good, not deficient. Do not raise "floor-poor" again.
+
+     **ROOT CAUSE (evidenced by the train log): OVERFITTING from epoch 1 = the
+     warm-start already fits the targets; nothing learnable.** pillar3g train log:
+     train loss 2.2944→2.2935→2.2893→2.2871 (barely moves at full lr 3e-4), VAL
+     loss RISES from ep1: 2.3371→2.3496→2.3516. So pillar3f (epoch 0) is the
+     val-loss MINIMUM — every epoch makes val worse. Contrast 3b at the same lr:
+     train loss DROPPED to ~2.0, val fell with it (real signal → +15% over 17 ep);
+     2z trained 40 ep on a falling val. The diagnostic is the LOSS TRAJECTORY:
+     decreasing val = learnable signal = improvement; rising val from ep1 = nothing
+     to learn = overfit residual noise = regress. Floor scores (eval_policy, no cap,
+     779000-779199) confirm: pillar3f P1 1057/P10 3349/<1000 0.5%; pillar3g ep2 P1
+     1437/P10 3852/<1000 1.0%; ep3 P1 808/P10 3578/<1000 2.0% (accumulating
+     regression as val climbs over 20 ep).
+
+     **WHY nothing to learn:** pillar3f GENERATED V14 with its own MCTS@400; at 400
+     sims a confident prior dominates the visit counts (visit-argmax==prior-argmax
+     84%; the visit target is a slightly-flatter copy of pillar3f's prior). So the
+     targets ≈ pillar3f's own output → warm-start already fits them → train can't
+     fall → overfit. 3b worked because pillar3a was WEAKER/less-confident, so its
+     400-sim search shifted the visits meaningfully OFF the prior → learnable target.
+     This is NOT "near the ceiling" (far from it) and NOT "teacher not better" (it
+     plays 2× via critical-move SELECTION — but that advantage is not in the per-
+     state VISIT COUNTS at 400 sims, which is all visit-distillation consumes).
+     **Fix direction = a target that DIFFERS from pillar3f's prior:** more search
+     depth so visits diverge from the confident prior (documented 2N→2P escape:
+     escalate sims), or a value/selection-based target (completed-Q was the right
+     idea, wrong execution — it chased rejected moves). NOT more/better data — more
+     of pillar3f's own self-play has the same no-signal property.
 
      Also fixed: `alphatrain/train.py:68` bf16 crash (`scaler.scale` with
      scaler=None) — gate on `scaler is not None` (bf16 uses autocast, no GradScaler).
