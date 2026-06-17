@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import Dataset
 
 from alphatrain.observation import build_observation, build_line_potentials_batch, NUM_CHANNELS
+from alphatrain.gumbel import completed_q_target
 
 BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4
@@ -200,6 +201,11 @@ def _load_backing(tensor_path, device):
         backing['obs_precomputed'] = data['obs_precomputed'].to(dev)
     else:
         backing['obs_precomputed'] = None
+    # Completed-Q (Gumbel trunk) fields — only present in slim/policy-only tensors.
+    if 'cand_idx' in data:
+        for k in ('cand_idx', 'cand_visit', 'cand_prior', 'cand_q',
+                  'cand_nnz', 'root_value'):
+            backing[k] = data[k].to(dev)
     n = backing['boards'].shape[0]
     print(f"  Loaded {n:,} base states in {time.time()-t0:.1f}s", flush=True)
     _BACKING_CACHE[key] = backing
@@ -513,3 +519,120 @@ class TensorDatasetGPU(Dataset):
     def _build_obs_boards_only(self, boards):
         """Build observations from boards only (no next_balls). For afterstates."""
         return self._build_obs_core(boards)
+
+
+class GumbelDatasetGPU(TensorDatasetGPU):
+    """Self-play trunk dataset whose target is the completed-Q improvement policy
+    (alphatrain/gumbel.py), NOT the visit distribution.
+
+    collate returns (obs, target, prior, weight):
+        target (B, NUM_MOVES)  softmax(prior + gated_adv/tau), dense, dihedral-augmented
+        prior  (B, NUM_MOVES)  softmax(clean prior), dense, augmented   (KL anchor)
+        weight (B,)            1 + gamma * is_correction  (dihedral-invariant scalar)
+
+    The dense target/prior are scattered from the stored top-K candidates and then
+    augmented with the EXACT same per-sample dihedral transform as the obs and as the
+    visit-policy target in the parent class — so index alignment is identical to the
+    already-verified path. Color augmentation does not touch move indices (color-invariant),
+    so candidate targets need only the dihedral remap. The Gumbel hyperparameters live in
+    one place (gumbel.completed_q_target); review tunes them, scaffolding is untouched.
+    """
+
+    def __init__(self, tensor_path, *, visit_floor=20.0, tau=0.02, gamma=10.0,
+                 spread_gate=0.05, kappa=15.0, **kw):
+        super().__init__(tensor_path, **kw)
+        backing = _load_backing(tensor_path, str(self.device))
+        if 'cand_idx' not in backing:
+            raise ValueError(
+                f"{tensor_path} has no cand_idx — build with --policy-only-data "
+                "(slim) so the completed-Q fields are present.")
+        self.cand_idx = backing['cand_idx']
+        self.cand_visit = backing['cand_visit']
+        self.cand_prior = backing['cand_prior']
+        self.cand_q = backing['cand_q']
+        self.cand_nnz = backing['cand_nnz']
+        self.root_value = backing['root_value']
+        self.visit_floor = visit_floor
+        self.tau = tau
+        self.gamma = gamma
+        self.spread_gate = spread_gate
+        self.kappa = kappa
+
+    @torch.no_grad()
+    def collate(self, indices):
+        items = torch.tensor(indices, dtype=torch.long, device=self.device)
+        B = len(items)
+        base_pos = items // self.augment_factor
+        base_idx = self.base_indices[base_pos]
+
+        boards = self.boards[base_idx]
+        next_pos = self.next_pos[base_idx]
+        next_col = self.next_col[base_idx]
+        n_next = self.n_next[base_idx]
+
+        # ── Color augmentation (move-index invariant) ──
+        if self.color_augment:
+            perm_1_7 = torch.argsort(torch.rand(B, 7, device=self.device), dim=1) + 1
+            perm = torch.zeros(B, 8, dtype=torch.long, device=self.device)
+            perm[:, 1:8] = perm_1_7
+            boards = torch.gather(perm, 1, boards.long().view(B, -1)).view(B, 9, 9).to(torch.int8)
+            next_col = torch.gather(perm, 1, next_col.long()).to(torch.int8)
+            use_precomputed = False
+        else:
+            use_precomputed = self.obs_precomputed is not None
+
+        if use_precomputed:
+            obs = self.obs_precomputed[base_idx].float()
+        else:
+            obs = self._build_obs_core(boards, next_pos=next_pos,
+                                       next_col=next_col, n_next=n_next)
+
+        # ── Completed-Q target over the stored candidates → dense ──
+        target_p, prior_p, weight, _, support = completed_q_target(
+            self.cand_visit[base_idx], self.cand_prior[base_idx],
+            self.cand_q[base_idx], self.cand_nnz[base_idx],
+            self.root_value[base_idx],
+            visit_floor=self.visit_floor, tau=self.tau, gamma=self.gamma,
+            spread_gate=self.spread_gate, kappa=self.kappa)
+        cand_idx = self.cand_idx[base_idx]                      # (B, K)
+        target = torch.zeros(B, NUM_MOVES, device=self.device)
+        prior = torch.zeros(B, NUM_MOVES, device=self.device)
+        sup = torch.zeros(B, NUM_MOVES, device=self.device)    # candidate-restricted CE support
+        # scatter_add_ is collision-safe: padded slots all map to move 0 with value 0.
+        target.scatter_add_(1, cand_idx, target_p)
+        prior.scatter_add_(1, cand_idx, prior_p)
+        sup.scatter_add_(1, cand_idx, support.float())
+
+        # ── Dihedral augmentation: same transform for obs, target, prior, support ──
+        if self.augment:
+            transforms = torch.randint(0, 8, (B,), device=self.device, dtype=torch.long)
+            for t in range(1, 8):
+                mask = transforms == t
+                if not mask.any():
+                    continue
+                obs[mask] = obs[mask].reshape(-1, NUM_CHANNELS, 81
+                    )[:, :, self._obs_luts[t]].reshape(-1, NUM_CHANNELS, 9, 9)
+                target[mask] = target[mask][:, self._pol_luts[t]]
+                prior[mask] = prior[mask][:, self._pol_luts[t]]
+                sup[mask] = sup[mask][:, self._pol_luts[t]]
+
+        return obs, target, prior, sup, weight
+
+    @classmethod
+    def make_train_val_split(cls, tensor_path, *, val_split=0.05,
+                             augment=True, color_augment=True, augment_factor=8,
+                             device='cuda', seed=42, visit_floor=20.0, tau=0.02,
+                             gamma=10.0, spread_gate=0.05, kappa=15.0):
+        backing = _load_backing(tensor_path, device)
+        n = backing['boards'].shape[0]
+        g = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(n, generator=g)
+        n_val = max(1, int(n * val_split))
+        gk = dict(visit_floor=visit_floor, tau=tau, gamma=gamma,
+                  spread_gate=spread_gate, kappa=kappa)
+        train = cls(tensor_path, base_indices=perm[n_val:], augment=augment,
+                    color_augment=color_augment, augment_factor=augment_factor,
+                    device=device, **gk)
+        val = cls(tensor_path, base_indices=perm[:n_val], augment=False,
+                  color_augment=False, augment_factor=1, device=device, **gk)
+        return train, val

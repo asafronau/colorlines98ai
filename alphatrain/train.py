@@ -65,13 +65,13 @@ def train_epoch(model, loader, optimizer, device, scaler=None, log_interval=100,
                                      target_temperature=target_temperature)
 
         optimizer.zero_grad(set_to_none=True)
-        if use_amp:
+        if scaler is not None:        # fp16 path (bf16 uses autocast but no scaler)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
-        else:
+        else:                         # bf16 or fp32: plain backward
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()

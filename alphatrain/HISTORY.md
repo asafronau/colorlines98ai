@@ -2979,3 +2979,55 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
        policies on the same seed play UNCORRELATED games (corr
        ≈ −0.03) — per-seed pairing only helps near-identical
        variants; cross-model comparisons need raw N.
+
+169. **V14/V15 self-play TRUNK distillation FAILED; root cause = floor-poor
+     corpus, NOT the recipe/teacher (2026-06-16). Facts locked so we stop
+     relitigating.** Two attempts to distill the V14/V15 self-play teacher onto
+     pillar3f both regressed: pillar3g (visit-distill, train_path_b, T=0.5) and
+     pillar3g2 (completed-Q "Gumbel" target). pillar3g2 eval (eval_policy, 200
+     seeds 779000-779199, cap 20000t): mean 23,042→11,411 (ep1)→7,684 (ep2),
+     <1000 0.5%→8% — halved, monotonic with training, floor WORSE.
+
+     **REFUTED hypotheses (each killed with data — do NOT raise again):**
+     - *"Student caught the teacher / gap closed."* FALSE. Teacher still ~2× on
+       the floor: teacher self-play P10 7,127 / P5 3,508 vs raw pillar3f P10
+       3,355 / P5 2,479. Matches 2z (MCTS 15,465 / pol 7,460 = 2×) and 3a (+49%).
+       The 1.5-2× outcome gap has held the whole project.
+     - *"Visits flattened / dilution on a strong base."* FALSE. Top-5-normalized
+       top-1 visit share is IDENTICAL across generations: V12=0.22, V13=0.22,
+       V14=0.22, V15=0.22 (top1-top2 gap ~0 in all). 2z distilled a target this
+       "flat" to a new best. (The earlier 0.22-vs-0.14 was a top-5-vs-top-15
+       recording artifact.)
+     - *"Sharpening / wrong trainer broke 3g."* FALSE. **3g IS the 3b recipe** —
+       same `train_path_b`, same `--target-temperature 0.5`, lr 3e-4, bs 32K,
+       color-aug ON (train_path_b default). 3b (V13→pillar3a) gave +15% policy
+       with this exact recipe.
+     - *Base (pillar3a vs pillar3f merge)*: already tested — 3b-base vs 3f-base
+       gave identical curves. Not it.
+     - *Move cap*: V13/V14 selfplay both ~8.6-9.1k avg states/game (same ~cap);
+       affects ceiling not floor. Not it.
+     - *completed-Q (3g2) specifically* distilled `q_arg` = the high-Q LOW-visit
+       move the search VISITED AND REJECTED (chosen_move==q_arg only 2.4%;
+       ==prior pick 84.3%). Anti-teacher target → its extra regression. Value head
+       is fine; the target was wrong.
+
+     **METRIC RULES (stop getting confused):** (a) crisis-game "scores" are
+     MEANINGLESS — a crisis game = snapshot score + a 200-500 move replay, so
+     higher crisis score = STRONGER generator, not better data. (b) self-play
+     mean/median are CAP-PINNED (most games hit the turn cap) — only the FLOOR
+     (P1-P25) is meaningful. (c) NEVER per-seed/paired (RNG forks the game once
+     players differ); distribution-over-a-seed-range only ([[feedback_eval_path_divergence]]).
+
+     **ROOT CAUSE (data-backed): the V14/V15 corpus is FLOOR-POOR.** Self-play
+     floor V14 P5 4,956 / P10 10,348 vs V13 P5 2,561 / P10 5,130 — ~2× HIGHER, i.e.
+     far fewer hard/early-death states. Crisis 13% of states (V14) vs 18% (V13).
+     pillar3f is a strong enough PLAYER that its self-play rarely visits trouble →
+     the corpus is dominated by safe high-floor states → the teacher's 2×-floor
+     advantage exists but the data doesn't CONTAIN enough floor states to distill
+     it. The stronger the generator, the cleaner (floor-poorer) its self-play, the
+     weaker the floor signal. **Fix = enrich the corpus with hard/floor states**
+     (more crisis mining, hard-seed self-play, oversample low-floor games) — "feed
+     better data," not change the recipe.
+
+     Also fixed: `alphatrain/train.py:68` bf16 crash (`scaler.scale` with
+     scaler=None) — gate on `scaler is not None` (bf16 uses autocast, no GradScaler).
