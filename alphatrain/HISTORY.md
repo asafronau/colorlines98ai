@@ -2980,10 +2980,10 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
        ≈ −0.03) — per-seed pairing only helps near-identical
        variants; cross-model comparisons need raw N.
 
-169. **V14/V15 self-play TRUNK distillation FAILED; root cause = OVERFITTING
-     (warm-start already fits the targets, nothing learnable), NOT the
-     recipe/teacher/data-quantity (2026-06-16). Facts locked so we stop
-     relitigating.** Two attempts to distill the V14/V15 self-play teacher onto
+169. **V14/V15 self-play TRUNK distillation FAILED. FACT: overfits from epoch 1
+     (val rises, train ~flat), NOT recipe/teacher/data-quantity. MECHANISM (why it
+     overfits) STILL OPEN — my "no learnable signal" theory was refuted (2026-06-16).
+     Facts locked so we stop relitigating; mechanism deliberately left open.** Two attempts to distill the V14/V15 self-play teacher onto
      pillar3f both regressed: pillar3g (visit-distill, train_path_b, T=0.5) and
      pillar3g2 (completed-Q "Gumbel" target). pillar3g2 eval (eval_policy, 200
      seeds 779000-779199, cap 20000t): mean 23,042→11,411 (ep1)→7,684 (ep2),
@@ -3037,20 +3037,18 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      1437/P10 3852/<1000 1.0%; ep3 P1 808/P10 3578/<1000 2.0% (accumulating
      regression as val climbs over 20 ep).
 
-     **WHY nothing to learn:** pillar3f GENERATED V14 with its own MCTS@400; at 400
-     sims a confident prior dominates the visit counts (visit-argmax==prior-argmax
-     84%; the visit target is a slightly-flatter copy of pillar3f's prior). So the
-     targets ≈ pillar3f's own output → warm-start already fits them → train can't
-     fall → overfit. 3b worked because pillar3a was WEAKER/less-confident, so its
-     400-sim search shifted the visits meaningfully OFF the prior → learnable target.
-     This is NOT "near the ceiling" (far from it) and NOT "teacher not better" (it
-     plays 2× via critical-move SELECTION — but that advantage is not in the per-
-     state VISIT COUNTS at 400 sims, which is all visit-distillation consumes).
-     **Fix direction = a target that DIFFERS from pillar3f's prior:** more search
-     depth so visits diverge from the confident prior (documented 2N→2P escape:
-     escalate sims), or a value/selection-based target (completed-Q was the right
-     idea, wrong execution — it chased rejected moves). NOT more/better data — more
-     of pillar3f's own self-play has the same no-signal property.
+     **WHY it overfits — UNVERIFIED, my "no learnable signal" hypothesis was REFUTED.**
+     I claimed pillar3f's search≈prior (nothing to learn). Direct test (forward each
+     warm-start model on its own self-play, measure prior-vs-visit gap): V13/pillar3a
+     argmax-agree 67% / KL 0.91; V14/pillar3f argmax-agree 79% / KL 1.06. My claim
+     predicted V14 has a SMALLER gap; it has a BIGGER KL → refuted. There IS plenty of
+     distributional signal in V14. The only directional hint: V13 had MORE argmax-level
+     corrections (33% vs 21%) — search picked a different BEST move more often; V14's gap
+     is more "visits flatter than the confident prior" than "different best move." NOT a
+     verified cause. **Do NOT invest expensive compute (sim escalation) on this — it was
+     justified only by the refuted theory.** Real lead (cheap): 3b and 3g are the SAME
+     recipe yet 3b val FELL over 17 ep and 3g val ROSE from ep1 — compare the two training
+     curves + what in the data flips val's direction. Mechanism still open.
 
      Also fixed: `alphatrain/train.py:68` bf16 crash (`scaler.scale` with
      scaler=None) — gate on `scaler is not None` (bf16 uses autocast, no GradScaler).
