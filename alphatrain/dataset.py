@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import Dataset
 
 from alphatrain.observation import build_observation, build_line_potentials_batch, NUM_CHANNELS
-from alphatrain.gumbel import completed_q_target
+from alphatrain.gumbel import completed_q_target, vetted_override_target
 
 BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4
@@ -538,7 +538,8 @@ class GumbelDatasetGPU(TensorDatasetGPU):
     one place (gumbel.completed_q_target); review tunes them, scaffolding is untouched.
     """
 
-    def __init__(self, tensor_path, *, visit_floor=20.0, tau=0.02, gamma=10.0,
+    def __init__(self, tensor_path, *, target_mode='completed_q', min_margin=0.0,
+                 visit_floor=20.0, tau=0.02, gamma=10.0,
                  spread_gate=0.05, kappa=15.0, **kw):
         super().__init__(tensor_path, **kw)
         backing = _load_backing(tensor_path, str(self.device))
@@ -552,6 +553,8 @@ class GumbelDatasetGPU(TensorDatasetGPU):
         self.cand_q = backing['cand_q']
         self.cand_nnz = backing['cand_nnz']
         self.root_value = backing['root_value']
+        self.target_mode = target_mode          # 'completed_q' or 'vetted_override'
+        self.min_margin = min_margin
         self.visit_floor = visit_floor
         self.tau = tau
         self.gamma = gamma
@@ -587,13 +590,18 @@ class GumbelDatasetGPU(TensorDatasetGPU):
             obs = self._build_obs_core(boards, next_pos=next_pos,
                                        next_col=next_col, n_next=n_next)
 
-        # ── Completed-Q target over the stored candidates → dense ──
-        target_p, prior_p, weight, _, support = completed_q_target(
-            self.cand_visit[base_idx], self.cand_prior[base_idx],
-            self.cand_q[base_idx], self.cand_nnz[base_idx],
-            self.root_value[base_idx],
-            visit_floor=self.visit_floor, tau=self.tau, gamma=self.gamma,
-            spread_gate=self.spread_gate, kappa=self.kappa)
+        # ── Build per-candidate target over the stored candidates → dense ──
+        if self.target_mode == 'vetted_override':
+            target_p, prior_p, weight, _, support = vetted_override_target(
+                self.cand_visit[base_idx], self.cand_prior[base_idx],
+                self.cand_nnz[base_idx], min_margin=self.min_margin)
+        else:
+            target_p, prior_p, weight, _, support = completed_q_target(
+                self.cand_visit[base_idx], self.cand_prior[base_idx],
+                self.cand_q[base_idx], self.cand_nnz[base_idx],
+                self.root_value[base_idx],
+                visit_floor=self.visit_floor, tau=self.tau, gamma=self.gamma,
+                spread_gate=self.spread_gate, kappa=self.kappa)
         cand_idx = self.cand_idx[base_idx]                      # (B, K)
         target = torch.zeros(B, NUM_MOVES, device=self.device)
         prior = torch.zeros(B, NUM_MOVES, device=self.device)
@@ -621,14 +629,16 @@ class GumbelDatasetGPU(TensorDatasetGPU):
     @classmethod
     def make_train_val_split(cls, tensor_path, *, val_split=0.05,
                              augment=True, color_augment=True, augment_factor=8,
-                             device='cuda', seed=42, visit_floor=20.0, tau=0.02,
+                             device='cuda', seed=42, target_mode='completed_q',
+                             min_margin=0.0, visit_floor=20.0, tau=0.02,
                              gamma=10.0, spread_gate=0.05, kappa=15.0):
         backing = _load_backing(tensor_path, device)
         n = backing['boards'].shape[0]
         g = torch.Generator().manual_seed(seed)
         perm = torch.randperm(n, generator=g)
         n_val = max(1, int(n * val_split))
-        gk = dict(visit_floor=visit_floor, tau=tau, gamma=gamma,
+        gk = dict(target_mode=target_mode, min_margin=min_margin,
+                  visit_floor=visit_floor, tau=tau, gamma=gamma,
                   spread_gate=spread_gate, kappa=kappa)
         train = cls(tensor_path, base_indices=perm[n_val:], augment=augment,
                     color_augment=color_augment, augment_factor=augment_factor,

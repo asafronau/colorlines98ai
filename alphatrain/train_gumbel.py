@@ -60,7 +60,12 @@ def gumbel_losses(logits, target, prior, support, weight, beta, anchor_mode, ce_
         logp_t = logp_full
     ce_target = -(target * logp_t).sum(1)        # (B,) candidate-restricted improvement
     ce_prior = -(prior * logp_full).sum(1)       # (B,) full-softmax forward anchor/monitor
-    is_corr = weight > 1.0
+    # "Active" (distilled) states = where the target's decision differs from the prior's.
+    # Mode-agnostic: for completed_q this is exactly the correction set (q_arg != p_arg,
+    # weight 1+gamma); for vetted_override it is the override set (weight 1.0, vs 0.0 on
+    # agreement). Defining it by argmax keeps observability (corr_match) and the partition
+    # split correct for BOTH modes — `weight > 1.0` silently matched nothing for override.
+    is_corr = target.argmax(1) != prior.argmax(1)
     if anchor_mode == 'partition':
         nc = (~is_corr)
         ce_term = (weight * ce_target)[is_corr].sum() / max(int(is_corr.sum()), 1)
@@ -161,9 +166,17 @@ def main():
     p.add_argument('--spread-gate', type=float, default=0.05)
     p.add_argument('--beta', type=float, default=0.0,
                    help='EXTRA explicit forward-CE-to-prior anchor weight. 0 = off '
-                        '(the gated target already anchors the 96% to the prior).')
+                        '(the gated target already anchors the 96%% to the prior).')
     p.add_argument('--anchor-mode', choices=['everywhere', 'partition'],
                    default='everywhere')
+    p.add_argument('--target-mode', choices=['completed_q', 'vetted_override'],
+                   default='completed_q',
+                   help="'vetted_override' (3i_a) = hard one-hot BC toward the search's "
+                        "most-visited move ONLY where it overrides argmax(prior); agreement "
+                        "states get weight 0 (use --beta for a tiny prior anchor).")
+    p.add_argument('--min-margin', type=float, default=0.0,
+                   help='vetted_override: require override move to beat prior move by this '
+                        'visit-share margin (0 = pure argmax disagreement).')
     p.add_argument('--ce-mode', choices=['candidate', 'full'], default='candidate',
                    help="Improvement CE support. 'candidate' (default) = restricted to "
                         "the searched candidates (top-10 prior mass is only ~0.93, so "
@@ -179,7 +192,8 @@ def main():
               else torch.device('cpu'))
     print(f"Device: {device}", flush=True)
 
-    gk = dict(visit_floor=args.visit_floor, tau=args.tau, gamma=args.gamma,
+    gk = dict(target_mode=args.target_mode, min_margin=args.min_margin,
+              visit_floor=args.visit_floor, tau=args.tau, gamma=args.gamma,
               spread_gate=args.spread_gate, kappa=args.kappa)
     train_set, val_set = GumbelDatasetGPU.make_train_val_split(
         args.tensor_file, val_split=args.val_split,
