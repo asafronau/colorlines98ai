@@ -3052,3 +3052,245 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 
      Also fixed: `alphatrain/train.py:68` bf16 crash (`scaler.scale` with
      scaler=None) — gate on `scaler is not None` (bf16 uses autocast, no GradScaler).
+
+170. **pillar3f crisis re-mining (harvest2) + the TWO-PIPELINE clarification
+     (2026-06-17..18). Provenance discipline starts here (write every model's
+     exact commands + why).**
+
+     **TWO DISTINCT crisis pipelines (do not conflate — this cost hours):**
+     - *MCTS pipeline (made pillar3f, the +37% breakthrough, HISTORY 167-168,
+       commit 6bd133f):* `gen_corrections_parallel.py` runs widened MCTS@4800
+       (3 determinizations, q_weight 2.0, FV value net — NO neural value head)
+       on each death game's crisis band, keeps states where MCTS top != policy
+       move, target = soft visit dist. Writes `crisis/corrections/corr_<seed>.json`
+       (keys: pol_share, mcts_top_share, visits). → `build_corrections_corpus.py`
+       → `corrections_corpus.pt` (63.8k corrections / 3,676 games ACCUMULATED over
+       many sessions; "decisive" subset mm05 = 27.6k). → `train_crisis_ft.py`
+       (frozen-BN fine-tune) → `merge_checkpoints.py` (θ_base + α·Δ). **This is the
+       teacher that produced pillar3f = pillar3b + 0.5·decisive_vector.**
+     - *Catastrophe pipeline (this session's action-risk direction):*
+       `overnight_systematic.py` → `mine_crisis_sweep.py` rolls out each policy
+       candidate to death (R_curve 100 / R_screen 50 / R_confirm 500), labels by
+       P(died-within-300) = catastrophe rate. Writes `mine_<seed>.json` (keys:
+       pol_cat, best_cat, cand_rates). Held-out R=500 CI guards winner's-curse.
+       Different teacher (policy self-judgment via rollouts, NOT a stronger searcher).
+
+     **harvest2 = a 67h catastrophe re-mine on pillar3f (NOT MCTS).** Command:
+     `caffeinate -s -i python scripts/overnight_systematic.py --model
+     alphatrain/data/pillar3f.pt --rec-cap 25000 --out-dir logs/harvest2
+     --seed-start 300000 --n-try 4000 --max-seconds 172800 --device mps
+     --workers 10 --r-screen 50` (added --model/--rec-cap/--out-dir flags this
+     session; depths stayed the default 15-45). Result: **575 natural-death pillar3f
+     games mined (725 recorded to death_games/death_300*.json), 510/575 with ≥1
+     CI-confirmed fork, 1,682 confirmed forks, 12,712 band states, 256,515 per-move
+     labels.** Bigger than the prior catastrophe harvest v1 (`logs/mine_*.json`,
+     443 games / 1,209 forks). NOT smaller — the earlier "less than 27.6k" alarm was
+     a wrong cross-pipeline comparison (catastrophe 575 games vs MCTS 3,676 games).
+
+     **Corpus builds from harvest2** (`scripts/build_catastrophe_corrections.py`,
+     NEW — converts catastrophe forks → the soft-corrections format train_crisis_ft
+     reads: tgt_prob ∝ softmax(−catastrophe/T=10) over candidates, weight = gap pp):
+     - `--all-rows` (proven "use them all" scope, min_margin=0 analog) →
+       `catastrophe_corrections_pillar3f_h2_all.pt`: **10,925 states (7,595 with
+       weight>0), top-share P50 0.20** — ≈ the proven mm10 corpus size (10,922).
+     - confirmed-only (1,682) and flagged-clean (3,371) variants also built; the
+       all-rows is the one we train (drops 1,787 R=500-negative screen false-positives).
+
+     **OPEN at write time:** task-arith on the catastrophe corpus is a NEW teacher
+     through the PROVEN channel — untested vs the MCTS teacher's +37%. Running the
+     500-seed α-sweep (`run_crisis_taskarith.sh`, CORPUS=...all.pt, EVAL 775000-775499)
+     to test transfer; results + the chosen model → next entry. Fallback if it
+     under-transfers: MCTS-relabel the SAME 725 recorded pillar3f death games via
+     `gen_corrections_parallel --model pillar3f --death-glob
+     'alphatrain/data/death_games/death_300*.json'` (the recording is reusable —
+     not wasted).
+
+171. **Catastrophe-corrections task-arith on pillar3f FAILED (wash/toxic) — the
+     rollout teacher does NOT transfer through the merge channel. Pivot to MCTS.
+     (2026-06-18.)**
+
+     **Production commands (the catastrophe attempt):**
+     1. `scripts/build_catastrophe_corrections.py --mine-glob 'logs/harvest2/mine_*.json'
+        --temp 10 --all-rows --out catastrophe_corrections_pillar3f_h2_all.pt`
+        (10,925 states / 7,595 weight>0; soft target = softmax(−catastrophe/T=10)
+        over candidates, weight = R=500 gap pp).
+     2. `scripts/run_crisis_taskarith.sh` (CORPUS=...all.pt, EVAL 775000-775499):
+        `train_crisis_ft.py --base pillar3f --epochs 15 --lr 1e-4
+        --target-temperature 0.5 --weighted` (frozen BN, ft_epoch_15) →
+        `merge_checkpoints.py --base pillar3f --crisis ft_epoch_15.pt --alpha {α}` →
+        `eval_policy 775000-775499` + `normal_play_drift.py`.
+
+     **Dose-response (500 seeds 775000-775499; base pillar3f mean 35,810 / P50 27,434
+        / P10 4,546 / <1000 1.2%):**
+        α=0.05  mean 35,117 / <1000 1.8% (9)  — slightly WORSE both
+        α=0.2   mean 33,700 / P50 25,326 / P10 4,623 / <1000 0.6% (3) — floor↓ but
+                mean −6% / median −8%; drift gate clean (healthy argmax-Δ 3.8%)
+        α=0.4   mean 16,253 — COLLAPSE; healthy argmax-Δ 26.9% (forgetting)
+        α=0.5   mean 6,529   — destroyed
+        α=0.7   mean 761     — destroyed; healthy argmax-Δ 53.8%
+     **OPPOSITE of the MCTS dose-response** (HISTORY 167: MCTS plateau α∈[0.4,0.7]
+     was the +37% sweet spot). The catastrophe task vector is TOXIC at the MCTS-proven
+     doses and survivable only at α≤0.2, where it's a WASH (no dose is a clean win:
+     0.05 slightly worse, 0.2 trades −6% mean for a noise-level floor edge).
+
+     **VERDICT:** catastrophe-rollout corrections (policy self-judgment via rollouts,
+     R=500-confirmed) are a genuinely WEAKER/different teacher than widened MCTS@4800
+     ("grandmaster moves"), and do NOT transfer through the task-arith merge channel.
+     Confirms HISTORY 168's scrambled-control conclusion that the +37% gain is
+     specifically 4800-sim knowledge — not just "any crisis correction." The 67h
+     harvest2 catastrophe mine is therefore NOT the lever; its 725 recorded pillar3f
+     death games ARE reused as the MCTS input.
+
+     **PIVOT (running): the PROVEN recipe — `gen_corrections_parallel.py --model
+     pillar3f --death-glob 'alphatrain/data/death_games/death_300*.json' --sims 4800
+     --mcts-seeds 3 --q-weight 2.0 --top-k 300 --topk-visits 20 --lo 15 --hi 85
+     --workers 16 --out-dir crisis/corrections_pillar3f`** (FV value net, no neural
+     head; script logic unchanged since commit 6bd133f — fb890b7 only ADDED clean-prior
+     recording). ~1.5 days on M5, resumable, additive corpus. Then build_corrections_
+     corpus → train_crisis_ft(pillar3f) → merge α∈[0.4,0.7] → eval + drift gate →
+     pillar3f' = pillar3f + α·MCTS_vector. Bar to beat = base pillar3f above.
+
+172. **MCTS task-arith on pillar3f FIRST CUT = NEGATIVE (the +37% does NOT reproduce
+     on a second iteration). 2026-06-22.**
+
+     **Commands:** recorded ~2,000 more pillar3f deaths (batch_record --model pillar3f
+     --tail 100, full 15-85 band) → 2,725 death games; `gen_corrections_parallel`
+     (MCTS@4800, FV value net) labeled 902 games so far → `build_corrections_corpus.py
+     --glob 'crisis/corrections_pillar3f/corr_*.json'` = **10,990 corrections / 902
+     games (12.2/game, 27% marginal)**; `train_crisis_ft.py --base pillar3f --epochs 15
+     --lr 1e-4 --target-temperature 0.5 --weighted` (frozen BN, ft_epoch_15, held-match
+     0.26 vs proven 0.35) → `merge_checkpoints.py α∈{0.2,0.4,0.5,0.7}` →
+     `eval_policy 775000-775499` (500 seeds) + `normal_play_drift.py`.
+
+     **Dose-response (base pillar3f mean 35,810 / P50 27,434 / P10 4,546 / <1000 1.2%):**
+        α=0.2  34,129 / P50 23,255 (−15%) / P10 4,750 / <1000 1.4%
+        α=0.4  32,542 / P50 23,026 / P10 4,233 / <1000 1.6%
+        α=0.5  30,615 / P50 22,290 / P10 4,512 / <1000 1.0%
+        α=0.7  23,398 / P50 15,231 / P10 2,580 / <1000 2.4%
+     **Every α mean+median NEGATIVE, monotonic. Even α=0.2 drops median 15% for a
+     noise-level P10 bump.** NOT the +37% — a wash-to-harmful (less violent than the
+     catastrophe vector but same shape). No α worth 5k-confirming.
+
+     **Two compounding hypotheses (honest, not yet isolated):** (1) DIMINISHING RETURNS
+     — pillar3f IS pillar3b + 0.5·decisive_MCTS_vector (HISTORY 167), so this is the
+     SAME recipe applied a 2nd time to a base that already absorbed 4800-sim crisis
+     knowledge; remaining corrections are marginal and perturb a converged policy.
+     (2) VALUE-HEAD-LIMITED TEACHER — gen_corrections uses the FV LINEAR value net
+     (value_head_path=None). FV-MCTS@4800 dominated the weaker pillar3b (+37%) but
+     pillar3f is ~2× stronger now; FV-MCTS may no longer beat it, so some "corrections"
+     are FV-favored moves WORSE than pillar3f's → distilling hurts. Caveat: partial
+     corpus (902/2,725); floor counts noisy at 500 seeds; but the mean/median decline
+     is robust/monotonic — more data is very unlikely to flip it to +37%.
+
+     **NEXT:** (a) finish the overnight mine (2,725 games) → rebuild → retest (cheap
+     sanity; prediction: still negative). (b) THE REAL LEAD: re-mine with the NEURAL
+     value head value_head_pillar3f.pt (gen_corrections hardcodes value_head_path=None
+     — needs a small change) so MCTS@4800 is a genuinely STRONGER teacher than the
+     converged pillar3f. (c) accept the crisis-correction lever is near its ceiling at
+     pillar3f (~30-35k mean). pillar3f stays the deployed best.
+
+173. **pillar3k — DECISIVENESS-WEIGHTED distillation BEATS pillar3f (+18% mean, +28%
+     floor). FIRST model past pillar3f; the de-peak wall is cracked.** (2026-06-23)
+
+     **Problem solved:** every full-corpus distillation into pillar3f (3g; 3k-v1 uniform)
+     de-peaked it → regression. Measured root cause: pillar3f policy peakedness ~0.40;
+     the crisis+selfplay corpus is dominated by FLAT quiet/recovered positions (selfplay
+     98% flat / 0% decisive; crisis 55% flat / 15-22% decisive >0.40). NO target-temperature
+     clears 0.40 — v14_rev2 mix sharpened top-share: T=1.0→0.23, T=0.5→0.25, T=0.25→0.30,
+     all <0.40. A strong base cannot be sharpened by a flat corpus (why 3b lifted WEAK
+     pillar3a ~0.25 but de-peaks pillar3f).
+
+     **Fix — decisiveness weighting (train_path_b.py `--decisiveness-power P`):** weight
+     each state's policy-CE by (visit top-share)**P, mean-1 normalized. Decisive
+     escape-or-die states (top-share 0.6-0.9) drive the gradient (64× a flat state at P=3);
+     flat quiet states (~0.2) get ~0 weight → CANNOT de-peak. Separates the escape signal
+     from the flat quiet bulk that sank every uniform attempt.
+
+     **Corpus v14_rev2.pt (70% crisis / 30% selfplay = 1,822,799 states):**
+       `python -m alphatrain.scripts.build_expert_v2_tensor --games-dir
+       data/crisis_v14_s600 data/crisis_v15 data/crisis_v16 data/selfplay_v14_30pct
+       --policy-only-data --output alphatrain/data/v14_rev2.pt`
+       crisis (all, the escape signal): crisis_v14_s600 (2857 games / 1.15M, @600,
+       pillar3f-generated) + crisis_v15 (132 / 54k, @600-800) + crisis_v16 (164 / 68k,
+       @4800). selfplay anchor (down-sampled 30%): 60 of 960 selfplay_v14 games (every
+       16th → symlinks data/selfplay_v14_30pct, 0.54M, pillar3f+MCTS@400). (all-zero-Q
+       warning benign: Q is Gumbel-only; 3b uses pol_values.)
+
+     **Train (Colab, train_pillar3k_colab.ipynb, 1.5h, 8× color+dihedral aug):**
+       `train_path_b --tensor-file v14_rev2.pt --amp --compile --resume pillar3f.pt
+       --warm-start --epochs 16 --batch-size 32768 --lr 3e-4 --warmup-epochs 1
+       --target-temperature 0.7 --decisiveness-power 3.0`
+
+     **Eval (eval_policy 775000-775499, 500 seeds, uncapped, fp16) vs pillar3f bar
+       (mean 35,810 / P50 27,434 / P10 4,546 / <1000 1.2%):**
+       ep10: mean 40,229 (+12%) / P50 27,182 / P10 4,392 / <1000 1.4% / max 238,539
+       ep16: mean 42,265 (+18.0%) / P50 28,329 (+3.3%) / P10 5,823 (+28.1%) /
+             <1000 1.0% / max 348,413
+     **WIN on EVERY metric — floor (P10 +28%, <1000 down) lifted WITHOUT flattening quiet
+     play (median UP +3.3%).** Still improving at ep16 (last epoch, LR→6e-6) → not converged.
+
+     **Val doubly unreliable here:** rose ep1 2.2758 → ~2.285 (looks like de-peak) yet
+     gameplay +18% — EXPECTED: val is unweighted CE dominated by the flat quiet states the
+     model now de-emphasizes by design. Gameplay is the only truth.
+
+     **NEXT:** (a) cheap (~3h): retrain current corpus more epochs (28-32) + sweep
+     DECISIVENESS {3,4} × T {0.5,0.7} → ceiling + best operating point. (b) generate more
+     v16 @4800 (decisiveness upweights the cleanest escapes; current corpus is 90% @600 /
+     under-resolved → quality of decisive states is now the lever), rebuild 70/30, retrain.
+     (c) iterate: best pillar3k → re-mine 4800 crisis on it → repeat.
+
+174. **pillar3k v2 (v14_rev3) = NEW BASELINE — beats v1 on a 5k eval. Crisis distillation
+     UNBLOCKED after months of failed attempts. Many lessons.** (2026-06-24)
+     Model: **pillar3k_r3_dw3_T0.7_epoch_22**.
+
+     **Result (eval_policy 775000-779999, 5000 seeds — 500 seeds was too noisy, showed
+     v2≈v1; only the 5k reveals the real gap):**
+       v2 ep22:  mean 43,390 / P50 31,016 / P10 5,010 / P25 13,247 / <1000 1.3% / max 337,411
+       v1 ep16:  mean 41,180 / P50 28,653 / P10 4,693 / P25 12,562 / <1000 1.2% / max 389,307
+     **v2 ep22 BEATS v1: mean +5.4%, median +8.2%, P10 +6.8%, P25 +5.5% (<1000 tied).**
+     Both ~+15-21% over the pillar3f bar (500-seed: mean 35,810 / P50 27,434 / P10 4,546).
+     **NEW BASELINE = pillar3k_r3_dw3_T0.7_epoch_22.**
+
+     **Corpus v14_rev3.pt (2,259,096 states, 70% crisis / 30% selfplay):** v14_rev2 crisis
+     pool + crisis_v16_1600 (699 games / 288k states, sims=[1600,2400] mix, cand_visits).
+       `build_expert_v2_tensor --games-dir crisis_v14_s600 crisis_v15 crisis_v16
+         crisis_v16_1600 selfplay_v14_30pct(74 games) --policy-only-data --output v14_rev3.pt`
+       `train_path_b --resume pillar3f --warm-start --epochs 28 --batch-size 32768 --lr 3e-4
+         --warmup-epochs 1 --target-temperature 0.7 --decisiveness-power 3.0` (Colab, ~2.5h)
+
+     **=== THE LESSONS (this arc broke a long impasse: 3g/3i/3k-v1 all REGRESSED pillar3f) ===**
+     1. **DECISIVENESS WEIGHTING is the unlock** (`train_path_b --decisiveness-power P`):
+        weight each state CE by (visit top-share)**P, mean-1 normalized. Decisive escapes
+        drive the gradient (~6.6× at P=3), flat quiet states get ~0.15× → they CANNOT de-peak
+        a strong base. First thing to beat pillar3f via full-corpus distillation.
+     2. **NO TEMPERATURE sharpens a flat corpus into a strong base.** Measured: v14_rev2 mix
+        sharpened top-share T=1.0→0.23 … T=0.25→0.30, ALL below pillar3f's 0.40. 3k-v1
+        (uniform, T=0.7) regressed −14% mean / −25% median. T is NOT the lever; decisiveness is.
+        (Why 3b lifted WEAK pillar3a ~0.25 but de-peaks pillar3f ~0.40.)
+     3. **FLATNESS IS POSITION TYPE, NOT SIMS:** selfplay 98% flat / 0% decisive (genuine
+        multi-good-move quiet); crisis 15-22% decisive (escape-or-die). The floor signal IS
+        the decisive escapes. Selfplay alone canNOT lift the floor (0% escapes) at any T.
+     4. **VAL IS DOUBLY UNRELIABLE under decisiveness weighting:** (a) it ROSE while gameplay
+        went +18% (val = unweighted CE dominated by the flat quiet states the model
+        de-emphasizes BY DESIGN); (b) in v2, late-epoch val DROPPING tracked the CEILING
+        (high-score tail), while the FLOOR was degrading. Gameplay is the ONLY truth.
+     5. **OVERFITTING TRADES FLOOR FOR CEILING:** v2 P50 peaked ep17 (30,237), P10 peaked
+        ep22 (5,362), BOTH declined by ep27 (P10 crashed to 4,316) while MEAN kept rising
+        (tail/max grew). Late training sharpens into longer high-score games but more brittle
+        crises (over-commits to noisy @600/1600 escape labels). PICK A MID-TRAINING epoch by
+        GAMEPLAY FLOOR — not val, not the last epoch. (ep22 won the 5k.)
+     6. **500 SEEDS IS TOO NOISY for close comparisons.** It showed v2≈v1 (wash); the 5k
+        eval revealed v2 > v1 by +5-8%. ALWAYS 5k (775000-779999) to choose between candidates.
+     7. **@600 CRISIS WORKS; 1600/2400 adds real gain; 4800 is overkill.** v1 was 90% @600
+        → +18%; cleaner @1600/2400 → another +5-8%. Cost/quality sweet spot is 1600-2400.
+     8. **SELFPLAY ANCHOR is partly redundant under decisiveness weighting** (@400 selfplay
+        ~0.15× weight) — may just dilute batch capacity. OPEN: test 85/15 crisis ratio.
+     9. **Don't be categorical from a proxy:** I claimed the new data "only added ~29k
+        decisive" from the 10% position-mix figure; the 5k eval PROVED it genuinely helped.
+        Position-mix counts peaked states, NOT escape quality/value. Validate, don't assert.
+
+     **NEXT — the iteration loop is LIVE (unblocked):** mine **crisis_v17 ON THE NEW BASELINE**
+     (pillar3k_r3_dw3_T0.7_epoch_22) — the improved policy's OWN crises = fresh decisive signal
+     (the AlphaZero self-improvement loop), unlike re-mining pillar3f's now-saturated crises.
+     Rebuild + distill → pillar3k iter 2. Side-bets: 85/15 crisis ratio (test selfplay
+     dilution, lesson 8); DECISIVENESS=4 sweep.

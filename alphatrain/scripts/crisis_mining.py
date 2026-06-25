@@ -106,7 +106,11 @@ def replay_from_snapshot(mcts, snapshot, replay_seed, num_sims,
     t0 = time.time()
     turn = 0
     capped = False
-    turns_limit = min(continue_turns, max_turns - snapshot['turn'])
+    # Replay exactly `continue_turns` from the rewind point (or until death).
+    # (Was `min(continue_turns, max_turns - snapshot['turn'])`, which went NEGATIVE
+    # for any game surviving past max_turns -> 0 replay turns -> 0 moves. The strong
+    # policy survives to 13k-37k turns, so ~70% of games produced EMPTY replays.)
+    turns_limit = continue_turns
 
     while not game.game_over and turn < turns_limit:
         board_snapshot = game.board.copy().tolist()
@@ -219,7 +223,23 @@ def _probe_worker(slot_id, seed_queue, task_queue, progress_queue,
         """Emit replay tasks (died) or a survived notice. Same semantics as
         the old per-game path: snapshot lookup by turn == max(0, T-rewind)."""
         if not died:
-            progress_queue.put((p.seed, 'survived', 0, 0))
+            # Survivors (reached policy_max_turns alive) ALSO get a deep-search replay:
+            # rewind prevention_turns, play continue_turns of MCTS self-play. Quiet/loaded
+            # positions are valuable training data ("self-play from the start"); without
+            # this the probe is wasted on survivors. Safe: the result count is drained from
+            # the task queue, not the 'survived'/'died' status, so this never hangs.
+            by_turn = {s['turn']: s for s in p.ring}
+            want = max(0, p.turn - prevention_turns)
+            snap = by_turn.get(want)
+            if snap is not None and (p.seed, 'survived') not in existing_keys:
+                snapshot = dict(snap)
+                snapshot['original_seed'] = p.seed
+                replay_seed = p.seed * 37 + prevention_turns
+                task_queue.put((snapshot, replay_seed, prevention_sims,
+                                'survived', prevention_turns))
+                progress_queue.put((p.seed, 'survived', 1, 0))
+            else:
+                progress_queue.put((p.seed, 'survived', 0, 0))
             return
         by_turn = {s['turn']: s for s in p.ring}
         tasks_pushed = 0
@@ -372,12 +392,13 @@ def main():
     p.add_argument('--continue-turns', type=int, default=500,
                    help='Max turns to play from rewind point')
     p.add_argument('--max-turns', type=int, default=5000,
-                   help='Hard cap on total game length for replay games '
-                        '(snapshot turn + replay turns ≤ max_turns).')
-    p.add_argument('--policy-max-turns', type=int, default=None,
-                   help='Cap on the policy-only probe game length. Probes '
-                        'beyond this are treated as survivors and produce '
-                        'no replay tasks. Default: falls back to --max-turns.')
+                   help='DEPRECATED / NO EFFECT. There is no total-game cap: the '
+                        'replay is bounded ONLY by --continue-turns, the probe ONLY '
+                        'by --policy-max-turns. (Kept for arg compatibility.)')
+    p.add_argument('--policy-max-turns', type=int, default=25000,
+                   help='Cap on the policy-only PROBE length (play to death OR this). '
+                        'Survivors are rewound + replayed too (good quiet self-play). '
+                        'The ONLY game-length control besides --continue-turns.')
     p.add_argument('--device', default=None)
     p.add_argument('--workers', type=int, default=1,
                    help='Parallel workers (1=serial, >1=GPU server)')
@@ -459,9 +480,7 @@ def main():
         if m:
             existing_keys.add((int(m.group(1)), m.group(2)))
 
-    policy_max_turns = (args.policy_max_turns
-                        if args.policy_max_turns is not None
-                        else args.max_turns)
+    policy_max_turns = args.policy_max_turns   # probe cap; decoupled from --max-turns
 
     # Pull model max_score from checkpoint (used by both paths to
     # configure MCTS / server).

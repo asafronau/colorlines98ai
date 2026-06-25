@@ -30,6 +30,7 @@ WORKERS = 1                             # parallel rollout workers (MPS ~1.4x; c
 COMPILE = False                         # torch.compile rollout forward (cuda only)
 REC_TAIL = 60                           # keep only last 60 frames (HI=45 + buffer) — tiny files
 MAX_SECONDS = 25000                     # ~7 h
+OUTDIR = 'logs'                         # harvest outputs (mine_*.json, teacher_labels.json, ...)
 T0 = time.time()
 
 
@@ -54,7 +55,7 @@ def run(cmd, logpath):
 
 
 def main():
-    global N_TRY, SEED_START, MAX_SECONDS, REC_CAP, LO, HI, R_CURVE, R_SCREEN, R_CONFIRM, REC_DEVICE, BATCH, WORKERS, COMPILE
+    global N_TRY, SEED_START, MAX_SECONDS, REC_CAP, LO, HI, R_CURVE, R_SCREEN, R_CONFIRM, REC_DEVICE, BATCH, WORKERS, COMPILE, MODEL, OUTDIR
     if '--smoke' in sys.argv:
         N_TRY, REC_CAP, SEED_START = 3, 8000, 51000
         LO, HI = 20, 30
@@ -70,10 +71,14 @@ def main():
     R_CONFIRM = _argint('--r-confirm', R_CONFIRM)
     WORKERS = _argint('--workers', WORKERS)
     COMPILE = '--compile' in sys.argv
+    MODEL = _argstr('--model', MODEL)
+    REC_CAP = _argint('--rec-cap', REC_CAP)
+    OUTDIR = _argstr('--out-dir', OUTDIR)
+    log(f"HARVEST model={MODEL} rec_cap={REC_CAP} out_dir={OUTDIR}")
     log(f"HARVEST: seeds {SEED_START}..{SEED_START+N_TRY-1}; depths {LO}-{HI}; "
         f"horizon {HORIZON}; R curve/screen/confirm={R_CURVE}/{R_SCREEN}/{R_CONFIRM}; "
         f"rec_cap={REC_CAP}; max={MAX_SECONDS}s")
-    os.makedirs('logs', exist_ok=True)
+    os.makedirs(OUTDIR, exist_ok=True)
     os.makedirs('alphatrain/data/death_games', exist_ok=True)
 
     swept = []
@@ -81,7 +86,7 @@ def main():
         if time.time() - T0 > MAX_SECONDS:
             log(f"TIME GUARD ({MAX_SECONDS}s) — stop launching."); break
         gpath = f'alphatrain/data/death_games/death_{seed}.json'
-        mpath = f'logs/mine_{seed}.json'
+        mpath = f'{OUTDIR}/mine_{seed}.json'
         if os.path.exists(mpath):            # idempotent resume — already mined
             log(f"seed {seed}: already mined — skip")
             continue
@@ -91,7 +96,7 @@ def main():
             run([PY, 'scripts/find_worst_game.py', '--model', MODEL,
                  '--record-seed', str(seed), '--max-turns', str(REC_CAP),
                  '--record-tail', str(REC_TAIL),
-                 '--device', REC_DEVICE, '--out', gpath], 'logs/harvest_record.log')
+                 '--device', REC_DEVICE, '--out', gpath], f'{OUTDIR}/harvest_record.log')
         if not os.path.exists(gpath):
             log(f"seed {seed}: record failed; skip."); continue
         g = json.load(open(gpath))
@@ -108,7 +113,7 @@ def main():
                   '--workers', str(WORKERS)] +
                  (['--compile'] if COMPILE else []) +
                  ['--fp16', '--out', mpath],
-                 f'logs/harvest_mine_{seed}.log')
+                 f'{OUTDIR}/harvest_mine_{seed}.log')
         if os.path.exists(mpath):
             swept.append((seed, g, mpath))
         log(f"seed {seed}: mine rc={rc} ({len(swept)} done)")
@@ -139,8 +144,8 @@ def main():
 
     json.dump({'model': MODEL, 'horizon': HORIZON, 'n_rows': len(rows),
                'n_move_labels': sum(len(r['cand_rates']) for r in rows), 'rows': rows},
-              open('logs/teacher_labels.json', 'w'), default=float)
-    json.dump({'per_seed': per_seed}, open('logs/harvest_summary.json', 'w'),
+              open(f'{OUTDIR}/teacher_labels.json', 'w'), default=float)
+    json.dump({'per_seed': per_seed}, open(f'{OUTDIR}/harvest_summary.json', 'w'),
               indent=1, default=float)
 
     n = len(swept)
@@ -154,7 +159,7 @@ def main():
         log(f"  seed {s['seed']:>6}: death {s['death'][0]}@{s['death'][1]}; "
             f"band {s['band']}; {s['n_real']} fork(s) "
             f"{[(f['depth'], round(f['gap'])) for f in s['real_forks']]}")
-    log("Wrote logs/teacher_labels.json + logs/harvest_summary.json")
+    log(f"Wrote {OUTDIR}/teacher_labels.json + {OUTDIR}/harvest_summary.json")
     log("DONE.")
 
 

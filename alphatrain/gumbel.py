@@ -104,3 +104,47 @@ def completed_q_target(cand_visit, cand_prior, cand_q, cand_nnz, root_value, *,
 
     weight = 1.0 + gamma * is_correction.float()
     return target_p, prior_p, weight, is_correction, support
+
+
+def vetted_override_target(cand_visit, cand_prior, cand_nnz, *, min_margin=0.0):
+    """DECISION distillation (the "vetted override" experiment, 3i_a).
+
+    Treat the search as a vetting process: if the search's most-visited move (its actual
+    decision) equals the prior's argmax, the prior is already good enough at this sim
+    budget — skip the state (weight 0). If the search picks a DIFFERENT move, that's a
+    high-SNR prior-blunder signal — hard one-hot BC toward the search's move.
+
+    This is NOT the soft visit distribution (smearing) nor completed-Q (which distilled the
+    REJECTED low-visit move). The target is the teacher's ACTUAL decision = argmax(visits).
+
+    Returns the same 5-tuple as completed_q_target so it drops into the dataset/trainer:
+        target_p (B,K)  ONE-HOT at the search's most-visited candidate (the override move)
+        prior_p  (B,K)  softmax(cand_prior) over valid candidates  (anchor reference)
+        weight   (B,)   1.0 on override states (argmax visits != argmax prior), else 0.0
+        is_override (B,) bool
+        support  (B,K) bool  valid candidates (candidate-restricted CE support)
+
+    Agreement states get weight 0; the trainer's `--beta` adds an optional tiny CE-to-prior
+    anchor on ALL states (prevents the backbone from drifting on the 84% it already gets
+    right). beta=0 = "ignore agreement" (drop); beta>0 = "tiny KL-anchor to prior".
+    `min_margin`>0 additionally requires the override move to beat the prior's move by that
+    visit-share margin (only count CONFIDENT overrides, not flat-distribution coin-flips).
+    """
+    B, K = cand_visit.shape
+    ar = torch.arange(K, device=cand_visit.device).unsqueeze(0)
+    valid = ar < cand_nnz.unsqueeze(1)
+    neg = torch.full_like(cand_prior, NEG_INF)
+    v_masked = torch.where(valid, cand_visit, torch.full_like(cand_visit, NEG_INF))
+    p_masked = torch.where(valid, cand_prior, neg)
+    va = v_masked.argmax(dim=1)                 # search's most-visited (played) move
+    pa = p_masked.argmax(dim=1)                 # prior's top move
+    override = (va != pa)
+    if min_margin > 0.0:
+        vis = torch.where(valid, cand_visit, torch.zeros_like(cand_visit))
+        vis = vis / vis.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        rows = torch.arange(B, device=cand_visit.device)
+        override = override & ((vis[rows, va] - vis[rows, pa]) >= min_margin)
+    target_p = F.one_hot(va, num_classes=K).float()     # hard one-hot at the override move
+    prior_p = F.softmax(p_masked, dim=1)
+    weight = override.float()
+    return target_p, prior_p, weight, override, valid

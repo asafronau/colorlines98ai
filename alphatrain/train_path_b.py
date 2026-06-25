@@ -88,7 +88,7 @@ def cross_entropy_soft(logits, targets):
 
 
 def distillation_loss(logits, soft_targets, blend_alpha=1.0,
-                      target_temperature=1.0):
+                      target_temperature=1.0, decisiveness_power=0.0):
     """Cross-entropy on a visit-distribution target.
 
     target_temperature=1.0 (default): targets used as-stored.
@@ -97,17 +97,31 @@ def distillation_loss(logits, soft_targets, blend_alpha=1.0,
         +57% lift over baseline.
     blend_alpha<1.0: convex blend of soft target CE and hard CE on argmax.
         Rarely used; legacy from pre-sharpening experiments.
+    decisiveness_power>0: weight each state's CE by its RAW visit peakedness
+        (top-share)**power, normalized to mean 1. Decisive escape-or-die states
+        (top-share ~0.6-0.9) dominate the gradient; flat quiet states (top-share
+        ~0.2, "many moves okay") get near-zero weight so they CANNOT flatten the
+        policy. This separates the floor signal from the flat quiet bulk that
+        de-peaks a strong base under uniform full-corpus distillation.
     """
+    w = None
+    if decisiveness_power > 0.0:
+        # peakedness from the RAW (pre-sharpen) target = the position's decisiveness.
+        raw_top = soft_targets.max(dim=-1).values.clamp(min=1e-6)   # (B,)
+        w = raw_top.pow(decisiveness_power)
+        w = w / w.mean().clamp(min=1e-8)                            # mean -> 1
     if target_temperature != 1.0:
         sharp = soft_targets.pow(1.0 / target_temperature)
         sharp = sharp / sharp.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         soft_targets = sharp
     log_probs = F.log_softmax(logits, dim=-1)
-    soft = -(soft_targets * log_probs).sum(dim=-1).mean()
+    per = -(soft_targets * log_probs).sum(dim=-1)                   # (B,)
+    soft = (w * per).mean() if w is not None else per.mean()
     if blend_alpha >= 1.0:
         return soft
     argmax_idx = soft_targets.argmax(dim=-1)
-    hard = F.cross_entropy(logits, argmax_idx)
+    hard_per = F.cross_entropy(logits, argmax_idx, reduction='none')
+    hard = (w * hard_per).mean() if w is not None else hard_per.mean()
     return blend_alpha * soft + (1.0 - blend_alpha) * hard
 
 
@@ -126,7 +140,7 @@ _GRAD_AUDIT = []   # accumulates (|g_main|, |g_aux|, lam, cos) for --grad-audit
 
 def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                  log_interval=100, blend_alpha=1.0, target_temperature=1.0,
-                 aux=None, epoch=0, grad_audit=0):
+                 aux=None, epoch=0, grad_audit=0, decisiveness_power=0.0):
     """One epoch. Optionally adds the listwise margin aux loss.
 
     `aux`, when not None, is a dict with:
@@ -160,7 +174,8 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
             main_loss = distillation_loss(
                 logits, pol_tgt,
                 blend_alpha=blend_alpha,
-                target_temperature=target_temperature)
+                target_temperature=target_temperature,
+                decisiveness_power=decisiveness_power)
 
             if aux is not None:
                 lam = _aux_lambda_schedule(
@@ -450,6 +465,11 @@ def main():
     p.add_argument('--target-temperature', type=float, default=1.0,
                    help='Sharpen targets via t**(1/T) renormalized. '
                         '1.0=no change. 0.5=produced sharp_50 win (HISTORY 154).')
+    p.add_argument('--decisiveness-power', type=float, default=0.0,
+                   help='Weight each state CE by (visit top-share)**power, mean-1 '
+                        'normalized. >0 makes DECISIVE escape states drive the gradient '
+                        'and flat quiet states near-zero weight (so they cannot de-peak '
+                        'a strong base). Try 3.0. 0=off (uniform).')
     p.add_argument('--blend-alpha', type=float, default=1.0,
                    help='Convex blend of soft CE and hard argmax CE. 1.0=soft '
                         'only (default). Rarely useful.')
@@ -645,6 +665,10 @@ def main():
     if args.target_temperature != 1.0:
         print(f"Target sharpening: T={args.target_temperature} "
               f"(targets**(1/{args.target_temperature}))", flush=True)
+    if args.decisiveness_power > 0.0:
+        print(f"Decisiveness weighting: (top-share)**{args.decisiveness_power} "
+              f"(decisive escape states drive the gradient; flat quiet states "
+              f"near-zero weight)", flush=True)
     if args.blend_alpha != 1.0:
         print(f"Blended CE: alpha={args.blend_alpha} "
               f"(blend_alpha*soft + (1-blend_alpha)*hard)", flush=True)
@@ -863,7 +887,8 @@ def main():
                                   scaler, amp_dtype,
                                   blend_alpha=args.blend_alpha,
                                   target_temperature=args.target_temperature,
-                                  aux=aux, epoch=epoch, grad_audit=args.grad_audit)
+                                  aux=aux, epoch=epoch, grad_audit=args.grad_audit,
+                                  decisiveness_power=args.decisiveness_power)
         vl = validate(model, val_loader, device, amp_dtype=amp_dtype)
         scheduler.step()
 
