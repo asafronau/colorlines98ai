@@ -49,7 +49,11 @@ def top_moves(net, dtype, ds, idx, K=5):
         bd = ds.boards[b].cpu().numpy().astype(np.int8)
         for i in range(len(b)):
             k, fi, pr = _legal_priors_jit(bd[i], lg[i], K)
-            res.append([int(x) for x in fi[:k]] if k > 0 else [])
+            if k == 0:
+                res.append([])
+                continue
+            order = np.argsort(-pr[:k])
+            res.append([int(fi[j]) for j in order])
     return res
 
 
