@@ -553,10 +553,14 @@ def main():
                    help='Skip MCTS pick if visit count is too close to '
                         "policy's pick (0.2 = 20%%). 0 = always trust MCTS.")
     p.add_argument('--max-turns', type=int, default=1_000_000,
-                   help='Turn cap. Default 1,000,000 = effectively no cap '
-                        '(games play to natural death, per project policy; no '
-                        'game reaches this — max observed ~70k turns). Lower '
-                        'it only to bound wall-clock on a quick smoke.')
+                   help='Turn cap for the MCTS player. Default 1,000,000 = '
+                        'effectively no cap (games play to natural death). Lower '
+                        'it to bound the (expensive) search wall-clock, e.g. '
+                        '50000 for a 400-sim run.')
+    p.add_argument('--policy-max-turns', type=int, default=None,
+                   help='Separate turn cap for the POLICY player only. Default = '
+                        'follow --max-turns. Set high (e.g. 1000000) to run the '
+                        'policy uncapped while --max-turns caps the costly MCTS.')
     p.add_argument('--device', default=None,
                    help='mps/cuda/cpu. Auto-detect if not set.')
     p.add_argument('--workers', type=int, default=1,
@@ -600,10 +604,13 @@ def main():
                         '--fp32 for an exactly-reproducible recording.')
     args = p.parse_args()
 
-    # Cap policy games at --max-turns (the worker had no cap → strong games
-    # ran to thousands of turns). Threaded via env to avoid touching the
+    # Policy cap: defaults to --max-turns (the MCTS cap) but can be DECOUPLED via
+    # --policy-max-turns — e.g. run the policy uncapped to natural death while
+    # --max-turns caps the expensive MCTS. Threaded via env to avoid touching the
     # worker signature. A game hitting the cap is NOT a natural death.
-    os.environ['POLICY_MAX_TURNS'] = str(args.max_turns)
+    policy_max_turns = (args.policy_max_turns if args.policy_max_turns is not None
+                        else args.max_turns)
+    os.environ['POLICY_MAX_TURNS'] = str(policy_max_turns)
 
     # Recording is wired into the policy worker via env var (avoids touching
     # the worker process signature). Only meaningful with the policy player.
