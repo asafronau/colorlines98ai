@@ -435,6 +435,11 @@ def main():
     p.add_argument('--batch-size', type=int, default=32768)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--warmup-epochs', type=int, default=1)
+    p.add_argument('--flat-epochs', type=int, default=0,
+                   help='Hold LR flat at peak for N epochs AFTER warmup and '
+                        'BEFORE cosine decay. For from-scratch distillation that '
+                        'is still climbing, keep LR flat for ~70%% of training, '
+                        'then cosine-decay the rest (Gemini recipe).')
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
@@ -637,11 +642,21 @@ def main():
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0,
         total_iters=args.warmup_epochs)
+    scheds = [warmup]
+    milestones = [args.warmup_epochs]
+    if args.flat_epochs > 0:
+        # Hold LR flat at peak after warmup, before cosine (Gemini: for a
+        # from-scratch student still climbing, decaying early starves it).
+        scheds.append(torch.optim.lr_scheduler.ConstantLR(
+            optimizer, factor=1.0, total_iters=args.flat_epochs))
+        milestones.append(args.warmup_epochs + args.flat_epochs)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, args.epochs - args.warmup_epochs),
+        optimizer,
+        T_max=max(1, args.epochs - args.warmup_epochs - args.flat_epochs),
         eta_min=args.lr * 0.01)
+    scheds.append(cosine)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, [warmup, cosine], milestones=[args.warmup_epochs])
+        optimizer, scheds, milestones=milestones)
 
     if (args.resume and not args.warm_start and ckpt is not None
             and 'optimizer' in ckpt):
