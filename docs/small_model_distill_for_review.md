@@ -1,42 +1,44 @@
-# Small-model policy distillation underperforming — peer review
+# Small-model policy distillation is too slow/weak — peer review (v2, full context)
 
-**Domain:** Color Lines 98 (9×9, 7 colors, stochastic i.i.d.-uniform ball spawns). Single-player survival game; score ≈ turns survived; no turn cap; effectively infinite for a strong policy. The deployed model is **policy-only, greedy at inference** (argmax over legal moves), no search.
+**Domain:** Color Lines 98 (9×9 board, 7 colors, stochastic i.i.d.-uniform ball spawns). Single-player survival game; score ≈ turns survived; no turn cap; effectively infinite for a strong policy. Deployed model is **policy-only, greedy at inference** (argmax over legal moves), no search.
 
 ## Goal
-Compress the best policy **pillar3k** (ResNet, 10 blocks × 256 ch, ~11.9M params, mean ≈ 43,000 over 5k seeds) into a **4× smaller** student (10 blocks × 128 ch, ~3.0M params) for browser deployment + faster self-play generation. A few-% score loss is acceptable.
+Compress the best policy **pillar3k** (PreAct-ResNet, **10 blocks × 256ch, ~11.9M params**, mean ≈ **43,000** over 5k seeds) into a **4× smaller student (10 blocks × 128ch, ~3.0M params)** for browser deploy + faster generation. A few-% score loss is fine. (Param counts: 256ch=11.9M, 192ch=6.7M, 128ch=3.0M.)
 
-## Method (policy distillation, from scratch)
-- **Corpus:** 3.85M board states (broad self-play "normal" play + crisis/near-death states), each **relabeled with pillar3k's top-5 legal-move policy** (softmax over legal moves, top-5 indices + probs stored).
-- **Train:** student matches the teacher's policy via soft cross-entropy. `batch=4096, lr=1e-3, 3-epoch warmup + cosine decay over 40 epochs, color+dihedral augmentation (×8), target_temperature=0.5 (sharpens the teacher target).` From scratch (no warm-start — architecture differs from any 256-ch checkpoint, so teacher weights can't be copied).
+## Method (current)
+- **Corpus:** 3.85M board states (broad self-play "normal" play + crisis/near-death states), each **relabeled with pillar3k's top-5 legal-move policy** (softmax over legal moves; top-5 indices+probs stored). Targets are *deterministic* (teacher is fixed).
+- **Train (`train_path_b`):** student matches the teacher's policy via soft cross-entropy (sparse top-5 target scattered into 6561-logit space, then soft-CE). From scratch. `batch=4096, lr=1e-3, 3-epoch warmup + cosine, color+dihedral aug (×8), target_temperature=0.5`. Arch: stem(conv→BN→relu) → 10×[BN→relu→conv→BN→relu→conv +residual] → BN→relu → policy head(conv 256→128, BN, conv 128→81) → 6561 logits.
 
-## Symptom: it learns, but slowly, and seems to be converging well short of the teacher
-Per-epoch, **argmax-match to teacher** (student's top legal move == teacher's top legal move, measured on the training states) and **greedy gameplay mean**:
+## The symptom
+The student **learns but slowly, and underfits the TRAINING distribution**, converging far short of the teacher. Best run (batch 4096, T=0.5, cosine):
 
-| epoch | argmax-match | top-3 match | gameplay mean |
+| epoch | argmax-match to teacher | top-3 match | gameplay mean |
 |---|---|---|---|
 | 5  | 18.9% | 39.9% | 1,835 |
 | 10 | 22.8% | 44.6% | 4,692 |
 | 15 | 23.9% | 45.9% | 7,414 |
 
-- Gameplay is **still climbing** (~linear, +2,700/5 epochs; max single game 40,818) — not a flat plateau.
-- But argmax-match is **decelerating hard** (+3.9 then +1.1) and the absolute match (~24%) is low for a 4× distillation. Note: the teacher's policy is **soft** (mean top-move probability ≈ 0.34 — many genuine near-ties), so exact-argmax match may understate the student.
-- This is **underfitting on the training distribution itself** (not just distribution shift): ~24% argmax-match after ~113k optimizer steps.
+- Gameplay climbs (~linear early) but is ~**10–17% of the teacher's** (43k). argmax-match **decelerates and seems to plateau ~24%**, measured **on the training states themselves** (so this is underfitting, not just distribution shift).
+- Teacher's policy is **soft** (mean top-move prob ≈ 0.34, many near-ties), so exact-argmax may understate the student — but a 24% match + 4–7k gameplay after many epochs is the core concern.
+- The student's output is **much flatter** than the teacher's (logit-std across states ≈ 1.5–3 vs teacher's 15.9 when healthy).
 
-## Prior mistakes already ruled out (so you can skip them)
-- It is **not** step-starvation: an earlier run at batch 32768 gave ~470 steps/epoch and barely learned (10% match); dropping to batch 4096 (~7,500 steps/epoch, the project's proven from-scratch recipe) is what produced the climb above.
-- It is **not** a load/arch bug: eval auto-detects the 128-ch arch and the student plays real games.
-- Temperature was tested at T=1.0 and T=0.5 **only while step-starved**, so neither is a clean result.
+## What we've ALREADY tried and RULED OUT (please don't re-suggest)
+1. **Batch / optimizer-step starvation — FIXED.** Big batch (32768/65536) gave ~470 steps/epoch and barely learned; from-scratch convergence is gated by # steps. Dropped to **batch 4096** (~7,300 steps/epoch, the project's proven from-scratch batch) → the climb above. (Confirmed: bigger batch is worse here.)
+2. **Target temperature — NON-ISSUE.** T=1.0 and T=0.5 give ~identical early gameplay (ep8: T=1.0→3,030, T=0.5→~3,100). Temperature is not the lever.
+3. **Flat-LR (Hinton-KD-style "soften + hold LR flat 70%") — CATASTROPHIC.** With T=1.0 + lr held flat at 1e-3 for ~62 epochs, the model was healthy at ep8 (mean 3,030) but **collapsed by ep86**: val_loss 1.647 ("best") yet gameplay mean **1**, logit-std 1.5 (flat/degenerate). A from-scratch net held at high LR with no decay drifts into a flat minimum. (Lesson: **val_loss / KL is a TRAP here** — a flat policy minimizes soft-CE but plays dead; track gameplay.) Reverted to plain cosine.
+4. **Truncation warm-start (copy teacher's first-128 of 256 channels + √2 scale reduced-input convs + BN recalibration) — FAILED.** Verified *before* training: argmax-match to teacher = **0.2%, identical to random init**. Trained-ResNet channels aren't importance-ordered, so a front-slice isn't a working sub-network. (No cheap warm-start available — widths differ.)
+5. **MCTS-visit targets** — deprioritized (this is compression, not improvement; teacher is policy-only/greedy anyway).
+6. **Capacity** — a prior reviewer argued 3.0M is plenty for a 9×9 local-feature board (not Go). We tentatively agree (gameplay still climbing, not flat-plateaued), but a 192ch (6.7M) control is cheap to run if you think capacity is the wall.
 
-## Our read
-We suspect it is **NOT capacity** (knowledge distillation at 4× usually transfers well; the teacher itself is still improving via its own iteration loop; gameplay is still climbing). We suspect the **recipe/approach** is suboptimal for from-scratch distillation.
+## The core question
+**Why does from-scratch distillation of a strong greedy policy into a 4×-smaller net underfit the training distribution (~24% argmax / 4–7k vs 43k gameplay) and converge so slowly — and what is the highest-leverage fix?** We can't warm-start (width mismatch) and step-count is already maxed (batch 4096). Specific candidates we'd like graded:
 
-## Questions
-1. **Target temperature (primary):** We *sharpen* the teacher target (T=0.5). Classic KD *softens* (T≥1) to transfer dark knowledge. For a **from-scratch** student that plays **greedy** at inference, which wins — sharper targets (better argmax commitment) or softer targets (richer learning signal)? Is sharpening actively hurting here?
-2. **From-scratch vs warm-start:** We can't copy teacher weights (256→128 width mismatch). Is there a better init/curriculum for compressing a *converged, lineage-built* policy into a smaller width — e.g. teacher-assistant distillation (256→192→128), progressive width pruning + fine-tune, or learning a width-projection? Or is from-scratch genuinely just slow and we should train far longer (80–120 epochs)?
-3. **LR schedule:** Cosine-to-zero over 40 epochs decays LR while gameplay is still climbing linearly. Extend epochs / use a higher LR floor / one-cycle? How would you set it for a model clearly not yet converged?
-4. **Target signal:** We distill the teacher's *greedy policy* (top-5). Would distilling the *MCTS visit distributions* (the richer search-improved targets that originally trained the lineage) be a materially better learning signal for the small student, despite being more work?
-5. **Is the 24% argmax-match a red herring** given the teacher's soft policy (top-share 0.34)? Is greedy gameplay the only metric we should optimize/track, and if so how do we predict the plateau without full evals?
-6. **Capacity sanity check:** For a 9×9 board policy, is 3.0M params (10×128) plausibly enough to match an 11.9M (10×256) teacher to within a few % of gameplay, or is ~4× compression of a strong policy known to be lossy here?
+1. **Feature/hint distillation (FitNets-style):** also match the teacher's *intermediate activations* (with a learned 128→256 projection), not just the output policy. Is this the standard cure for slow small-model distillation here, and where should the hint losses attach (after each block? backbone output?)?
+2. **DAgger / on-policy relabel:** the student errs → reaches states the teacher's training corpus never covered → no signal there. Relabel the *student's own* game states with the teacher and add them. Worth it given the underfit is partly on-distribution?
+3. **Just train far longer:** is ~24% match at ep15 actually on track to 70–85% by ep150–300, i.e. is this just the expected slow tail of from-scratch compression, and we should be patient (it's still climbing)?
+4. **Architecture:** for a fixed ~3M budget, is 10×128 the wrong shape — would deeper-narrower, wider-shallower, or a different head help a small net mimic a deep teacher?
+5. **Loss:** pure soft-CE on top-5. Would full-distribution KL (all 6561, temperature-scaled), or adding a hard-CE-on-teacher-argmax term, materially help the *argmax* fidelity that greedy play needs?
+6. **Is 4× simply too aggressive** for this policy, such that 192ch (6.7M, 1.77× smaller) is the realistic floor?
 
 ## Data we can produce on request
-Per-epoch match + gameplay curves; a clean T=0.5-vs-1.0 A/B at batch 4096; a 192-ch (6.7M) capacity-control run; DAgger (student-state relabel) results; MCTS-visit-target variant.
+Per-epoch match+gameplay curves; KL/val curves; a 192ch control; FitNets feature-distillation run; DAgger run; full-KL vs top-5 ablation; the teacher and a few student checkpoints.
