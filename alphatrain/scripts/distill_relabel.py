@@ -73,8 +73,9 @@ def main():
             if k == 0:
                 continue
             kk = int(min(k, K))
-            pol_idx[s + i, :kk] = flat_idx[:kk]
-            pol_val[s + i, :kk] = priors[:kk]
+            order = np.argsort(-priors[:kk])
+            pol_idx[s + i, :kk] = flat_idx[:kk][order]
+            pol_val[s + i, :kk] = priors[:kk][order]
             pol_nnz[s + i] = kk
         if (s // a.batch) % 20 == 0:
             done = e
