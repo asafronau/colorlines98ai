@@ -10,6 +10,16 @@ endif()
 # LibTorch ships *inside* your Python venv's torch package — no separate
 # download. Point CMake at it on the command line (see README):
 #   cmake -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')"
+set(Python3_EXECUTABLE "${CMAKE_SOURCE_DIR}/../../.venv/bin/python")
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c
+        "import torch; print(torch.utils.cmake_prefix_path)"
+        OUTPUT_VARIABLE TORCH_CMAKE_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+list(APPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX}")
+
 find_package(Torch REQUIRED)
 
 add_executable(infer src/main.cc)
