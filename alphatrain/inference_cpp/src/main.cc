@@ -14,6 +14,7 @@
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 using Clock = std::chrono::high_resolution_clock;
@@ -47,7 +48,21 @@ static double BenchMs(torch::jit::Module& net, torch::Tensor input,
   return std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
 }
 
+// THE reusable core native_selfplay / crisis_mining / eval_policy call:
+// score a batch of boards, return one *legal* move per board.
+//   obs   : [B,18,9,9] float   legal : [B,6561] float (1=legal)   (same device)
+//   -> [B] int64 move indices (src*81 + tgt), on that device.
+static torch::Tensor BestMoves(torch::jit::Module& net, torch::Tensor obs,
+                               torch::Tensor legal) {
+  float neg_inf = -std::numeric_limits<float>::infinity();
+  torch::Tensor logits = net.forward({obs}).toTensor();   // [B,6561]
+  return logits.masked_fill(legal < 0.5f, neg_inf).argmax(1);  // [B]
+}
+
 int main() {
+  // Pure inference: skip all autograd bookkeeping (faster, less memory).
+  torch::InferenceMode guard;
+
   const bool have_mps = torch::mps::is_available();
   torch::Device cpu(torch::kCPU), mps(torch::kMPS);
 
@@ -75,6 +90,25 @@ int main() {
   std::cout << "CPU  move=" << cpu_logits.argmax().item<int>()
             << "  max|diff| vs PyTorch = "
             << (cpu_logits - want_t).abs().max().item<float>() << "\n";
+
+  // Load the legal mask (1.0 = legal, 0.0 = illegal) the game engine would give us.
+  std::vector<float> legal = ReadFloats("data/example_legal.f32", kLogits);
+  torch::Tensor legal_t = torch::from_blob(legal.data(), {kLogits}).clone();
+
+  // masked_fill: wherever the mask is "off", overwrite that logit with -inf.
+  // Then argmax cannot land on an illegal move.
+  float neg_inf = -std::numeric_limits<float>::infinity();
+  torch::Tensor masked = cpu_logits.masked_fill(legal_t < 0.5f, neg_inf);
+  int legal_move = masked.argmax().item<int>();
+  std::cout << "legal move = " << legal_move << "  (should be 4166)\n";
+
+  // Same thing via the reusable batched API, on a batch of 4 copies.
+  net.to(cpu);
+  torch::Tensor obs_b = obs.repeat({4, 1, 1, 1});
+  torch::Tensor legal_b = legal_t.unsqueeze(0).repeat({4, 1});
+  torch::Tensor moves = BestMoves(net, obs_b, legal_b);
+  std::cout << "BestMoves (batch of 4) = " << moves.view({4}) << "\n";
+
 
   // 4) Correctness on MPS (the GPU). Expect a *tiny* diff (~1e-5): GPU kernels
   //    aren't bit-identical to CPU. Same argmax = same move, which is what counts.
