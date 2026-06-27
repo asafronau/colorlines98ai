@@ -126,14 +126,23 @@ int main(int argc, char** argv) {
       slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
       slots[i].game.LegalMask(legal_buf.data() + (size_t)i * clines::kActions);
     }
-    torch::Tensor obs = torch::from_blob(obs_buf.data(), {n, 18, 9, 9}).to(dev);
-    if (use_half) obs = obs.to(torch::kHalf);  // input must match the net dtype
-    // legal stays fp32: `legal < 0.5` is a bool mask, so masked_fill works on
-    // the fp16 logits regardless of the mask's own dtype.
-    torch::Tensor legal = torch::from_blob(legal_buf.data(), {n, clines::kActions}).to(dev);
+    // --- Shrink the CPU->GPU transfer (the profiled copy_and_sync bottleneck) ---
+    // Obs: convert fp32->fp16 on the CPU *before* uploading, so we ship half the
+    // bytes. (Uploading fp32 then .to(kHalf) on the GPU pays the full fp32
+    // transfer plus an extra GPU kernel.)
+    torch::Tensor obs = torch::from_blob(obs_buf.data(), {n, 18, 9, 9});
+    if (use_half) obs = obs.to(torch::kHalf);
+    obs = obs.to(dev);
+    // Legal mask: it's just 0/1, so upload it as uint8 (1 byte) instead of fp32
+    // (4 bytes) -> 4x less, and it's the single biggest per-step transfer.
+    // `legal == 0` is then the bool "illegal" mask for masked_fill (works on the
+    // fp16 logits regardless of the mask's own dtype).
+    torch::Tensor legal = torch::from_blob(legal_buf.data(), {n, clines::kActions})
+                              .to(torch::kByte)
+                              .to(dev);
     torch::Tensor logits = net.forward({obs}).toTensor();
     float ninf = -std::numeric_limits<float>::infinity();
-    torch::Tensor moves = logits.masked_fill(legal < 0.5f, ninf).argmax(1).to(torch::kCPU);
+    torch::Tensor moves = logits.masked_fill(legal == 0, ninf).argmax(1).to(torch::kCPU);
     auto mv = moves.accessor<int64_t, 1>();
     ++fwd;
 
