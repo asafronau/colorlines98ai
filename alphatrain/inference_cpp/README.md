@@ -1,49 +1,55 @@
 # Color Lines 98 — C++ policy inference
 
-A from-scratch C++ forward pass for the `PolicyNet` (the deployed Color Lines
-policy), built against [abseil](https://abseil.io). Goal: a small, dependency-light
-inference engine that runs the policy fast at batch=1 on CPU (the AI-hint regime)
-and compiles to WASM for the browser. Training stays in Python; this is inference only.
+Run the deployed policy net from C++ using **LibTorch** (PyTorch's official C++
+API). Training stays in Python; this is inference only. The whole engine is
+`src/main.cc` (~40 lines) — LibTorch provides conv/batchnorm/relu, so there is
+no math to hand-write.
 
-## Layout
-```
-export_weights.py   # Python: dump PolicyNet -> data/weights.bin + a golden test vector
-CMakeLists.txt      # build (fetches abseil)
-src/net.h / net.cc  # Tensor, blob loader, ops (Conv2d done; BN/ReLU/Forward TODO)
-src/main.cc         # milestone harness: run an op, diff against the golden
-```
+## Why LibTorch
+The model is already a PyTorch net. We export it once to a self-contained
+TorchScript file (`policy_ts.pt`), and C++ just loads and runs it. LibTorch
+already lives inside your venv's `torch` package, so there's nothing extra to
+download.
 
 ## Build & run
 ```bash
-# 1) export weights + golden from a checkpoint (run from the repo root, venv active)
-python -m alphatrain.inference_cpp.export_weights \
+# 0) from the repo root, venv active
+source .venv/bin/activate
+
+# 1) export the net + a test vector (TorchScript module + example obs/logits)
+python -m alphatrain.inference_cpp.export_ts \
     --model alphatrain/data/pillar3k_small128_epoch_15.pt
 
-# 2) build (first build compiles abseil; ~minutes)
+# 2) configure + build (point CMake at the LibTorch inside your venv)
 cd alphatrain/inference_cpp
-cmake -B build && cmake --build build -j
+cmake -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')"
+cmake --build build -j
 
-# 3) run (from this dir so it finds data/)
+# 3) run (from this dir, so it finds data/)
 ./build/infer
 ```
-Expected at Milestone 1: `stem conv: max|diff| = …e-07 -> PASS ✅`.
+Expected output:
+```
+predicted move index <n>  (source cell .., target cell ..)
+max|diff| vs PyTorch = 0.000…   PASS ✅
+```
 
-## Implementation milestones
-The forward pass is built op-by-op; the **golden vector** (PyTorch output on a real
-board, in `data/golden.bin`) is the correctness oracle at each step.
+## Files
+```
+export_ts.py     Python: PolicyNet -> data/policy_ts.pt + example_obs/logits.f32
+CMakeLists.txt   build (finds LibTorch in the venv)
+src/main.cc      load policy_ts.pt, run forward, print the move, check vs PyTorch
+data/            generated artifacts (git-ignored)
+from_scratch/    OPTIONAL deep-dive: the same net hand-written op-by-op with
+                 abseil (conv/BN/relu from scratch). Great for understanding the
+                 internals later; not needed for the working engine.
+```
 
-1. **Stem conv** — `Conv2d(obs, stem.0.weight, pad=1)` vs `golden["stem_conv_out"]`. *(done — the harness checks it)*
-2. **ReLU** — `net.cc::ReluInPlace`. (one-liner)
-3. **BatchNorm** — `net.cc::BatchNorm` (per-channel affine, inference form). Verify a stem→BN→ReLU chain against a golden you add for it.
-4. **ResBlock** — pre-activation residual; compose into the body loop.
-5. **Head + reshape** — 1×1 convs to 81 channels → 6561 logits.
-6. **`Forward`** — wire it all up; flip `kRunFullForward` in `main.cc` and match `golden["logits"]` to ~1e-2.
-7. **Obs builder** — port `_build_obs_core` (board+next_balls → 18×9×9) so C++ runs end-to-end from a board, not a precomputed obs.
-
-Later (after correctness): legal-move masking + argmax (the actual move), then
-optimization (contiguous loops, SIMD, fixed-size buffers), then an Emscripten/WASM target.
-
-## Binary format (`CLNW`)
-`magic 'CLNW'`, `uint32 num_tensors`, then per tensor: `uint32 name_len`, name,
-`uint32 ndim`, `int32[ndim] dims`, `float32[prod] data` (row-major). Both
-`weights.bin` and `golden.bin` use it; `net.cc::LoadBlob` reads it.
+## What's next (small, in order)
+1. **Run it** — confirm the PASS above.
+2. **Argmax over *legal* moves** — the real game masks illegal source/target
+   cells before argmax. Port that mask so the move is always playable.
+3. **Obs builder in C++** — port `_build_obs_core` (board + next balls → 18×9×9)
+   so C++ runs end-to-end from a raw board, not a precomputed obs.
+4. **Speed / deploy** — batch=1 latency, then a WASM build for the browser
+   (likely via ONNX Runtime at that point).

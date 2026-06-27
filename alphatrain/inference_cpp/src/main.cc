@@ -1,56 +1,62 @@
-// Milestone harness: load the exported weights + golden, run a piece of the
-// forward pass, and check it against PyTorch bit-close.
+// Color Lines 98 — policy inference using LibTorch (PyTorch's official C++ API).
 //
-// Milestone 1 (now): the stem conv. Conv2d(obs, stem.0.weight) must match the
-// golden 'stem_conv_out' to ~1e-3.
-// Later milestones: once you've implemented BatchNorm/ReLU/Forward in net.cc,
-// flip RUN_FULL_FORWARD to true to check the final 6561 logits.
+// The entire "engine" is: load the TorchScript module, run forward(), read the
+// move. LibTorch already implements conv/batchnorm/relu, so there is no math to
+// write here. We also load one real obs + PyTorch's logits and check they match.
+//
+// Note: the module was traced in inference mode (BatchNorm running-stats baked
+// in), so it is already frozen for inference — no mode toggle needed here.
 
-#include <cmath>
-#include <string>
+#include <torch/script.h>  // the one LibTorch header we need
 
-#include "absl/strings/str_format.h"
-#include "net.h"
+#include <fstream>
+#include <iostream>
+#include <vector>
 
-namespace {
-constexpr bool kRunFullForward = false;  // set true after net.cc::Forward is done
-constexpr int kNumBlocks = 10;
-
-// Max absolute difference between two equally-shaped tensors.
-float MaxAbsDiff(const clines::Tensor& a, const clines::Tensor& b) {
-  float m = 0.0f;
-  for (int i = 0; i < a.size(); ++i)
-    m = std::max(m, std::abs(a.data[i] - b.data[i]));
-  return m;
+// Read `count` little-endian float32 values from a raw file into a vector.
+static std::vector<float> ReadFloats(const std::string& path, int count) {
+  std::vector<float> v(count);
+  std::ifstream f(path, std::ios::binary);
+  f.read(reinterpret_cast<char*>(v.data()), count * sizeof(float));
+  if (!f) {
+    std::cerr << "failed to read " << path << "\n";
+    std::exit(1);
+  }
+  return v;
 }
-}  // namespace
 
 int main() {
-  auto weights = clines::LoadBlob("data/weights.bin");
-  auto golden = clines::LoadBlob("data/golden.bin");
-  if (!weights.ok() || !golden.ok()) {
-    absl::FPrintF(stderr, "load failed: %s / %s\n",
-                  weights.status().message(), golden.status().message());
+  // 1) Load the network. Weights, BatchNorm stats, architecture — all baked in.
+  torch::jit::Module net;
+  try {
+    net = torch::jit::load("data/policy_ts.pt");
+  } catch (const c10::Error& e) {
+    std::cerr << "could not load data/policy_ts.pt (run export_ts.py first): "
+              << e.what() << "\n";
     return 1;
   }
-  const clines::Tensor& obs = golden->at("obs");
-  absl::PrintF("loaded %d weight tensors; obs shape {%d,%d,%d}\n",
-               (int)weights->size(), obs.shape[0], obs.shape[1], obs.shape[2]);
 
-  // ---- Milestone 1: stem conv ----
-  const clines::Tensor& stem_w = weights->at("stem.0.weight");  // {C,18,3,3}
-  clines::Tensor got = clines::Conv2d(obs, stem_w, /*pad=*/1);
-  const clines::Tensor& want = golden->at("stem_conv_out");
-  float diff = MaxAbsDiff(got, want);
-  absl::PrintF("stem conv: max|diff| = %.3e  -> %s\n", diff,
-               diff < 1e-3f ? "PASS ✅" : "FAIL ❌");
+  // 2) Build the input tensor from the example obs (shape {1, 18, 9, 9}).
+  constexpr int kObs = 18 * 9 * 9, kLogits = 6561;
+  std::vector<float> obs_data = ReadFloats("data/example_obs.f32", kObs);
+  // from_blob wraps our vector's memory without copying; clone() makes the
+  // tensor own a copy so it stays valid for the rest of the program.
+  torch::Tensor obs = torch::from_blob(obs_data.data(), {1, 18, 9, 9}).clone();
 
-  // ---- Later: full forward ----
-  if (kRunFullForward) {
-    clines::Tensor logits = clines::Forward(*weights, obs, kNumBlocks);
-    float ld = MaxAbsDiff(logits, golden->at("logits"));
-    absl::PrintF("full forward logits: max|diff| = %.3e -> %s\n", ld,
-                 ld < 1e-2f ? "PASS ✅" : "FAIL ❌");
-  }
+  // 3) Run the forward pass. forward() takes a list of inputs (here, just obs).
+  torch::Tensor logits = net.forward({obs}).toTensor();  // shape {1, 6561}
+
+  // 4) The chosen move = argmax over the 6561 outputs (= source*81 + target).
+  int move = logits.argmax(1).item<int>();
+  std::cout << "predicted move index " << move
+            << "  (source cell " << move / 81 << ", target cell " << move % 81
+            << ")\n";
+
+  // 5) Sanity check: does C++ match PyTorch numerically?
+  std::vector<float> want = ReadFloats("data/example_logits.f32", kLogits);
+  torch::Tensor want_t = torch::from_blob(want.data(), {kLogits});
+  float diff = (logits.view({kLogits}) - want_t).abs().max().item<float>();
+  std::cout << "max|diff| vs PyTorch = " << diff
+            << (diff < 1e-3f ? "   PASS \xE2\x9C\x85\n" : "   FAIL \xE2\x9D\x8C\n");
   return 0;
 }
