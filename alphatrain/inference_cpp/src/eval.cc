@@ -32,12 +32,15 @@ struct Args {
   uint64_t seed_start = 50000, seed_end = 50300;  // [start, end)
   int batch = 256;
   long max_turns = 1000000;
+  bool fp32 = false;  // default: fp16 on MPS (like eval_policy.py)
 };
 
 Args ParseArgs(int argc, char** argv) {
   Args a;
-  for (int i = 1; i < argc - 1; ++i) {
+  for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
+    if (k == "--fp32") { a.fp32 = true; continue; }
+    if (i + 1 >= argc) break;  // remaining flags take a value
     if (k == "--model") a.model = argv[++i];
     else if (k == "--device") a.device = argv[++i];
     else if (k == "--seed-start") a.seed_start = std::stoull(argv[++i]);
@@ -72,6 +75,9 @@ int main(int argc, char** argv) {
     dev = torch::Device(torch::kCPU);
   }
 
+  // fp16 only on the GPU (CPU fp16 ops are slow/unsupported); fp32 on CPU.
+  const bool use_half = dev.is_mps() && !args.fp32;
+
   torch::jit::Module net;
   try { net = torch::jit::load(args.model); }
   catch (const c10::Error& e) {
@@ -79,6 +85,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   net.to(dev);
+  if (use_half) net.to(torch::kHalf);  // convert weights + BN buffers to fp16
 
   // Seed queue.
   std::vector<uint64_t> todo;
@@ -120,6 +127,9 @@ int main(int argc, char** argv) {
       slots[i].game.LegalMask(legal_buf.data() + (size_t)i * clines::kActions);
     }
     torch::Tensor obs = torch::from_blob(obs_buf.data(), {n, 18, 9, 9}).to(dev);
+    if (use_half) obs = obs.to(torch::kHalf);  // input must match the net dtype
+    // legal stays fp32: `legal < 0.5` is a bool mask, so masked_fill works on
+    // the fp16 logits regardless of the mask's own dtype.
     torch::Tensor legal = torch::from_blob(legal_buf.data(), {n, clines::kActions}).to(dev);
     torch::Tensor logits = net.forward({obs}).toTensor();
     float ninf = -std::numeric_limits<float>::infinity();
@@ -162,8 +172,9 @@ int main(int argc, char** argv) {
   }
 
   double el = std::chrono::duration<double>(Clock::now() - t0).count();
-  std::printf("\ndone: %zu games in %.1fs (%.0f games/s, %ld forwards, batch=%d, %s)\n",
-              scores.size(), el, scores.size() / el, fwd, B, args.device.c_str());
+  std::printf("\ndone: %zu games in %.1fs (%.0f games/s, %ld forwards, batch=%d, %s %s)\n",
+              scores.size(), el, scores.size() / el, fwd, B, args.device.c_str(),
+              use_half ? "fp16" : "fp32");
   char tag[64];
   std::snprintf(tag, sizeof(tag), "scores [%llu,%llu):",
                 (unsigned long long)args.seed_start, (unsigned long long)args.seed_end);
