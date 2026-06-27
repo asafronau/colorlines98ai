@@ -112,6 +112,9 @@ int main(int argc, char** argv) {
     int n = (int)slots.size();
     obs_buf.resize((size_t)n * 18 * clines::kNN);
     legal_buf.resize((size_t)n * clines::kActions);
+    // Build each game's obs+legal. Single-threaded on purpose: profiling showed
+    // this eval is forward-bound (the heavy-tail long games run solo at tiny
+    // batch and dominate wall-clock), so parallelizing this loop gave ~0 gain.
     for (int i = 0; i < n; ++i) {
       slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
       slots[i].game.LegalMask(legal_buf.data() + (size_t)i * clines::kActions);
