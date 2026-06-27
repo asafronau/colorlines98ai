@@ -59,15 +59,26 @@ def main():
         traced = ts(obs)
     max_diff = (eager - traced).abs().max().item()
 
+    # Legal-move mask for this board (the canonical BFS-component rule), so the
+    # C++ side can test "argmax over legal moves". 1.0 = legal, 0.0 = illegal.
+    from alphatrain.batched_engine_gpu import legal_priors_t
+    cnt, idx, _ = legal_priors_t(ds.boards[0:1], eager, top_k=6561)
+    legal = torch.zeros(6561)
+    legal[idx[0][idx[0] >= 0]] = 1.0
+    legal_move = int(idx[0, 0])  # highest-logit *legal* move = the answer C++ must match
+
     ts.save(f'{a.outdir}/policy_ts.pt')
     eager[0].numpy().astype('<f4').tofile(f'{a.outdir}/example_logits.f32')
     obs[0].numpy().astype('<f4').tofile(f'{a.outdir}/example_obs.f32')
+    legal.numpy().astype('<f4').tofile(f'{a.outdir}/example_legal.f32')
 
     print(f'arch: {nblocks}b x {ch}ch')
     print(f'traced vs eager max|diff| = {max_diff:.2e}  '
           f'({"OK" if max_diff < 1e-4 else "WARN"})')
-    print(f'wrote {a.outdir}/: policy_ts.pt, example_obs.f32 (18x9x9), '
-          f'example_logits.f32 (6561)')
+    print(f'raw argmax move = {int(eager[0].argmax())}  |  '
+          f'legal argmax move = {legal_move}  ({int(cnt[0])} legal moves)')
+    print(f'wrote {a.outdir}/: policy_ts.pt, example_obs.f32, example_logits.f32, '
+          f'example_legal.f32')
 
 
 if __name__ == '__main__':
