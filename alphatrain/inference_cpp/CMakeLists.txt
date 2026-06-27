@@ -24,3 +24,10 @@ find_package(Torch REQUIRED)
 
 add_executable(infer src/main.cc)
 target_link_libraries(infer PRIVATE "${TORCH_LIBRARIES}")
+
+# Pure game-engine golden test — no LibTorch needed, builds in a second.
+add_executable(game_test src/game_test.cc src/game.cc src/obs.cc)
+
+# Full policy eval: C++ game loop + LibTorch batched inference.
+add_executable(eval src/eval.cc src/game.cc src/obs.cc)
+target_link_libraries(eval PRIVATE "${TORCH_LIBRARIES}")
