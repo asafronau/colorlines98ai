@@ -1,55 +1,81 @@
-# Color Lines 98 — C++ policy inference
+# Color Lines 98 — C++ engine
 
-Run the deployed policy net from C++ using **LibTorch** (PyTorch's official C++
-API). Training stays in Python; this is inference only. The whole engine is
-`src/main.cc` (~40 lines) — LibTorch provides conv/batchnorm/relu, so there is
-no math to hand-write.
+Native C++ for the deployed policy, built on **LibTorch** (PyTorch's official C++
+API). Training stays in Python. Two executables:
 
-## Why LibTorch
-The model is already a PyTorch net. We export it once to a self-contained
-TorchScript file (`policy_ts.pt`), and C++ just loads and runs it. LibTorch
-already lives inside your venv's `torch` package, so there's nothing extra to
-download.
+- **`infer`** — single-state inference demo + CPU/MPS benchmark (`src/main.cc`).
+- **`eval`** — `native_eval_policy`: a full C++ game loop + batched policy play,
+  the C++ port of `scripts/eval_policy.py` (`src/eval.cc` + the game engine).
+- **`game_test`** — golden test for the game engine (no LibTorch needed).
 
-## Build & run
+LibTorch lives inside your venv's `torch`, so there's nothing extra to download;
+`CMakeLists.txt` auto-locates it via the venv python.
+
+## Build
 ```bash
-# 0) from the repo root, venv active
-source .venv/bin/activate
+source .venv/bin/activate          # from repo root
 
-# 1) export the net + a test vector (TorchScript module + example obs/logits)
-python -m alphatrain.inference_cpp.export_ts \
-    --model alphatrain/data/pillar3k_small128_epoch_15.pt
+# export the TorchScript net + golden test vectors
+python -m alphatrain.inference_cpp.export_ts --model alphatrain/data/<MODEL>.pt
+python -m alphatrain.inference_cpp.export_game_golden   # game-engine goldens
 
-# 2) configure + build (point CMake at the LibTorch inside your venv)
 cd alphatrain/inference_cpp
-cmake -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')"
-cmake --build build -j
+cmake -B build && cmake --build build -j               # builds all 3 targets
+```
 
-# 3) run (from this dir, so it finds data/)
-./build/infer
+## Run (from this dir, so it finds `data/`)
+```bash
+./build/game_test          # engine golden test: obs/legal/clear vs Python (must PASS)
+./build/infer              # single-state demo + CPU-vs-MPS benchmark
+
+# native_eval_policy: greedy policy play over a seed range, score distribution
+./build/eval --device mps --seed-start 50000 --seed-end 50256 --batch 256
+#   flags: --model --device cpu|mps --seed-start/--seed-end (end EXCLUSIVE)
+#          --batch --max-turns --fp32   (default: fp16 on MPS)
 ```
-Expected output:
-```
-predicted move index <n>  (source cell .., target cell ..)
-max|diff| vs PyTorch = 0.000…   PASS ✅
-```
+
+## Correctness & the RNG caveat
+The **deterministic** kernels (obs, legal-move mask, line-clear) are golden-tested
+bit-for-bit against the authoritative Python (`game_test` → `max|diff| = 0`).
+
+The **game RNG is NOT** matched to Python: `game/rng.py` uses numpy PCG64, whose
+`choice()/integers()` internals are fragile to replicate, so this engine uses its
+own RNG (SplitMix64). Consequence: for a given seed the C++ engine plays a
+*different specific game* than Python, but the **same score distribution** (same
+policy + rules). That's all the consumers (eval/selfplay/mining) need. Validated:
+on the same model+seeds the distributions match (tail fractions ~identical,
+medians close); per-seed games differ by design.
+
+## Performance (vs `scripts/eval_policy.py`, fair capped comparison)
+Both forward-bound (the long-tail games run solo at tiny batch and gate wall-clock
+— same limitation as Python). Matched 256 seeds / batch 256 / cap 3000:
+
+| precision | C++ | Python | C++ speedup |
+|-----------|-----|--------|-------------|
+| fp16 (default) | 24.9s | 27.0s | ~1.1× |
+| fp32           | 36.5s | 44.8s | ~1.2× |
+
+fp16 is the bigger lever (~1.5× over fp32). C++'s edge grows at smaller batch
+(more host overhead per forward — the AI-hint regime). Compare speed with
+`--max-turns` capped: uncapped wall-clock is dominated by whichever run's RNG
+happens to deal the longest game.
 
 ## Files
 ```
-export_ts.py     Python: PolicyNet -> data/policy_ts.pt + example_obs/logits.f32
-CMakeLists.txt   build (finds LibTorch in the venv)
-src/main.cc      load policy_ts.pt, run forward, print the move, check vs PyTorch
-data/            generated artifacts (git-ignored)
-from_scratch/    OPTIONAL deep-dive: the same net hand-written op-by-op with
-                 abseil (conv/BN/relu from scratch). Great for understanding the
-                 internals later; not needed for the working engine.
+export_ts.py          PolicyNet -> data/policy_ts.pt + example_obs/logits/legal.f32
+export_game_golden.py game-engine golden vectors (obs/legal/clear)
+src/main.cc           inference demo + benchmark
+src/eval.cc           native_eval_policy (batched greedy eval)
+src/game.h/.cc        game engine (port of game/board.py)
+src/obs.cc            18-channel observation (port of observation.py)
+src/rng.h             SplitMix64
+src/game_test.cc      engine golden test
+data/                 generated artifacts (git-ignored)
+from_scratch/         OPTIONAL deep-dive: the net hand-written op-by-op with abseil
 ```
 
-## What's next (small, in order)
-1. **Run it** — confirm the PASS above.
-2. **Argmax over *legal* moves** — the real game masks illegal source/target
-   cells before argmax. Port that mask so the move is always playable.
-3. **Obs builder in C++** — port `_build_obs_core` (board + next balls → 18×9×9)
-   so C++ runs end-to-end from a raw board, not a precomputed obs.
-4. **Speed / deploy** — batch=1 latency, then a WASM build for the browser
-   (likely via ONNX Runtime at that point).
+## Next
+- **fp16 everywhere** is in; **WASM/browser** build (likely ONNX Runtime) is the
+  remaining deploy step.
+- Wire `BestMoves` / the game engine into native selfplay + crisis mining (same
+  batched-MPS pattern: stack ~256 states, one forward, one masked argmax).
