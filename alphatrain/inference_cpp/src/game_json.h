@@ -52,7 +52,13 @@ inline void AppendD(std::string& s, double v) {
 }
 
 // Append the "moves": [...] array (without the key) to `s`.
-inline void AppendMovesArray(std::string& s, const std::vector<MoveRec>& moves) {
+// slim (default): only what train_path_b consumes — cand_moves + cand_visits
+// (-> pol_indices/pol_values + decisiveness top-share). cand_prior/cand_q/
+// root_value/q_min/q_max are Gumbel-only (~35% of the bytes); written only
+// when full=true. Precedent: the pillar3k corpus itself had zero Q (HISTORY
+// 173: "all-zero-Q warning benign; 3b uses pol_values").
+inline void AppendMovesArray(std::string& s, const std::vector<MoveRec>& moves,
+                             bool full = false) {
   s += "[";
   for (size_t m = 0; m < moves.size(); ++m) {
     const MoveRec& mr = moves[m];
@@ -90,22 +96,25 @@ inline void AppendMovesArray(std::string& s, const std::vector<MoveRec>& moves) 
       if (i) s += ", ";
       s += std::to_string(mr.cands[i].visits);
     }
-    s += "], \"cand_prior\": [";
-    for (size_t i = 0; i < mr.cands.size(); ++i) {
-      if (i) s += ", ";
-      AppendD(s, std::log(std::max(mr.cands[i].prior, 1e-30)));
+    s += "]";
+    if (full) {
+      s += ", \"cand_prior\": [";
+      for (size_t i = 0; i < mr.cands.size(); ++i) {
+        if (i) s += ", ";
+        AppendD(s, std::log(std::max(mr.cands[i].prior, 1e-30)));
+      }
+      s += "], \"cand_q\": [";
+      for (size_t i = 0; i < mr.cands.size(); ++i) {
+        if (i) s += ", ";
+        AppendD(s, mr.cands[i].q);
+      }
+      s += "], \"root_value\": ";
+      AppendD(s, mr.root_value);
+      s += ", \"q_min\": ";
+      AppendD(s, mr.q_min);
+      s += ", \"q_max\": ";
+      AppendD(s, mr.q_max);
     }
-    s += "], \"cand_q\": [";
-    for (size_t i = 0; i < mr.cands.size(); ++i) {
-      if (i) s += ", ";
-      AppendD(s, mr.cands[i].q);
-    }
-    s += "], \"root_value\": ";
-    AppendD(s, mr.root_value);
-    s += ", \"q_min\": ";
-    AppendD(s, mr.q_min);
-    s += ", \"q_max\": ";
-    AppendD(s, mr.q_max);
     s += "}";
   }
   s += "]";
