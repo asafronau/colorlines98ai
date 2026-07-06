@@ -58,6 +58,7 @@ struct Args {
   double dirichlet_alpha = 0.3, dirichlet_weight = 0.25;
   int threads = 14;
   bool fp32 = false;
+  bool full_record = false;  // Gumbel-only extras; train_path_b ignores them
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -65,6 +66,7 @@ Args ParseArgs(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k == "--fp32") { a.fp32 = true; continue; }
+    if (k == "--full-record") { a.full_record = true; continue; }
     if (i + 1 >= argc) break;
     if (k == "--model") a.model = argv[++i];
     else if (k == "--device") a.device = argv[++i];
@@ -245,7 +247,7 @@ int main(int argc, char** argv) {
                   ", \"continue_turns\": " + std::to_string(args.continue_turns) +
                   ", \"policy_max_turns\": " + std::to_string(args.policy_max_turns) +
                   ", \"moves\": ";
-          clines::AppendMovesArray(json, recs);
+          clines::AppendMovesArray(json, recs, args.full_record);
           json += "}";
           clines::WriteFileOrDie(
               args.out_dir + "/game_seed" + std::to_string(seed) + "_" +

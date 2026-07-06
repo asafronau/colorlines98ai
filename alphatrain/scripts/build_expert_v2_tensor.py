@@ -52,8 +52,14 @@ def extract_candidates(move):
         n = len(cm)
         flat[:n] = np.asarray(cm, dtype=np.int64)
         visits[:n] = np.asarray(move['cand_visits'][:n], dtype=np.float32)
-        prior[:n] = np.asarray(move['cand_prior'][:n], dtype=np.float32)
-        q[:n] = np.asarray(move['cand_q'][:n], dtype=np.float32)
+        # Slim recorders (C++ mcts_selfplay/mcts_crisis) omit the Gumbel-only
+        # fields (cand_prior/cand_q/root_value/q_min/q_max); default to zeros —
+        # train_path_b uses only pol_indices/pol_values (visits). Same as the
+        # pillar3k corpus's benign all-zero-Q (HISTORY 173).
+        if 'cand_prior' in move:
+            prior[:n] = np.asarray(move['cand_prior'][:n], dtype=np.float32)
+        if 'cand_q' in move:
+            q[:n] = np.asarray(move['cand_q'][:n], dtype=np.float32)
         return (flat, visits, prior, q, n, float(move.get('root_value', 0.0)),
                 float(move.get('q_min', 0.0)), float(move.get('q_max', 0.0)))
     top = move['top_moves'][:K_CAND]
