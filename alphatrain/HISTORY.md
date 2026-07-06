@@ -3294,3 +3294,58 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      (the AlphaZero self-improvement loop), unlike re-mining pillar3f's now-saturated crises.
      Rebuild + distill → pillar3k iter 2. Side-bets: 85/15 crisis ratio (test selfplay
      dilution, lesson 8); DECISIVENESS=4 sweep.
+
+175. **pillar3k_small128_hardce_epoch_87 — the 4× smaller student (10b×128ch, 3.0M
+     params), distilled from pillar3k. LAUNCH PAD for the small-model improvement
+     loop.** (2026-07-05)
+
+     **Provenance (exact):** from-scratch distillation of pillar3k_r3_dw3_T0.7_epoch_22
+     (teacher, 256ch) into 10b×128ch. Corpus `distill_pillar3k.pt` = 3,846,619 states
+     (selfplay_v14 240 games ~2.16M broad + all crisis ~1.69M escapes, 56/44) relabeled
+     with the teacher's top-5 legal-softmax policy via `alphatrain/scripts/distill_relabel.py`.
+     Train (Colab, train_pillar3k_small_colab.ipynb, RUN=pillar3k_small128_hardce):
+       `train_path_b --channels 128 --epochs 100 --batch-size 4096 --lr 1e-3
+        --warmup-epochs 3 --flat-epochs 0 --target-temperature 0.5 --blend-alpha 0.5`
+     (0.5·soft-CE + 0.5·hard-CE on teacher argmax; plain cosine; from-scratch recipe
+     batch 4096/lr 1e-3 — larger batches step-starve from-scratch runs).
+     **Eval (eval_policy 775000-775499, 500 seeds, fp16 @1024):** ep87 mean 12,987 /
+     P50 8,889 / P10 1,799 / <1000 4.8% / max 131,845. Teacher-match 73.0% top-1,
+     96.6% top-3 (diag_student_match, 20k states).
+     **Key findings of the distillation arc:** (a) an ascending-vs-descending bug in
+     diag/relabel top-K reads faked "not learning" for a week (true match was 67-69%);
+     (b) match and gameplay DECOUPLE — match flat ~72% from ep19 while gameplay climbed
+     6,237→12,987 (mimicry limit ≠ capacity limit); (c) cosine tail consolidated
+     (ep49 10,877 → ep87 12,987); (d) truncation warm-start from the teacher's first
+     128 channels = random init (0.2% match) — trained channels aren't importance-ordered.
+
+176. **C++ engine (alphatrain/inference_cpp) = production for selfplay + crisis mining
+     + policy eval. Python RETIRED for those three (user directive). First loop
+     experiment sp1 (100% selfplay corpus) REGRESSED — lesson-3 replication.** (2026-07-06)
+
+     **C++ engine, all golden/distribution-validated:** game engine bit-exact vs Python
+     (obs/legal/clear 0.0e+00); 27-feature FV leaf evaluator bit-close (V 2.4e-07);
+     MCTS (PUCT/min-max-Q/virtual-loss/open-loop determinized) strength-matched vs
+     Python MCTS on a 100-seed A/B (median 11,112 vs 10,060, same seed list, noise);
+     eval ~1.1-1.4× Python; selfplay + crisis recorders emit the moves-schema JSON that
+     `build_expert_v2_tensor --policy-only-data` consumes directly (integration-tested;
+     zero illegal actions; real Q). Throughput (M5, 14 threads): ~20.8k leaf evals/s,
+     ~36-47k selfplay states/hour @1600 sims. Binaries: eval, mcts_eval, mcts_selfplay,
+     mcts_crisis (+ game_test/feature_test goldens). RNG note: C++ plays different
+     per-seed games than Python (own SplitMix64) — same distribution; compare
+     distributions over a seed range, never per-seed.
+     **MCTS-vs-greedy on the small model (n=100, 100 sims, q=1.0, fv-leaf):**
+     median +15-25% over greedy (early +61% was an n=48 lucky draw).
+     **sp1 NEGATIVE (controlled, cheap):** corpus = 100 C++ selfplay games @1600 sims
+     (seeds 920000-99, cap 1500) = 142,844 states, `selfplay_cpp128_v1_slim.pt`; train =
+     `train_path_b --resume ...epoch_87 --warm-start --channels 128 --epochs 16
+      --batch-size 4096 --lr 1e-4 --warmup-epochs 1 --target-temperature 0.7
+      --decisiveness-power 3.0`. Gate evals (775000-775499): ep1 10,865/6,800 →
+     ep8 9,066/6,032 → ep16 8,192/6,265 (mean/P50) vs base 12,987/8,889 — MONOTONIC
+     regression. Pre-flight had predicted it: ep87 prior top-share P50 0.565 (hard-CE
+     made it decisive) vs 1600-sim visit target P50 0.335 → de-peak regime; and the
+     corpus was 100% selfplay = ~0% decisive escapes, so decisiveness weighting had
+     nothing to upweight. REPLICATES lesson 3 (entry 174) on the small model: the
+     crisis (escape-or-die) share IS the load-bearing mitigation, not the trainer flags.
+     **NEXT:** mine ep87's own crises with `mcts_crisis` (recovery 15@1600 / prevention
+     75@2400 / continue 500), build ~70/30 crisis/selfplay corpus (selfplay anchor
+     already in hand), retrain dw3/T0.7 on Colab, floor-gated 500-seed then 5k eval.
