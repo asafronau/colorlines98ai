@@ -3349,3 +3349,17 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      **NEXT:** mine ep87's own crises with `mcts_crisis` (recovery 15@1600 / prevention
      75@2400 / continue 500), build ~70/30 crisis/selfplay corpus (selfplay anchor
      already in hand), retrain dw3/T0.7 on Colab, floor-gated 500-seed then 5k eval.
+
+     **ERRATUM to 176 (2026-07-06, same day):** `data/policy_ts.pt` (the C++ tools'
+     default model) was a stale Jun-26 export of the PRE-hardce model (~7.4k mean) —
+     never re-exported after ep87 was chosen. Therefore: (a) selfplay_cpp128_v1
+     (142,844 states) was generated with the OLD model, not ep87 → sp1's regression is
+     CONFOUNDED (weaker-teacher data + de-peak; cannot attribute cleanly — the lesson-3
+     replication claim is weakened, both causes plausible); (b) the C++-vs-Python MCTS
+     "validation" A/B was CROSS-MODEL (C++ on old model vs Python on ep87) → redone
+     clean below; (c) engine-level validations unaffected (greedy C++-vs-Python used
+     the same model explicitly; goldens model-independent). Fix: ep87 re-exported and
+     VERIFIED (logit diff 0.0 vs checkpoint); selfplay_cpp128_v1 + its slim tensor
+     retired from training use; corpus to be regenerated with ep87. LESSON: never rely
+     on a default model path in generators — pass --model explicitly and verify the
+     export against the checkpoint before generating (a one-line logit-diff check).
