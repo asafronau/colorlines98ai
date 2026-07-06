@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "game.h"
+#include "mcts.h"  // LegalPriors cross-check
 
 namespace {
 struct Reader {
@@ -35,6 +36,10 @@ int main() {
 
   using namespace clines;
   float obs_diff = 0, legal_diff = 0;
+  int lp_mismatch = 0;  // LegalPriors vs golden legal-mask cross-check
+  std::vector<float> zero_logits(kActions, 0.0f);
+  std::vector<int> lp_acts(kActions);
+  std::vector<double> lp_pris(kActions);
   int K = r.I32();
   for (int k = 0; k < K; ++k) {
     float bf[kNN]; r.F32(bf, kNN);
@@ -56,6 +61,21 @@ int main() {
     g.LegalMask(legal.data());
     obs_diff = std::max(obs_diff, MaxDiff(obs.data(), obs_g.data(), 18 * kNN));
     legal_diff = std::max(legal_diff, MaxDiff(legal.data(), legal_g.data(), kActions));
+
+    // LegalPriors with uniform logits + top_k=all must return exactly the
+    // golden legal set, with priors summing to 1.
+    int kk = LegalPriors(board, zero_logits.data(), kActions,
+                         lp_acts.data(), lp_pris.data());
+    int want = 0;
+    for (int a = 0; a < kActions; ++a) want += legal_g[a] > 0.5f;
+    double psum = 0;
+    bool ok = (kk == want);
+    for (int i = 0; i < kk && ok; ++i) {
+      if (legal_g[lp_acts[i]] < 0.5f) ok = false;
+      psum += lp_pris[i];
+    }
+    if (kk > 0 && std::fabs(psum - 1.0) > 1e-9) ok = false;
+    if (!ok) ++lp_mismatch;
   }
 
   int clear_mismatch = 0, board_mismatch = 0;
@@ -80,8 +100,10 @@ int main() {
   std::printf("clear: %d/%d count-mismatch, %d/%d board-mismatch  -> %s\n",
               clear_mismatch, M, board_mismatch, M,
               (clear_mismatch == 0 && board_mismatch == 0) ? "PASS" : "FAIL");
+  std::printf("LegalPriors vs golden mask: %d/%d mismatch  -> %s\n",
+              lp_mismatch, K, lp_mismatch == 0 ? "PASS" : "FAIL");
   bool pass = obs_diff < 1e-5 && legal_diff < 1e-6 && clear_mismatch == 0 &&
-              board_mismatch == 0;
+              board_mismatch == 0 && lp_mismatch == 0;
   std::printf("%s\n", pass ? "ALL PASS \xE2\x9C\x85" : "FAIL \xE2\x9D\x8C");
   return pass ? 0 : 1;
 }

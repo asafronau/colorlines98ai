@@ -26,7 +26,9 @@ add_executable(infer src/main.cc)
 target_link_libraries(infer PRIVATE "${TORCH_LIBRARIES}")
 
 # Pure game-engine golden test — no LibTorch needed, builds in a second.
-add_executable(game_test src/game_test.cc src/game.cc src/obs.cc)
+# (Includes mcts.cc for the LegalPriors cross-check against the golden masks.)
+add_executable(game_test src/game_test.cc src/game.cc src/obs.cc src/mcts.cc
+                         src/feature_value.cc)
 
 # Feature-value evaluator golden test — no LibTorch needed.
 add_executable(feature_test src/feature_test.cc src/feature_value.cc src/game.cc)
@@ -34,3 +36,9 @@ add_executable(feature_test src/feature_test.cc src/feature_value.cc src/game.cc
 # Full policy eval: C++ game loop + LibTorch batched inference.
 add_executable(eval src/eval.cc src/game.cc src/obs.cc)
 target_link_libraries(eval PRIVATE "${TORCH_LIBRARIES}")
+
+# MCTS eval: feature-value MCTS over a seed range (game threads + one shared
+# inference-server thread).
+add_executable(mcts_eval src/mcts_eval.cc src/mcts.cc src/game.cc src/obs.cc
+                         src/feature_value.cc)
+target_link_libraries(mcts_eval PRIVATE "${TORCH_LIBRARIES}")

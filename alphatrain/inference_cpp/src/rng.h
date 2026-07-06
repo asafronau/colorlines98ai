@@ -32,6 +32,11 @@ class SimpleRng {
     return low + static_cast<int>(NextU64() % static_cast<uint64_t>(high - low));
   }
 
+  // Uniform double in [0, 1). Top 53 bits for full double precision.
+  double NextF64() {
+    return static_cast<double>(NextU64() >> 11) * (1.0 / 9007199254740992.0);
+  }
+
   // Choose k distinct indices from [0, n) (partial Fisher-Yates).
   void ChoiceNoReplace(int n, int k, std::vector<int>& out) {
     scratch_.resize(n);
