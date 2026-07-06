@@ -15,9 +15,10 @@ constexpr int kDc4[4] = {1, -1, 0, 0};
 
 struct Node {
   std::vector<std::pair<int, Node*>> children;  // (flat action, child)
-  int n = 0;       // visit_count
-  double w = 0.0;  // value_sum
-  double p = 0.0;  // prior
+  int n = 0;            // visit_count
+  double w = 0.0;       // value_sum
+  double p = 0.0;       // prior used in search (post-noise at root)
+  double p_clean = 0.0; // pre-Dirichlet prior (recorded by selfplay)
 };
 
 // Deterministic per-state seed for the sim RNG (Python: MD5 of state -> PCG64;
@@ -129,11 +130,24 @@ SearchResult MCTS::Search(const Game& game, double temperature,
   for (int i = 0; i < k; ++i) {
     pool.emplace_back();
     pool.back().p = pris[i];
+    pool.back().p_clean = pris[i];
     root->children.push_back({acts[i], &pool.back()});
   }
   root->n = 1;          // mcts.py: root.visit_count = 1
   root->w = root_value;
   double min_q = root_value, max_q = root_value;
+
+  // Root Dirichlet noise (selfplay exploration). Uses the state-seeded sim
+  // RNG, like Python (self._sim_rng.dirichlet). Clean priors stay in p_clean.
+  if (cfg_.dirichlet_alpha > 0.0 && cfg_.dirichlet_weight > 0.0) {
+    std::vector<double> noise;
+    sim_rng.Dirichlet(cfg_.dirichlet_alpha, k, noise);
+    for (int i = 0; i < k; ++i) {
+      Node* ch = root->children[i].second;
+      ch->p = (1.0 - cfg_.dirichlet_weight) * ch->p +
+              cfg_.dirichlet_weight * noise[i];
+    }
+  }
 
   // --- Batched virtual-loss simulation loop ---
   const int B = cfg_.batch_size;
@@ -248,6 +262,7 @@ SearchResult MCTS::Search(const Game& game, double temperature,
           if (!exists) {
             pool.emplace_back();
             pool.back().p = pris[i];
+            pool.back().p_clean = pris[i];
             node->children.push_back({acts[i], &pool.back()});
           }
         }
@@ -283,7 +298,8 @@ SearchResult MCTS::Search(const Game& game, double temperature,
   }
   res.cands.reserve(root->children.size());
   for (const auto& [act, ch] : root->children)
-    res.cands.push_back({act, ch->n, ch->p, ch->n > 0 ? ch->w / ch->n : 0.0});
+    res.cands.push_back(
+        {act, ch->n, ch->p_clean, ch->n > 0 ? ch->w / ch->n : 0.0});
   std::stable_sort(res.cands.begin(), res.cands.end(),
                    [](const Candidate& a, const Candidate& b) {
                      return a.visits > b.visits;

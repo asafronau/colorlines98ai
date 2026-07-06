@@ -10,6 +10,7 @@
 #ifndef CLINES_RNG_H_
 #define CLINES_RNG_H_
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -35,6 +36,50 @@ class SimpleRng {
   // Uniform double in [0, 1). Top 53 bits for full double precision.
   double NextF64() {
     return static_cast<double>(NextU64() >> 11) * (1.0 / 9007199254740992.0);
+  }
+
+  // Standard normal via Box-Muller (port of rust_engine/src/rng.rs).
+  double NextNormal() {
+    double u1 = NextF64();
+    double u2 = NextF64();
+    while (u1 == 0.0) u1 = NextF64();
+    return std::sqrt(-2.0 * std::log(u1)) *
+           std::cos(2.0 * 3.14159265358979323846 * u2);
+  }
+
+  // Gamma(alpha, 1) via Marsaglia-Tsang (port of rng.rs::next_gamma).
+  double NextGamma(double alpha) {
+    if (alpha < 1.0) {
+      double u = NextF64();
+      while (u == 0.0) u = NextF64();
+      return NextGamma(alpha + 1.0) * std::pow(u, 1.0 / alpha);
+    }
+    double d = alpha - 1.0 / 3.0;
+    double c = 1.0 / std::sqrt(9.0 * d);
+    while (true) {
+      double x = NextNormal();
+      double v = 1.0 + c * x;
+      if (v <= 0.0) continue;
+      v = v * v * v;
+      double u = NextF64();
+      if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
+      if (std::log(u) < 0.5 * x * x + d * (1.0 - v + std::log(v))) return d * v;
+    }
+  }
+
+  // Symmetric Dirichlet(alpha) over n dims -> out (sums to 1).
+  void Dirichlet(double alpha, int n, std::vector<double>& out) {
+    out.resize(n);
+    double total = 0.0;
+    for (int i = 0; i < n; ++i) {
+      out[i] = NextGamma(alpha);
+      total += out[i];
+    }
+    if (total == 0.0) {
+      for (int i = 0; i < n; ++i) out[i] = 1.0 / n;
+    } else {
+      for (int i = 0; i < n; ++i) out[i] /= total;
+    }
   }
 
   // Choose k distinct indices from [0, n) (partial Fisher-Yates).
