@@ -28,6 +28,9 @@ target_link_libraries(infer PRIVATE "${TORCH_LIBRARIES}")
 # Pure game-engine golden test — no LibTorch needed, builds in a second.
 add_executable(game_test src/game_test.cc src/game.cc src/obs.cc)
 
+# Feature-value evaluator golden test — no LibTorch needed.
+add_executable(feature_test src/feature_test.cc src/feature_value.cc src/game.cc)
+
 # Full policy eval: C++ game loop + LibTorch batched inference.
 add_executable(eval src/eval.cc src/game.cc src/obs.cc)
 target_link_libraries(eval PRIVATE "${TORCH_LIBRARIES}")
