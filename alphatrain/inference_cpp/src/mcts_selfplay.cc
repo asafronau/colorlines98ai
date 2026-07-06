@@ -29,14 +29,13 @@
 
 #include "feature_value.h"
 #include "game.h"
+#include "game_json.h"
 #include "infer_server.h"
 #include "mcts.h"
 
 using Clock = std::chrono::high_resolution_clock;
 
 namespace {
-
-constexpr int kTopKSave = 15;  // selfplay.py top_k_save
 
 struct Args {
   std::string model = "data/policy_ts.pt";
@@ -80,85 +79,6 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--threads") a.threads = std::stoi(argv[++i]);
   }
   return a;
-}
-
-struct MoveRec {
-  int8_t board[81];
-  std::vector<clines::NextBall> next_balls;
-  int action;
-  std::vector<clines::Candidate> cands;  // top kTopKSave by visits
-  double root_value, q_min, q_max;
-};
-
-// Append a double with enough precision for float32 round-trip.
-void AppendD(std::string& s, double v) {
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "%.8g", v);
-  s += buf;
-}
-
-void AppendGameJson(std::string& s, uint64_t seed, int score, bool capped,
-                    const std::vector<MoveRec>& moves) {
-  s += "{\"seed\": " + std::to_string(seed) +
-       ", \"score\": " + std::to_string(score) +
-       ", \"capped\": " + (capped ? std::string("true") : std::string("false")) +
-       ", \"moves\": [";
-  for (size_t m = 0; m < moves.size(); ++m) {
-    const MoveRec& mr = moves[m];
-    if (m) s += ", ";
-    s += "{\"board\": [";
-    for (int r = 0; r < 9; ++r) {
-      if (r) s += ", ";
-      s += "[";
-      for (int c = 0; c < 9; ++c) {
-        if (c) s += ", ";
-        s += std::to_string(static_cast<int>(mr.board[r * 9 + c]));
-      }
-      s += "]";
-    }
-    s += "], \"next_balls\": [";
-    for (size_t i = 0; i < mr.next_balls.size(); ++i) {
-      if (i) s += ", ";
-      s += "{\"row\": " + std::to_string(mr.next_balls[i].r) +
-           ", \"col\": " + std::to_string(mr.next_balls[i].c) +
-           ", \"color\": " + std::to_string(mr.next_balls[i].color) + "}";
-    }
-    s += "], \"num_next\": " + std::to_string(mr.next_balls.size());
-    int src = mr.action / 81, tgt = mr.action % 81;
-    s += ", \"chosen_move\": {\"sr\": " + std::to_string(src / 9) +
-         ", \"sc\": " + std::to_string(src % 9) +
-         ", \"tr\": " + std::to_string(tgt / 9) +
-         ", \"tc\": " + std::to_string(tgt % 9) + "}";
-    s += ", \"cand_moves\": [";
-    for (size_t i = 0; i < mr.cands.size(); ++i) {
-      if (i) s += ", ";
-      s += std::to_string(mr.cands[i].action);
-    }
-    s += "], \"cand_visits\": [";
-    for (size_t i = 0; i < mr.cands.size(); ++i) {
-      if (i) s += ", ";
-      s += std::to_string(mr.cands[i].visits);
-    }
-    s += "], \"cand_prior\": [";
-    for (size_t i = 0; i < mr.cands.size(); ++i) {
-      if (i) s += ", ";
-      // Clean pre-Dirichlet prior as LOG-prob (build_expert_v2_tensor schema).
-      AppendD(s, std::log(std::max(mr.cands[i].prior, 1e-30)));
-    }
-    s += "], \"cand_q\": [";
-    for (size_t i = 0; i < mr.cands.size(); ++i) {
-      if (i) s += ", ";
-      AppendD(s, mr.cands[i].q);
-    }
-    s += "], \"root_value\": ";
-    AppendD(s, mr.root_value);
-    s += ", \"q_min\": ";
-    AppendD(s, mr.q_min);
-    s += ", \"q_max\": ";
-    AppendD(s, mr.q_max);
-    s += "}";
-  }
-  s += "]}";
 }
 
 }  // namespace
@@ -218,7 +138,7 @@ int main(int argc, char** argv) {
       clines::Game g(seed);
       g.Reset();
       clines::SimpleRng move_rng(seed * 2654435761ULL + 0x9E3779B97F4A7C15ULL);
-      std::vector<MoveRec> recs;
+      std::vector<clines::MoveRec> recs;
       bool capped = false;
 
       while (!g.over()) {
@@ -230,16 +150,7 @@ int main(int argc, char** argv) {
         clines::SearchResult r = mcts.Search(g, temp, move_rng);
         if (r.action < 0) break;  // no legal moves
 
-        MoveRec mr;
-        std::memcpy(mr.board, g.board().data(), 81);
-        mr.next_balls = g.next_balls();
-        mr.action = r.action;
-        int nc = std::min<int>(kTopKSave, (int)r.cands.size());
-        mr.cands.assign(r.cands.begin(), r.cands.begin() + nc);
-        mr.root_value = r.root_value;
-        mr.q_min = r.q_min;
-        mr.q_max = r.q_max;
-        recs.push_back(std::move(mr));
+        recs.push_back(clines::MakeMoveRec(g, r));
 
         int src = r.action / 81, tgt = r.action % 81;
         if (!g.Move(src / 9, src % 9, tgt / 9, tgt % 9)) {
@@ -258,16 +169,15 @@ int main(int argc, char** argv) {
 
       std::string json;
       json.reserve(recs.size() * 900 + 256);
-      AppendGameJson(json, seed, g.score(), capped, recs);
-      std::string path = args.out_dir + "/game_seed" + std::to_string(seed) +
-                         "_score" + std::to_string(g.score()) + ".json";
-      FILE* f = std::fopen(path.c_str(), "w");
-      if (!f) {
-        std::fprintf(stderr, "FATAL: cannot write %s\n", path.c_str());
-        std::abort();
-      }
-      std::fwrite(json.data(), 1, json.size(), f);
-      std::fclose(f);
+      json += "{\"seed\": " + std::to_string(seed) +
+              ", \"score\": " + std::to_string(g.score()) +
+              ", \"capped\": " + (capped ? std::string("true") : std::string("false")) +
+              ", \"moves\": ";
+      clines::AppendMovesArray(json, recs);
+      json += "}";
+      clines::WriteFileOrDie(args.out_dir + "/game_seed" + std::to_string(seed) +
+                                 "_score" + std::to_string(g.score()) + ".json",
+                             json);
 
       int d = done.fetch_add(1) + 1;
       double el = std::chrono::duration<double>(Clock::now() - t0).count();

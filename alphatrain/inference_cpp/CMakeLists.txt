@@ -48,3 +48,9 @@ target_link_libraries(mcts_eval PRIVATE "${TORCH_LIBRARIES}")
 add_executable(mcts_selfplay src/mcts_selfplay.cc src/mcts.cc src/game.cc
                              src/obs.cc src/feature_value.cc)
 target_link_libraries(mcts_selfplay PRIVATE "${TORCH_LIBRARIES}")
+
+# Crisis mining: greedy probe to death -> rewind anchors -> deep-MCTS replay
+# (the decisive escape-or-die games; port of crisis_mining.py).
+add_executable(mcts_crisis src/mcts_crisis.cc src/mcts.cc src/game.cc
+                           src/obs.cc src/feature_value.cc)
+target_link_libraries(mcts_crisis PRIVATE "${TORCH_LIBRARIES}")

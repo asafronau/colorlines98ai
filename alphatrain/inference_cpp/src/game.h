@@ -60,8 +60,10 @@ class Game {
   bool over() const { return over_; }
   int CountEmpty() const;
 
-  // Test hooks: drive the engine from a fixed state (no RNG), for golden tests.
-  void SetState(const int8_t* board81, const std::vector<NextBall>& nb);
+  // Restore an arbitrary state (golden tests; crisis-anchor replay restores
+  // score/turns too, mirroring crisis_mining.py's game.reset + score/turns).
+  void SetState(const int8_t* board81, const std::vector<NextBall>& nb,
+                int score = 0, int turns = 0);
 
   // Pure kernels exposed for golden tests (operate on a caller's board buffer).
   static int ClearLinesAt(int8_t* board, int r, int c);

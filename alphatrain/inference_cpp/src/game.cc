@@ -209,10 +209,11 @@ void Game::TrustedMove(int sr, int sc, int tr, int tc, SimpleRng& rng) {
   }
 }
 
-void Game::SetState(const int8_t* board81, const std::vector<NextBall>& nb) {
+void Game::SetState(const int8_t* board81, const std::vector<NextBall>& nb,
+                    int score, int turns) {
   for (int i = 0; i < kNN; ++i) board_[i] = board81[i];
   next_balls_ = nb;
-  score_ = 0; turns_ = 0; over_ = false;
+  score_ = score; turns_ = turns; over_ = false;
 }
 
 }  // namespace clines
