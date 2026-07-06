@@ -10,7 +10,9 @@
 #include <torch/script.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <future>
@@ -23,8 +25,12 @@ namespace clines {
 
 class InferenceServer {
  public:
-  InferenceServer(const std::string& model_path, torch::Device dev, bool fp16)
-      : dev_(dev), fp16_(fp16) {
+  // log_every_forwards > 0: print "[GPU] ... evals/s" every N forwards (rare,
+  // like Python's inference_server) so C++/Python throughput is comparable.
+  InferenceServer(const std::string& model_path, torch::Device dev, bool fp16,
+                  int64_t log_every_forwards = 10000)
+      : dev_(dev), fp16_(fp16), log_every_(log_every_forwards),
+        t0_(std::chrono::steady_clock::now()) {
     module_ = torch::jit::load(model_path);
     module_.to(dev_);
     if (fp16_) module_.to(torch::kHalf);
@@ -96,12 +102,22 @@ class InferenceServer {
       }
       fwd_ += 1;
       evals_ += total;
+      if (log_every_ > 0 && fwd_ % log_every_ == 0) {
+        double el = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t0_).count();
+        std::printf("  [GPU] %lld evals, %lld fwd (avg bs=%.1f, %.0f evals/s)\n",
+                    (long long)evals_.load(), (long long)fwd_.load(),
+                    (double)evals_.load() / fwd_.load(), evals_.load() / el);
+        std::fflush(stdout);
+      }
     }
   }
 
   torch::jit::Module module_;
   torch::Device dev_;
   bool fp16_;
+  int64_t log_every_;
+  std::chrono::steady_clock::time_point t0_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Req*> queue_;
