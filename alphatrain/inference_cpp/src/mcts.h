@@ -34,12 +34,16 @@ struct MctsConfig {
   int batch_size = 8;      // leaves per batched policy forward (virtual loss)
   double q_weight = 1.0;   // PUCT: q_weight*q_norm + U
   bool early_stop = false; // eval-only: stop when the argmax can't change
+  // Root exploration noise (selfplay): prior = (1-w)*p + w*Dirichlet(alpha).
+  // 0 = off (eval). selfplay.py defaults: alpha 0.3, weight 0.25.
+  double dirichlet_alpha = 0.0;
+  double dirichlet_weight = 0.0;
 };
 
 struct Candidate {
   int action;     // flat = (sr*9+sc)*81 + (tr*9+tc)
   int visits;
-  double prior;   // post-noise prior actually used in search
+  double prior;   // CLEAN pre-Dirichlet prior (what selfplay records)
   double q;       // value_sum / visits (0 if unvisited)
 };
 

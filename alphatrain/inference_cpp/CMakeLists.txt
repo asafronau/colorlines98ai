@@ -42,3 +42,9 @@ target_link_libraries(eval PRIVATE "${TORCH_LIBRARIES}")
 add_executable(mcts_eval src/mcts_eval.cc src/mcts.cc src/game.cc src/obs.cc
                          src/feature_value.cc)
 target_link_libraries(mcts_eval PRIVATE "${TORCH_LIBRARIES}")
+
+# MCTS selfplay: records visit distributions in the moves-schema JSON that
+# build_expert_v2_tensor consumes.
+add_executable(mcts_selfplay src/mcts_selfplay.cc src/mcts.cc src/game.cc
+                             src/obs.cc src/feature_value.cc)
+target_link_libraries(mcts_selfplay PRIVATE "${TORCH_LIBRARIES}")
