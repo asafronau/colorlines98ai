@@ -41,6 +41,12 @@ class Game {
   // true if the move was legal+applied. Updates board/score/turns/over.
   bool Move(int sr, int sc, int tr, int tc);
 
+  // Apply a move known to be legal, drawing spawn RNG from an EXTERNAL rng
+  // (mirrors ColorLinesGame.trusted_move). Used by MCTS: each simulation clones
+  // the root game and replays the tree path against one shared sim-RNG, so the
+  // stochastic spawns advance a single stream across the batch (open-loop).
+  void TrustedMove(int sr, int sc, int tr, int tc, SimpleRng& rng);
+
   // Legal-move mask over the 6561 flat actions (src*81 + tgt): 1.0 legal else 0.
   void LegalMask(float* out) const;
 
@@ -62,8 +68,8 @@ class Game {
   static void LabelEmpty(const int8_t* board, int8_t* labels);  // 0=ball, 1+=id
 
  private:
-  void GenerateNextBalls();
-  std::vector<int> SpawnBalls();  // returns landed flat cell indices
+  void GenerateNextBalls(SimpleRng& rng);
+  std::vector<int> SpawnBalls(SimpleRng& rng);  // returns landed flat cell indices
 
   std::array<int8_t, kNN> board_{};
   std::vector<NextBall> next_balls_;

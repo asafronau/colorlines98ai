@@ -102,7 +102,7 @@ void Game::LegalMask(float* out) const {
   }
 }
 
-void Game::GenerateNextBalls() {
+void Game::GenerateNextBalls(SimpleRng& rng) {
   next_balls_.clear();
   std::vector<int> empty;
   for (int i = 0; i < kNN; ++i) if (board_[i] == 0) empty.push_back(i);
@@ -110,15 +110,15 @@ void Game::GenerateNextBalls() {
   if (n_empty == 0) return;
   int n = std::min(kBallsPerTurn, n_empty);
   std::vector<int> idx;
-  rng_.ChoiceNoReplace(n_empty, n, idx);
+  rng.ChoiceNoReplace(n_empty, n, idx);
   for (int i = 0; i < n; ++i) {
     int cell = empty[idx[i]];
-    int color = rng_.RandInt(1, kColors + 1);
+    int color = rng.RandInt(1, kColors + 1);
     next_balls_.push_back({cell / kN, cell % kN, color});
   }
 }
 
-std::vector<int> Game::SpawnBalls() {
+std::vector<int> Game::SpawnBalls(SimpleRng& rng) {
   std::vector<int> landed;
   for (const NextBall& nb : next_balls_) {
     int cell = Idx(nb.r, nb.c);
@@ -129,7 +129,7 @@ std::vector<int> Game::SpawnBalls() {
       std::vector<int> empty;
       for (int i = 0; i < kNN; ++i) if (board_[i] == 0) empty.push_back(i);
       if (!empty.empty()) {
-        int j = rng_.RandInt(0, static_cast<int>(empty.size()));
+        int j = rng.RandInt(0, static_cast<int>(empty.size()));
         board_[empty[j]] = static_cast<int8_t>(nb.color);
         landed.push_back(empty[j]);
       }
@@ -141,9 +141,9 @@ std::vector<int> Game::SpawnBalls() {
 void Game::Reset() {
   board_.fill(0);
   score_ = 0; turns_ = 0; over_ = false;
-  GenerateNextBalls();
-  SpawnBalls();
-  GenerateNextBalls();
+  GenerateNextBalls(rng_);
+  SpawnBalls(rng_);
+  GenerateNextBalls(rng_);
 }
 
 bool Game::Move(int sr, int sc, int tr, int tc) {
@@ -173,17 +173,40 @@ bool Game::Move(int sr, int sc, int tr, int tc) {
   if (cleared > 0) {
     score_ += LineScore(cleared);
   } else {
-    std::vector<int> landed = SpawnBalls();
+    std::vector<int> landed = SpawnBalls(rng_);
     for (int cell : landed) {
       if (board_[cell] != 0) {
         int sc2 = ClearLinesAt(board_.data(), cell / kN, cell % kN);
         if (sc2 > 0) score_ += LineScore(sc2);
       }
     }
-    GenerateNextBalls();
+    GenerateNextBalls(rng_);
     if (CountEmpty() == 0) over_ = true;
   }
   return true;
+}
+
+void Game::TrustedMove(int sr, int sc, int tr, int tc, SimpleRng& rng) {
+  // No validation — caller guarantees the move is legal (MCTS tree path).
+  int s = Idx(sr, sc), t = Idx(tr, tc);
+  int8_t color = board_[s];
+  board_[s] = 0;
+  board_[t] = color;
+  ++turns_;
+  int cleared = ClearLinesAt(board_.data(), tr, tc);
+  if (cleared > 0) {
+    score_ += LineScore(cleared);
+  } else {
+    std::vector<int> landed = SpawnBalls(rng);
+    for (int cell : landed) {
+      if (board_[cell] != 0) {
+        int sc2 = ClearLinesAt(board_.data(), cell / kN, cell % kN);
+        if (sc2 > 0) score_ += LineScore(sc2);
+      }
+    }
+    GenerateNextBalls(rng);
+    if (CountEmpty() == 0) over_ = true;
+  }
 }
 
 void Game::SetState(const int8_t* board81, const std::vector<NextBall>& nb) {
