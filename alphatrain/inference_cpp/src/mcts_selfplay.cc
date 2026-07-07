@@ -21,10 +21,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <dirent.h>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "feature_value.h"
@@ -103,8 +105,27 @@ int main(int argc, char** argv) {
   ::mkdir(args.out_dir.c_str(), 0755);
   clines::InferenceServer server(args.model, dev, fp16);
 
+  // Resume: skip seeds whose game file already exists in out_dir.
+  std::unordered_set<uint64_t> done_seeds;
+  if (DIR* dp = opendir(args.out_dir.c_str())) {
+    while (dirent* e = readdir(dp)) {
+      std::string name = e->d_name;
+      const std::string pfx = "game_seed";
+      if (name.rfind(pfx, 0) != 0) continue;
+      if (name.size() < 6 || name.substr(name.size() - 5) != ".json") continue;
+      size_t p = pfx.size(), q = p;
+      while (q < name.size() && isdigit(name[q])) ++q;
+      if (q > p) done_seeds.insert(std::stoull(name.substr(p, q - p)));
+    }
+    closedir(dp);
+  }
+
   std::vector<uint64_t> seeds;
-  for (uint64_t s = args.seed_start; s < args.seed_end; ++s) seeds.push_back(s);
+  for (uint64_t s = args.seed_start; s < args.seed_end; ++s)
+    if (!done_seeds.count(s)) seeds.push_back(s);
+  if (!done_seeds.empty())
+    std::printf("resume: %zu seeds already on disk — %zu remaining\n",
+                done_seeds.size(), seeds.size());
   std::atomic<size_t> next_idx{0};
   std::atomic<int> done{0};
   std::mutex print_mu;
