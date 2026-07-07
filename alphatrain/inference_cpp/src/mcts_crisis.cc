@@ -26,11 +26,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <dirent.h>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "feature_value.h"
@@ -107,6 +110,45 @@ struct ReplayTask {
   int rewind, sims;
 };
 
+constexpr int kRecoveryBit = 1, kPreventionBit = 2;
+
+// Resume state scanned from out_dir: which (seed,label) games already exist
+// ("game_seed<S>_<label>_score*.json"), and which probes capped with no death
+// (logged in capped_probes.log, since they leave no files).
+struct ResumeState {
+  std::unordered_map<uint64_t, int> done;  // seed -> label bitmask
+  std::unordered_set<uint64_t> capped;
+};
+
+ResumeState ScanResume(const std::string& out_dir) {
+  ResumeState rs;
+  if (DIR* dp = opendir(out_dir.c_str())) {
+    while (dirent* e = readdir(dp)) {
+      std::string name = e->d_name;
+      const std::string pfx = "game_seed";
+      if (name.rfind(pfx, 0) != 0) continue;
+      if (name.size() < 6 || name.substr(name.size() - 5) != ".json") continue;
+      size_t p = pfx.size(), q = p;
+      while (q < name.size() && isdigit(name[q])) ++q;
+      if (q == p || q >= name.size() || name[q] != '_') continue;
+      uint64_t seed = std::stoull(name.substr(p, q - p));
+      if (name.compare(q, 10, "_recovery_") == 0) rs.done[seed] |= kRecoveryBit;
+      else if (name.compare(q, 12, "_prevention_") == 0) rs.done[seed] |= kPreventionBit;
+    }
+    closedir(dp);
+  }
+  if (FILE* f = std::fopen((out_dir + "/capped_probes.log").c_str(), "r")) {
+    char line[64];
+    while (std::fgets(line, sizeof(line), f)) {
+      char* end = nullptr;
+      uint64_t s = std::strtoull(line, &end, 10);
+      if (end != line) rs.capped.insert(s);
+    }
+    std::fclose(f);
+  }
+  return rs;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -141,6 +183,22 @@ int main(int argc, char** argv) {
               fp16 ? "fp16" : "fp32", args.threads, args.out_dir.c_str());
   std::fflush(stdout);
 
+  // ============ Resume: skip work that already exists on disk ============
+  ResumeState rs = ScanResume(args.out_dir);
+  const int all_bits = kRecoveryBit | kPreventionBit;
+  size_t resumed_seeds = 0;
+  for (uint64_t s : seeds) {
+    auto it = rs.done.find(s);
+    if (rs.capped.count(s) || (it != rs.done.end() && it->second == all_bits))
+      ++resumed_seeds;
+  }
+  if (resumed_seeds > 0 || !rs.done.empty())
+    std::printf("resume: %zu/%zu seeds already complete (%zu seeds with games "
+                "on disk, %zu capped probes) — skipping them\n",
+                resumed_seeds, seeds.size(), rs.done.size(), rs.capped.size());
+  FILE* capped_log =
+      std::fopen((args.out_dir + "/capped_probes.log").c_str(), "a");
+
   // ============ Phase 1: BULK policy-only probes ============
   struct Slot {
     uint64_t seed;
@@ -151,6 +209,14 @@ int main(int argc, char** argv) {
   size_t next_seed = 0;
   std::vector<Slot> slots;
   auto fill_slot = [&](Slot& s) -> bool {
+    while (next_seed < seeds.size()) {
+      uint64_t sd = seeds[next_seed];
+      auto it = rs.done.find(sd);
+      bool complete = rs.capped.count(sd) ||
+                      (it != rs.done.end() && it->second == all_bits);
+      if (!complete) break;
+      ++next_seed;  // fully processed on a previous run
+    }
     if (next_seed >= seeds.size()) return false;
     s.seed = seeds[next_seed++];
     s.game = clines::Game(s.seed);
@@ -213,10 +279,13 @@ int main(int argc, char** argv) {
         if (dead) {
           ++probe_deaths;
           int death_turn = s.game.turns();
-          struct { const char* label; int rewind, sims; } bands[2] = {
-              {"recovery", args.recovery_turns, args.recovery_sims},
-              {"prevention", args.prevention_turns, args.prevention_sims}};
+          int have = rs.done.count(s.seed) ? rs.done[s.seed] : 0;
+          struct { const char* label; int rewind, sims, bit; } bands[2] = {
+              {"recovery", args.recovery_turns, args.recovery_sims, kRecoveryBit},
+              {"prevention", args.prevention_turns, args.prevention_sims,
+               kPreventionBit}};
           for (auto& band : bands) {
+            if (have & band.bit) continue;  // replay done on a previous run
             int want = std::max(0, death_turn - band.rewind);
             for (const Snapshot& sn : s.ring) {
               if (sn.turn == want) {
@@ -225,6 +294,10 @@ int main(int argc, char** argv) {
               }
             }
           }
+        } else if (capped_log) {
+          // Capped probes leave no game files; log them so a resume skips them.
+          std::fprintf(capped_log, "%llu\n", (unsigned long long)s.seed);
+          std::fflush(capped_log);
         }
         double el = std::chrono::duration<double>(Clock::now() - t0).count();
         std::printf("  [probe %d/%zu] seed=%llu %s turn=%d score=%d | "
@@ -241,6 +314,7 @@ int main(int argc, char** argv) {
     }
     slots.swap(survivors);
   }
+  if (capped_log) std::fclose(capped_log);
   double el1 = std::chrono::duration<double>(Clock::now() - t0).count();
   std::printf("phase 1 done: %d probes, %d deaths, %zu replay checkpoints in "
               "%.0fs\n\n",

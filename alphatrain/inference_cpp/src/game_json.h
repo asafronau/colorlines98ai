@@ -120,15 +120,21 @@ inline void AppendMovesArray(std::string& s, const std::vector<MoveRec>& moves,
   s += "]";
 }
 
-// Write string to path or abort (crash on failure, never skip silently).
+// Write string to path ATOMICALLY (tmp + rename) or abort. Atomicity makes
+// aborted runs resume-safe: a kill mid-write can't leave a truncated .json.
 inline void WriteFileOrDie(const std::string& path, const std::string& body) {
-  FILE* f = std::fopen(path.c_str(), "w");
+  std::string tmp = path + ".tmp";
+  FILE* f = std::fopen(tmp.c_str(), "w");
   if (!f) {
-    std::fprintf(stderr, "FATAL: cannot write %s\n", path.c_str());
+    std::fprintf(stderr, "FATAL: cannot write %s\n", tmp.c_str());
     std::abort();
   }
   std::fwrite(body.data(), 1, body.size(), f);
   std::fclose(f);
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    std::fprintf(stderr, "FATAL: cannot rename %s\n", tmp.c_str());
+    std::abort();
+  }
 }
 
 }  // namespace clines
