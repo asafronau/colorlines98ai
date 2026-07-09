@@ -113,11 +113,13 @@ SearchResult MCTS::Search(const Game& game, double temperature,
 
   SimpleRng sim_rng(StateSeed(game));
 
-  // --- Root: policy priors + feature value ---
+  // --- Root: policy priors + leaf value (NN head or feature evaluator) ---
   std::vector<float> obs(18 * kNN);
   game.BuildObs(obs.data());
   std::vector<float> root_logits(kActions);
-  policy_(obs.data(), 1, root_logits.data());
+  float root_v_nn = 0.0f;
+  policy_(obs.data(), 1, root_logits.data(),
+          cfg_.nn_value ? &root_v_nn : nullptr);
 
   std::vector<int> acts(cfg_.top_k);
   std::vector<double> pris(cfg_.top_k);
@@ -125,7 +127,9 @@ SearchResult MCTS::Search(const Game& game, double temperature,
                       acts.data(), pris.data());
   if (k == 0) return res;  // no legal moves: action stays -1
 
-  double root_value = fe_->Value(game.board().data(), game.next_balls());
+  double root_value = cfg_.nn_value
+                          ? static_cast<double>(root_v_nn)
+                          : fe_->Value(game.board().data(), game.next_balls());
   root->children.reserve(k);
   for (int i = 0; i < k; ++i) {
     pool.emplace_back();
@@ -153,6 +157,7 @@ SearchResult MCTS::Search(const Game& game, double temperature,
   const int B = cfg_.batch_size;
   std::vector<float> obs_buf(static_cast<size_t>(B) * 18 * kNN);
   std::vector<float> logits_buf(static_cast<size_t>(B) * kActions);
+  std::vector<float> values_buf(B);
   std::vector<std::vector<Node*>> paths(B);
   std::vector<Node*> leaves(B);
   std::vector<Game> leaf_games;
@@ -234,7 +239,10 @@ SearchResult MCTS::Search(const Game& game, double temperature,
 
       leaves[b] = node;
       over_flags[b] = sim.over() ? 1 : 0;
-      if (!sim.over()) {
+      // With the NN value head, TERMINAL leaves also need an obs slot (their
+      // V comes from the same fused forward; logits unused). Matches Python's
+      // separate terminal head-eval, fused into the batch here.
+      if (!sim.over() || cfg_.nn_value) {
         sim.BuildObs(obs_buf.data() + static_cast<size_t>(obs_count) * 18 * kNN);
         nn_slot[b] = obs_count++;
       } else {
@@ -243,8 +251,11 @@ SearchResult MCTS::Search(const Game& game, double temperature,
       leaf_games.push_back(std::move(sim));
     }
 
-    // === BATCH EVALUATE (policy only; value is the feature evaluator) ===
-    if (obs_count > 0) policy_(obs_buf.data(), obs_count, logits_buf.data());
+    // === BATCH EVALUATE ===
+    values_buf.resize(obs_count > 0 ? obs_count : 1);
+    if (obs_count > 0)
+      policy_(obs_buf.data(), obs_count, logits_buf.data(),
+              cfg_.nn_value ? values_buf.data() : nullptr);
 
     // === EXPAND + BACKUP ===
     for (int b = 0; b < bs; ++b) {
@@ -267,9 +278,11 @@ SearchResult MCTS::Search(const Game& game, double temperature,
           }
         }
       }
-      // Leaf value = feature evaluator on the leaf board (terminal included —
-      // matches mcts.py's feature_coefs branch for both cases).
-      double value = fe_->Value(lg.board().data(), lg.next_balls());
+      // Leaf value: NN head (fused forward, terminal included) or the feature
+      // evaluator (matches mcts.py's feature_coefs branch for both cases).
+      double value = cfg_.nn_value
+                         ? static_cast<double>(values_buf[nn_slot[b]])
+                         : fe_->Value(lg.board().data(), lg.next_balls());
       if (value < min_q) min_q = value;
       if (value > max_q) max_q = value;
       for (Node* pn : paths[b]) pn->w += kVirtualLoss + value;

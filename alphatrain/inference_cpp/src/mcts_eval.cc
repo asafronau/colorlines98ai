@@ -33,6 +33,7 @@ namespace {
 struct Args {
   std::string model = "data/policy_ts.pt";
   std::string device = "mps";
+  std::string value_module;  // fused policy+value TS -> NN leaf value
   uint64_t seed_start = 775000, seed_end = 775048;  // [start, end)
   int sims = 100;
   int batch_size = 8;
@@ -53,6 +54,7 @@ Args ParseArgs(int argc, char** argv) {
     if (k == "--fp32") { a.fp32 = true; continue; }
     if (i + 1 >= argc) break;
     if (k == "--model") a.model = argv[++i];
+    else if (k == "--value-module") a.value_module = argv[++i];
     else if (k == "--device") a.device = argv[++i];
     else if (k == "--seed-start") a.seed_start = std::stoull(argv[++i]);
     else if (k == "--seed-end") a.seed_end = std::stoull(argv[++i]);
@@ -102,7 +104,10 @@ int main(int argc, char** argv) {
     std::printf("cannot load data/feature_value.bin (run export_feature_weights.py)\n");
     return 1;
   }
-  clines::InferenceServer server(args.model, dev, fp16);
+  const bool nn_value = !args.value_module.empty();
+  clines::InferenceServer server(nn_value ? args.value_module : args.model,
+                                 dev, fp16, 10000, nn_value);
+  if (nn_value) std::printf("NN value head: %s\n", args.value_module.c_str());
 
   std::vector<uint64_t> seeds;
   for (uint64_t s = args.seed_start; s < args.seed_end; ++s) seeds.push_back(s);
@@ -120,6 +125,7 @@ int main(int argc, char** argv) {
   cfg.batch_size = args.batch_size;
   cfg.q_weight = args.q_weight;
   cfg.early_stop = args.early_stop;
+  cfg.nn_value = nn_value;
 
   std::printf("mcts_eval: %zu seeds [%llu,%llu)  sims=%d q=%.2f batch=%d "
               "top_k=%d early_stop=%d  %s %s  threads=%d\n",
@@ -131,7 +137,7 @@ int main(int argc, char** argv) {
 
   auto worker = [&](int tid) {
     clines::MCTS mcts(
-        [&server](const float* o, int n, float* out) { server.Eval(o, n, out); },
+        [&server](const float* o, int n, float* out, float* out_v) { server.Eval(o, n, out, out_v); },
         &fe, cfg);
     while (true) {
       size_t i = next_idx.fetch_add(1);

@@ -27,10 +27,12 @@ class InferenceServer {
  public:
   // log_every_forwards > 0: print "[GPU] ... evals/s" every N forwards (rare,
   // like Python's inference_server) so C++/Python throughput is comparable.
+  // fused_value: module forward returns (logits, value) — the policy+value
+  // export (export_policy_value.py); Eval can then also fill out_values.
   InferenceServer(const std::string& model_path, torch::Device dev, bool fp16,
-                  int64_t log_every_forwards = 10000)
-      : dev_(dev), fp16_(fp16), log_every_(log_every_forwards),
-        t0_(std::chrono::steady_clock::now()) {
+                  int64_t log_every_forwards = 10000, bool fused_value = false)
+      : dev_(dev), fp16_(fp16), fused_value_(fused_value),
+        log_every_(log_every_forwards), t0_(std::chrono::steady_clock::now()) {
     module_ = torch::jit::load(model_path);
     module_.to(dev_);
     if (fp16_) module_.to(torch::kHalf);
@@ -46,8 +48,9 @@ class InferenceServer {
   }
 
   // Blocking. obs = n contiguous (18,9,9) fp32; writes n*6561 logits to out.
-  void Eval(const float* obs, int n, float* out) {
-    Req r{obs, n, out, {}};
+  // out_values (optional, needs fused_value): n scalars.
+  void Eval(const float* obs, int n, float* out, float* out_values = nullptr) {
+    Req r{obs, n, out, out_values, {}};
     std::future<void> done = r.prom.get_future();
     {
       std::lock_guard<std::mutex> l(mu_);
@@ -65,6 +68,7 @@ class InferenceServer {
     const float* obs;
     int n;
     float* out;
+    float* out_v;  // may be null
     std::promise<void> prom;
   };
 
@@ -89,15 +93,23 @@ class InferenceServer {
         dst += static_cast<size_t>(r->n) * 18 * 81;
       }
       if (fp16_) obs = obs.to(torch::kHalf);  // convert BEFORE upload (Lever 1)
-      torch::Tensor logits = module_.forward({obs.to(dev_)})
-                                 .toTensor()
-                                 .to(torch::kFloat)
-                                 .cpu()
-                                 .contiguous();
+      torch::Tensor logits, values;
+      if (fused_value_) {
+        auto tup = module_.forward({obs.to(dev_)}).toTuple();
+        logits = tup->elements()[0].toTensor().to(torch::kFloat).cpu().contiguous();
+        values = tup->elements()[1].toTensor().to(torch::kFloat).cpu().contiguous();
+      } else {
+        logits = module_.forward({obs.to(dev_)})
+                     .toTensor().to(torch::kFloat).cpu().contiguous();
+      }
       const float* src = logits.data_ptr<float>();
+      const float* vsrc = fused_value_ ? values.data_ptr<float>() : nullptr;
       for (Req* r : batch) {
         std::memcpy(r->out, src, static_cast<size_t>(r->n) * 6561 * sizeof(float));
         src += static_cast<size_t>(r->n) * 6561;
+        if (r->out_v && vsrc)
+          std::memcpy(r->out_v, vsrc, static_cast<size_t>(r->n) * sizeof(float));
+        if (vsrc) vsrc += r->n;
         r->prom.set_value();
       }
       fwd_ += 1;
@@ -116,6 +128,7 @@ class InferenceServer {
   torch::jit::Module module_;
   torch::Device dev_;
   bool fp16_;
+  bool fused_value_;
   int64_t log_every_;
   std::chrono::steady_clock::time_point t0_;
   std::mutex mu_;
