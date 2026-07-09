@@ -39,6 +39,8 @@ struct JudgeState {
 struct Args {
   std::string model = "data/policy_ts.pt";
   std::string device = "mps";
+  std::string states = "data/judge_states.bin";
+  std::string out = "data/judge_results.csv";
   int reps = 64;
   int horizon = 300;
   int batch = 512;
@@ -53,6 +55,8 @@ Args ParseArgs(int argc, char** argv) {
     if (i + 1 >= argc) break;
     if (k == "--model") a.model = argv[++i];
     else if (k == "--device") a.device = argv[++i];
+    else if (k == "--states") a.states = argv[++i];
+    else if (k == "--out") a.out = argv[++i];
     else if (k == "--reps") a.reps = std::stoi(argv[++i]);
     else if (k == "--horizon") a.horizon = std::stoi(argv[++i]);
     else if (k == "--batch") a.batch = std::stoi(argv[++i]);
@@ -99,9 +103,9 @@ int main(int argc, char** argv) {
   if (dev.is_mps() && !torch::mps::is_available()) dev = torch::Device(torch::kCPU);
   const bool fp16 = dev.is_mps() && !args.fp32;
 
-  std::vector<JudgeState> states = LoadStates("data/judge_states.bin");
+  std::vector<JudgeState> states = LoadStates(args.states.c_str());
   if (states.empty()) {
-    std::printf("cannot load data/judge_states.bin (run export_judge_states.py)\n");
+    std::printf("cannot load %s\n", args.states.c_str());
     return 1;
   }
   clines::InferenceServer server(args.model, dev, fp16);
@@ -207,7 +211,7 @@ int main(int argc, char** argv) {
   }
 
   // ---- aggregate ----
-  FILE* csv = std::fopen("data/judge_results.csv", "w");
+  FILE* csv = std::fopen(args.out.c_str(), "w");
   std::fprintf(csv, "state,top_share,teacher_died,base_died,teacher_turns,base_turns\n");
   int genuine = 0, phantom = 0, tie = 0;
   double sum_td = 0, sum_bd = 0;
@@ -238,6 +242,6 @@ int main(int argc, char** argv) {
               "PHANTOM %d (%.0f%%)\n",
               margin, genuine, 100.0 * genuine / N, tie, 100.0 * tie / N,
               phantom, 100.0 * phantom / N);
-  std::printf("results: data/judge_results.csv\n");
+  std::printf("results: %s\n", args.out.c_str());
   return 0;
 }
