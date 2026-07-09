@@ -435,6 +435,9 @@ def main():
     p.add_argument('--batch-size', type=int, default=32768)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--warmup-epochs', type=int, default=1)
+    p.add_argument('--seed', type=int, default=None,
+                   help='Seed torch/numpy/random for reproducible runs '
+                        '(unseeded near-replicates differ by ~1k median).')
     p.add_argument('--flat-epochs', type=int, default=0,
                    help='Hold LR flat at peak for N epochs AFTER warmup and '
                         'BEFORE cosine decay. For from-scratch distillation that '
@@ -557,6 +560,15 @@ def main():
                              args.aux_corrections_corpus)) > 1:
         raise SystemExit("Pick ONE aux mode: --aux-counterfactual, "
                          "--aux-crisis[-corpus], or --aux-corrections-corpus.")
+
+    # Reproducibility: σ_train ≈ 1k median between unseeded near-replicates
+    # (HISTORY 165) — seed everything so close A/Bs compare recipes, not RNG.
+    if args.seed is not None:
+        import random as _random
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed % (2**32))
+        _random.seed(args.seed)
+        print(f"Seeded: {args.seed}", flush=True)
 
     # Device
     if torch.cuda.is_available():
