@@ -565,8 +565,9 @@ def main():
     # (HISTORY 165) — seed everything so close A/Bs compare recipes, not RNG.
     if args.seed is not None:
         import random as _random
+        import numpy as _np
         torch.manual_seed(args.seed)
-        np.random.seed(args.seed % (2**32))
+        _np.random.seed(args.seed % (2**32))
         _random.seed(args.seed)
         print(f"Seeded: {args.seed}", flush=True)
 
