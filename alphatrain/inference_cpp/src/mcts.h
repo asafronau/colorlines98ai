@@ -22,10 +22,11 @@
 
 namespace clines {
 
-// Batched policy forward: `obs` holds n contiguous (18,9,9) fp32 observations;
-// writes n*6561 logits to `out`. Provided by the driver (direct LibTorch call
-// or a shared inference-server thread).
-using PolicyFn = std::function<void(const float* obs, int n, float* out)>;
+// Batched policy(+value) forward: `obs` holds n contiguous (18,9,9) fp32
+// observations; writes n*6561 logits to `out`, and (if out_values != nullptr
+// and the module is a fused policy+value export) n scalars to `out_values`.
+using PolicyFn = std::function<void(const float* obs, int n, float* out,
+                                    float* out_values)>;
 
 struct MctsConfig {
   int num_simulations = 100;
@@ -38,6 +39,9 @@ struct MctsConfig {
   // 0 = off (eval). selfplay.py defaults: alpha 0.3, weight 0.25.
   double dirichlet_alpha = 0.0;
   double dirichlet_weight = 0.0;
+  // Leaf value from the fused NN value head (q=2.0 operating point) instead of
+  // the 27-feature linear evaluator. Gate-validated 2026-07-09.
+  bool nn_value = false;
 };
 
 struct Candidate {

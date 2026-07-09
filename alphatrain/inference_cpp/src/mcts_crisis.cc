@@ -50,6 +50,7 @@ struct Args {
   std::string model = "data/policy_ts.pt";
   std::string device = "mps";
   std::string out_dir = "crisis_out";
+  std::string value_module;  // fused policy+value TS -> NN leaf value (q=2 op point)
   uint64_t seed_start = 940100, seed_end = 940400;  // [start, end)
   int recovery_turns = 15, recovery_sims = 1600;
   int prevention_turns = 75, prevention_sims = 2400;
@@ -74,6 +75,7 @@ Args ParseArgs(int argc, char** argv) {
     if (k == "--full-record") { a.full_record = true; continue; }
     if (i + 1 >= argc) break;
     if (k == "--model") a.model = argv[++i];
+    else if (k == "--value-module") a.value_module = argv[++i];
     else if (k == "--device") a.device = argv[++i];
     else if (k == "--out-dir") a.out_dir = argv[++i];
     else if (k == "--seed-start") a.seed_start = std::stoull(argv[++i]);
@@ -166,7 +168,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   ::mkdir(args.out_dir.c_str(), 0755);
-  clines::InferenceServer server(args.model, dev, fp16);
+  const bool nn_value = !args.value_module.empty();
+  clines::InferenceServer server(nn_value ? args.value_module : args.model,
+                                 dev, fp16, 10000, nn_value);
+  if (nn_value) std::printf("NN value head: %s\n", args.value_module.c_str());
 
   std::vector<uint64_t> seeds;
   for (uint64_t s = args.seed_start; s < args.seed_end; ++s) seeds.push_back(s);
@@ -348,7 +353,7 @@ int main(int argc, char** argv) {
       cfg.dirichlet_alpha = args.dirichlet_alpha;
       cfg.dirichlet_weight = args.dirichlet_weight;
       clines::MCTS mcts(
-          [&server](const float* o, int n, float* out) { server.Eval(o, n, out); },
+          [&server](const float* o, int n, float* out, float* out_v) { server.Eval(o, n, out, out_v); },
           &fe, cfg);
       clines::SimpleRng move_rng(replay_seed * 2654435761ULL + 1);
 

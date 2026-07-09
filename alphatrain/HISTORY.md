@@ -3363,3 +3363,51 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      retired from training use; corpus to be regenerated with ep87. LESSON: never rely
      on a default model path in generators — pass --model explicitly and verify the
      export against the checkpoint before generating (a one-line logit-diff check).
+
+177. **small128 improvement loop UNBLOCKED: value_head_small128 + head-guided crisis
+     micro-corpus beats ep87 on the 5k gold standard. Three-gate validation ladder,
+     all gates passed.** (2026-07-09)
+
+     **Model: `checkpoints/gate3/epoch_1.pt`** (pick: ep1; ep3/5 overtrain).
+     **5k eval (775000-779999, C++ eval, fp16):**
+       ep1:  mean 13,080 / P50 9,323 / P5 1,222 / P10 1,889 / <1000 3.5% / >10k 48%
+       ep87: mean 12,895 / P50 8,917 / P5 1,103 / P10 1,810 / <1000 4.2% / >10k 46%
+     Better on EVERY metric (P50 +4.6%, <1000 −17%). The 500-seed gate eval had shown
+     P50 −6% — inverted at 5k (lesson 6 again: 500 seeds mislead close calls).
+
+     **Why this worked when iter-1 regressed 3× (recipe-invariant):** the FV-mined
+     corpus's corrections were 90% survival-neutral (rollout judge; signal only in the
+     danger band +2.6pp). Every historically-working corpus (V13/V14) was mined with a
+     NEURAL SURVIVAL HEAD @ q=2.0 (verified from notebook commands); every FV-mined
+     one failed on a strong base (HISTORY 171/172 + ours). Mechanism: chance-node
+     branching → sims carry ~no horizon; the leaf value function is the knowledge
+     carrier (600 sims + head beats 2400 + FV).
+
+     **Provenance (exact):**
+     1. value_head_small128.pt: survival ValueHead on ep87 FROZEN backbone;
+        labels = build_value_targets on data/crisis_cpp128_v1 + selfplay_cpp128_v2
+        (2.97M states, censoring-aware); train_value_head 5ep/bs4096/lr1e-3 (7.8 min).
+        Death-balanced K=64 val: r 0.79-0.84 (H25-200). NOTE: the old "128ch backbone
+        can't host a head" (val_acc 0.52) was a TRANSFER-DATA artifact — matched data
+        fixed it (HISTORY 158 rule). Afterstate-ranking acc 0.567 ≈ the production
+        value_head_pillar3f's 0.554 on the identical protocol (working heads consume
+        state-level calibration at diverged leaves, not sibling-afterstate deltas).
+     2. Gate-2 target audit (600 sims, no Dirichlet, q sweep): q=0 control = 0
+        corrections; q=1/2 corrections judge at +4.5-5.1pp died-rate gap, 27-29%
+        clear-wins, 0 phantoms (FV corpus: +0.1pp). Quiet states: still ties → the
+        head is a danger-band amplifier, not a broad-corpus unlock. q=2.0 = op point.
+     3. Micro-corpus: crisis_mining (Python, validation exception) ep87 +
+        value_head_small128, q=2.0, recovery 15@600 / prevention 30@400, continue 500,
+        seeds 960000-960099 → 84 deaths → 184 replays / 55,548 states (36 min).
+     4. Train: gate3_crisis.pt + mix_tensors REHEARSAL 3:1 from distill_pillar3k.pt
+        (222,192 states, 25% new signal); train_path_b --resume ep87 --warm-start
+        --channels 128 --seed 42 --epochs 5 --batch-size 4096 --lr 1e-4
+        --warmup-epochs 1 --target-temperature 1.0 --decisiveness-power 0
+        --blend-alpha 0.5.
+     **C++ engine gained NN-value MCTS** (export_policy_value.py fused policy+value
+     TS module; InferenceServer tuple mode; MctsConfig.nn_value; --value-module flag
+     on mcts_eval/mcts_selfplay/mcts_crisis) — production mining no longer needs the
+     Python exception.
+     **NEXT (scale + iterate):** full campaign ~1500-3000 probes @600/400 q=2 with
+     --value-module (C++), rehearsal mix, train, 5k gate; then RE-TRAIN THE HEAD on
+     the new model's own games each iteration (HISTORY 158) and repeat.
