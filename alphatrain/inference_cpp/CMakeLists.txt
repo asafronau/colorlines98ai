@@ -54,3 +54,8 @@ target_link_libraries(mcts_selfplay PRIVATE "${TORCH_LIBRARIES}")
 add_executable(mcts_crisis src/mcts_crisis.cc src/mcts.cc src/game.cc
                            src/obs.cc src/feature_value.cc)
 target_link_libraries(mcts_crisis PRIVATE "${TORCH_LIBRARIES}")
+
+# Rollout judge: teacher-move vs base-move on correction states (died-within-H).
+add_executable(rollout_judge src/rollout_judge.cc src/mcts.cc src/game.cc
+                             src/obs.cc src/feature_value.cc)
+target_link_libraries(rollout_judge PRIVATE "${TORCH_LIBRARIES}")
