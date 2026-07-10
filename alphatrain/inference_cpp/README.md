@@ -12,8 +12,22 @@ API). Training stays in Python. Executables:
 - **`mcts_selfplay`** — MCTS selfplay data gen: records visit distributions in
   the moves-schema JSON that `alphatrain/scripts/build_expert_v2_tensor.py`
   consumes directly (integration-tested end-to-end).
+- **`mcts_crisis`** — crisis mining: bulk greedy probes to death → rewind
+  anchors (recovery/prevention) → deep-MCTS replays. Two-phase, resume-safe.
+- **`rollout_judge`** — adjudicates move pairs by died-within-H rates over R
+  greedy rollouts (correction screening, ranking validation, target audits).
 - **`game_test`**, **`feature_test`** — golden tests (no LibTorch needed): game
   engine + 27-feature leaf-value evaluator, bit-exact vs Python.
+
+**NN value head (`--value-module`)**: `export_policy_value.py` fuses the policy
+with a survival ValueHead into one TorchScript module returning
+`(logits[B,6561], V[B])`; pass it via `--value-module` to mcts_eval /
+mcts_selfplay / mcts_crisis and the MCTS leaf value comes from the head
+(q_weight 2.0 = validated operating point) instead of the linear features.
+Gate-validated 2026-07-09 (HISTORY 177): head-guided corpora improve the
+policy where FV-guided ones regressed. Retrain the head per base model
+(HISTORY 158) and re-export; ALWAYS verify exports against the checkpoint
+(logit diff) before mining — a stale default export once poisoned a corpus.
 
 LibTorch lives inside your venv's `torch`, so there's nothing extra to download;
 `CMakeLists.txt` auto-locates it via the venv python.
