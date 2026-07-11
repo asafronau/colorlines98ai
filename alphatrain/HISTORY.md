@@ -3447,3 +3447,28 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      value-limited" precedent, HISTORY 167/172); (c) multi-step distillation
      (sequence targets) — new machinery. Loop yield after 1 step: ep87→vh1 +4.6%
      median 5k; vh1→? requires one of the above.
+
+179. **Levers (a) and (b) falsified in one day — single-move distillation from this
+     teacher family into vh1 is CLOSED, with receipts from every angle.** (2026-07-11)
+
+     Judge protocol identical throughout (300 corrections vs vh1 argmax, R=64, H=300,
+     vh1 greedy continuation):
+     | teacher config                     | gap    | genuine/tie/phantom |
+     | 600/400 + fresh-label head (a)     | −0.1pp | 5% / 92% / 3%       |
+     | 4800 sims, top-k 300 widened (b)   | +0.3pp | 2% / 97% / 1%       |
+     | (prior: 600-1200 sims, old head)   | +0.2pp | 4% / 93-94% / 2-3%  |
+     | (reference vs ep87, gate-2)        | +4.5pp | 27-29% / — / 0%     |
+     Fresh-label head calibrates fine (r 0.76-0.84 on fresh death-balanced val) —
+     calibration was not the constraint. The widened teacher disagrees MORE (22%
+     correction rate, 16% decisive) but its alternatives are survival-neutral for a
+     greedy executor. The teacher's play edge persists (escapes ~84% of vh1's deaths
+     with rolling search): the residual advantage is structurally MULTI-STEP.
+
+     **State of the small model: `small128_vh1` (5k: mean 13,080 / P50 9,323 /
+     <1000 3.5%). The loop delivered exactly one iteration (+4.6% median over ep87)
+     and every subsequent lever was measured to zero: corpus volume, mix ratio,
+     step count, γ/lr/blend, head freshness, sim depth, tree width.**
+     Remaining directions: (c) multi-step/sequence distillation (research bet,
+     new machinery); (d) a stronger distillation SOURCE (the 256ch line's future
+     improvements, re-distilled); (e) ship vh1 (browser MVP was the point of the
+     4x compression). Strategy decision, not a compute decision.
