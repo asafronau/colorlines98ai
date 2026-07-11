@@ -3411,3 +3411,39 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      **NEXT (scale + iterate):** full campaign ~1500-3000 probes @600/400 q=2 with
      --value-module (C++), rehearsal mix, train, 5k gate; then RE-TRAIN THE HEAD on
      the new model's own games each iteration (HISTORY 158) and repeat.
+
+178. **iter-2 + the distill-better grid: REJECTED end to end — and the cause measured.
+     vh1's per-move marginal gap is CONSUMED after one absorption step.** (2026-07-10/11)
+
+     **What was tried (all 5k-rejected or grid-rejected; vh1 stays baseline):**
+     - iter-2: 2.51M head-guided states (vh1's own deaths, 1200/800 sims, q=2.0,
+       C++-mined) + full rehearsal (6.35M, 39% signal), gate-3 recipe → 5k mean 11,599
+       (−11%). Epoch soup: no rescue.
+     - GRID (6 seeded arms × step-checkpoints every 500): γ-disagreement weighting
+       {0,2,6} × lr {1e-4,3e-4} × blend {0.5,0.3}, from vh1 on iter2_mixg
+       (418,802-correction mask). Control step-axis: best point = s500 (floor ties,
+       median −7%), monotonic-ish decline after — no winning window at ANY step.
+       Best arm g2_lr1_s1000 (only floor-above-bar read at 500 seeds) → 5k mean
+       11,156 (−15%). γ=6 collapses the floor; lr 3e-4 hurts everywhere.
+       (500-seed reads flipped at 5k for the THIRD time — coarse screen only.)
+     - New trainer machinery (kept): `--disagree-gamma` (+ add_disagree_mask.py),
+       `--save-every-steps`, `--seed`; mix_tensors rehearsal blending.
+
+     **The measured cause (rollout judge, vh1 continuation, R=64 H=300):**
+       gate-2 reference (600/400 from ep87):  gap +4.5-5.1pp, 27-29% win, 0 phantom
+       iter-2 corpus (1200/800 from vh1):     gap +0.3pp, 4% win, 94% tie
+       isolation (600/400 from vh1):          gap +0.2pp, 4% win, 93% tie
+     Sims exonerated; recipe exonerated (grid); volume exonerated. **After vh1
+     absorbed gate-3's corrections, the teacher's remaining advantage is no longer
+     expressible as single-move corrections** — yet its PLAY still escapes 84% of
+     vh1's deaths (prevention band): the residual edge is multi-step / rolling-search
+     knowledge. Decisive-share among corrections fell 20% → 5-6%.
+
+     **Levers for iteration 3 (ranked, untested):** (a) sharpen the value head
+     (fresh vh1-era labels, longer horizons) so finer Q differences become
+     expressible as corrections — cheap, judge-auditable before any mining;
+     (b) WIDENED deep search (the +37%-era teacher was 4800 sims with top-k~300
+     widened roots — our miner has only run top-k 30; "sim-limited not
+     value-limited" precedent, HISTORY 167/172); (c) multi-step distillation
+     (sequence targets) — new machinery. Loop yield after 1 step: ep87→vh1 +4.6%
+     median 5k; vh1→? requires one of the above.
