@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "game.h"
+#include "game_json.h"
 
 using clines::Game;
 using Clock = std::chrono::high_resolution_clock;
@@ -33,7 +34,90 @@ struct Args {
   int batch = 256;
   long max_turns = 1000000;
   bool fp32 = false;  // default: fp16 on MPS (like eval_policy.py)
+  // On-policy trajectory recording (DAgger harvest + value-head fuel):
+  // keep the FULL last `record_tail` turns (death band) + every
+  // `record_every`-th turn before that (broad coverage). Empty dir = off.
+  std::string record_dir;
+  int record_every = 8;
+  int record_tail = 160;
 };
+
+// One recorded pre-move snapshot: state + the move the policy chose there.
+struct TurnRec {
+  int8_t board[81];
+  int8_t nb[9];  // (r, c, color) x up to 3
+  int8_t n_next;
+  int32_t move;
+  int32_t turn;  // 0-based move index within the game
+};
+
+TurnRec SnapTurn(const Game& g, int move) {
+  TurnRec t;
+  std::memcpy(t.board, g.board().data(), 81);
+  const auto& nb = g.next_balls();
+  t.n_next = (int8_t)std::min<size_t>(nb.size(), 3);
+  std::memset(t.nb, 0, sizeof(t.nb));
+  for (int i = 0; i < t.n_next; ++i) {
+    t.nb[i * 3 + 0] = (int8_t)nb[i].r;
+    t.nb[i * 3 + 1] = (int8_t)nb[i].c;
+    t.nb[i * 3 + 2] = (int8_t)nb[i].color;
+  }
+  t.move = move;
+  t.turn = (int)g.turns();
+  return t;
+}
+
+void AppendTurnRec(std::string& s, const TurnRec& t) {
+  s += "{\"turn\": " + std::to_string(t.turn) + ", \"board\": [";
+  for (int r = 0; r < 9; ++r) {
+    if (r) s += ", ";
+    s += "[";
+    for (int c = 0; c < 9; ++c) {
+      if (c) s += ", ";
+      s += std::to_string((int)t.board[r * 9 + c]);
+    }
+    s += "]";
+  }
+  s += "], \"next_balls\": [";
+  for (int i = 0; i < t.n_next; ++i) {
+    if (i) s += ", ";
+    s += "{\"row\": " + std::to_string((int)t.nb[i * 3]) +
+         ", \"col\": " + std::to_string((int)t.nb[i * 3 + 1]) +
+         ", \"color\": " + std::to_string((int)t.nb[i * 3 + 2]) + "}";
+  }
+  s += "], \"num_next\": " + std::to_string((int)t.n_next);
+  s += ", \"move\": " + std::to_string(t.move) + "}";
+}
+
+void WriteGameRecord(const Args& args, uint64_t seed, int score, long turns,
+                     bool died, const std::vector<TurnRec>& broad,
+                     const std::vector<TurnRec>& tail_ring, size_t ring_head) {
+  std::string s = "{\"seed\": " + std::to_string(seed) +
+                  ", \"final_score\": " + std::to_string(score) +
+                  ", \"final_turns\": " + std::to_string(turns) +
+                  ", \"died\": " + (died ? "true" : "false") +
+                  ", \"record_every\": " + std::to_string(args.record_every) +
+                  ", \"record_tail\": " + std::to_string(args.record_tail) +
+                  ", \"states\": [";
+  // Tail window start (turn index): everything at or after this is in the ring.
+  long tail_start = std::max<long>(0, turns - (long)tail_ring.size());
+  bool first = true;
+  for (const TurnRec& t : broad) {
+    if (t.turn >= tail_start) break;  // avoid duplicating tail states
+    if (!first) s += ", ";
+    AppendTurnRec(s, t);
+    first = false;
+  }
+  for (size_t i = 0; i < tail_ring.size(); ++i) {
+    const TurnRec& t = tail_ring[(ring_head + i) % tail_ring.size()];
+    if (!first) s += ", ";
+    AppendTurnRec(s, t);
+    first = false;
+  }
+  s += "]}";
+  clines::WriteFileOrDie(
+      args.record_dir + "/game_seed" + std::to_string(seed) + ".json", s);
+}
 
 Args ParseArgs(int argc, char** argv) {
   Args a;
@@ -47,6 +131,9 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--seed-end") a.seed_end = std::stoull(argv[++i]);
     else if (k == "--batch") a.batch = std::stoi(argv[++i]);
     else if (k == "--max-turns") a.max_turns = std::stol(argv[++i]);
+    else if (k == "--record-dir") a.record_dir = argv[++i];
+    else if (k == "--record-every") a.record_every = std::stoi(argv[++i]);
+    else if (k == "--record-tail") a.record_tail = std::stoi(argv[++i]);
   }
   return a;
 }
@@ -93,13 +180,21 @@ int main(int argc, char** argv) {
   size_t next = 0;
   const int B = std::min<int>(args.batch, (int)todo.size());
 
-  struct Slot { uint64_t seed; Game game; };
+  struct Slot {
+    uint64_t seed; Game game;
+    std::vector<TurnRec> broad, ring;  // recording only
+    size_t ring_head = 0;
+  };
+  const bool recording = !args.record_dir.empty();
   std::vector<Slot> slots;
   auto make_slot = [&](Slot& dst) -> bool {
     if (next >= todo.size()) return false;
     dst.seed = todo[next++];
     dst.game = Game(dst.seed);
     dst.game.Reset();
+    dst.broad.clear();
+    dst.ring.clear();
+    dst.ring_head = 0;
     return true;
   };
   slots.reserve(B);
@@ -156,11 +251,25 @@ int main(int argc, char** argv) {
       bool dead = !any_legal;
       if (!dead) {
         int64_t m = mv[i];
+        if (recording) {
+          TurnRec tr = SnapTurn(slots[i].game, (int)m);
+          if (tr.turn % args.record_every == 0) slots[i].broad.push_back(tr);
+          if ((int)slots[i].ring.size() < args.record_tail) {
+            slots[i].ring.push_back(tr);
+          } else {
+            slots[i].ring[slots[i].ring_head] = tr;
+            slots[i].ring_head = (slots[i].ring_head + 1) % slots[i].ring.size();
+          }
+        }
         int s = (int)(m / 81), t = (int)(m % 81);
         bool ok = slots[i].game.Move(s / 9, s % 9, t / 9, t % 9);
         dead = !ok || slots[i].game.over() || slots[i].game.turns() >= args.max_turns;
       }
       if (dead) {
+        if (recording)
+          WriteGameRecord(args, slots[i].seed, slots[i].game.score(),
+                          slots[i].game.turns(), slots[i].game.over(),
+                          slots[i].broad, slots[i].ring, slots[i].ring_head);
         scores.push_back(slots[i].game.score());
         ++done;
         Slot repl{0, Game(0)};
