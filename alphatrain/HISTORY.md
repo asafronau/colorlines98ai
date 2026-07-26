@@ -3472,3 +3472,57 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      new machinery); (d) a stronger distillation SOURCE (the 256ch line's future
      improvements, re-distilled); (e) ship vh1 (browser MVP was the point of the
      4x compression). Strategy decision, not a compute decision.
+
+180. **Phase 0b (DAgger gate): MICRO-GO — pillar3k's single-move corrections ARE
+     greedy-cashable by vh1; the effect concentrates in confident disagreements;
+     burst ladder is FLAT (single-move labels valid).** (2026-07-26)
+
+     Context: single-move distillation from vh1's OWN MCTS teacher closed (179).
+     New hypothesis (peer-reviewed, docs/small128_dagger_for_review.md): the
+     256ch teacher pillar3k_ep22 (5k mean 43,390, GREEDY eval) is a different
+     signal — its per-move choices are cashable by a greedy executor.
+
+     **ChatGPT review corrections, all verified then adopted (commit 452afd4):**
+     crisis tensors are ~99.7% MCTS-replay states (only first-of-replay rows are
+     true student-visited anchors — original 0a measured the wrong distribution);
+     old judge exporter restricted base move to stored teacher top-5; the 2.5M
+     "3:1" mix is really 39.5% new + its ep1 = ~28.6x the winning run's optimizer
+     steps; a hard 500-seed ep1 gate would have rejected vh1 itself (HISTORY:3375).
+
+     **Corrected 0a (7,287 true anchors from 3,653 vh1 deaths, full-legal argmax
+     both policies):** agree 70.7% all / 69.0% recovery — NO aggregate drop, but
+     disagreements sharpen near death: teacher logit-gap median 0.95 in recovery,
+     49% >=1.0 (vs 0.40 / 27% in prevention). Aggregate agreement was the wrong
+     shift diagnostic.
+
+     **The gate (2,135 disagreement anchors x 2 arms x 64 common-seed reps,
+     H=300, 7 continuation conditions, seed-cluster bootstrap 95% CIs):**
+       ./scripts/run_dagger_judge.sh  (rollout_judge + new --burst-model/--burst-len)
+       python -m alphatrain.scripts.export_dagger_anchors   (anchors + .bin + meta)
+       python -m alphatrain.scripts.dagger_judge_analysis   (CIs + bars)
+     Models: vh1_policy_ts.pt / pillar3k_ep22_policy_ts.pt, both logit-diff
+     verified 0.00e+00 vs checkpoints (verify_ts_export.py — provenance rule).
+
+     Condition S (vh1 continuation, PRIMARY): **+1.69pp [+1.32,+2.09]** died-
+     within-300 uplift (turns +4.9). Genuine 18% : phantom 9% (own-MCTS levers
+     in 178/179 read 2-5% genuine, <=+0.3pp).
+       Strata: gap>=1.0 (n=822) **+3.73pp [+3.03,+4.42]**, turns +11.5 — near
+       the gate-2 win-predicting +4.5pp reference; gap<0.5 (n=934) +0.34pp = 0;
+       recovery +2.25pp vs prevention +1.06pp.
+       T (teacher continuation) +1.81pp; bursts L=1/2/4/8/16: +1.55/+1.30/+1.30/
+       +1.43/+1.54 — **FLAT ladder**: the advantage cashes at the single move,
+       is continuation-robust, and teacher control after the swap adds nothing.
+       So: single-move DAgger labels are VALID; short-sequence cloning adds no
+       value ON THESE anchors.
+
+     **Verdict per pre-registered bars: MICRO-GO** (lower CI > 0, point >= +1pp;
+     Strong GO needed lower CI > +2pp).
+
+     **NEXT (Phase 1, per review recipe + concentration finding):** 50-75k
+     genuinely on-policy corpus — add --record-games to eval.cc (slim JSON via
+     game_json.h) -> fresh vh1 greedy games -> harvest recovery/prevention/broad
+     bands, mostly disagreements (gap<0.5 carries ~nothing; emphasize confident
+     corrections), minority agreement states for calibration; pillar3k top-5 +
+     argmax labels; 3:1 rehearsal; warm-start vh1; checkpoints at ~100/250/400/
+     800 optimizer STEPS (absorption optimum, not epochs); 500-seed screens only
+     reject catastrophes; the 5k eval decides.
