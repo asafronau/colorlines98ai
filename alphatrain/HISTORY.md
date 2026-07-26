@@ -3526,3 +3526,43 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      argmax labels; 3:1 rehearsal; warm-start vh1; checkpoints at ~100/250/400/
      800 optimizer STEPS (absorption optimum, not epochs); 500-seed screens only
      reject catastrophes; the 5k eval decides.
+
+181. **DAgger round-1 corpus BUILT (dagger_v1_mix.pt) + Colab package ready.**
+     (2026-07-26)
+
+     Follows the HISTORY 180 MICRO-GO. Master remains FROZEN by user directive
+     (pillar3k = static label source only; all evolution on the small line).
+
+     **On-policy generation (C++ eval, new --record-dir/--record-every/--record-tail):**
+       ./build/eval --model data/vh1_policy_ts.pt --device mps --batch 512
+         --seed-start 860000 --seed-end 862000 --max-turns 40000
+         --record-dir data/dagger_games_v1
+     2,000 vh1 greedy games in 443s. Distribution matched vh1's 5k bar (mean
+     12,860 / P50 9,005 / <1000 4.3%) = on-policy sanity OK. Record format:
+     full last-160-turn death band + every-8th-turn broad samples (~350/game),
+     with the PLAYED move per state (fp16 batched argmax = deployment truth).
+
+     **Harvest (alphatrain/scripts/harvest_dagger_corpus.py, seed 0):** 703,788
+     candidates -> teacher selection pass (pillar3k fp16, full-legal argmax +
+     logit gap vs the recorded student move) -> selection per HISTORY 180
+     concentration: band disagreements gap>=0.5 all (25% sample below), broad
+     only gap>=1.0, agreements downsampled to 18%; per-game caps 30/4/6; dedup.
+     **66,917 states**: recovery 23,139 (21,119 dis) / prevention 31,992
+     (27,255 dis) / broad 11,786 (6,543 dis, all confident) / agreements 12,000.
+     Meta sidecar dagger_v1_states_meta.npz (seed/turn/band/gap/moves).
+
+     **Labels:** distill_relabel.py (pillar3k ep22, top-5 legal softmax — the
+     IDENTICAL convention as the rehearsal corpus). Label top-share P50=0.41.
+     **Mix:** mix_tensors 3:1 -> 267,668 states, EXACTLY 25% new signal (the
+     proven gate-3 ratio; no rehearsal-cap distortion at this size). Mask:
+     patch_mix_mask.py -> disagree_mask on 47,308 confident-correction rows
+     (rehearsal rows 0). ~523 optimizer steps/epoch at batch 4096 aug 8.
+
+     **Colab (train_small128_dagger_colab.ipynb, RUN=small128_dagger1):**
+     gate-3 winner recipe: warm-start vh1, blend 0.5, T=1.0, dw 0, lr 1e-4,
+     bs 4096, seed 42, 3 epochs + --save-every-steps 100 (absorption window
+     100-1000 steps). Upload: colorlines_pillar3d_v4.tar.gz (523,429 B),
+     dagger_v1_mix.pt.gz (16,158,887 B), small128_vh1.pt (36,156,933 B).
+     Gate: 500-seed = catastrophe filter ONLY; floor-first shortlist -> 5k
+     decides vs vh1 bar (13,080 / 9,323 / P5 1,222 / <1000 3.5%).
+     Expectation (HISTORY 180 calibration): +3-8% median.
