@@ -3566,3 +3566,43 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Gate: 500-seed = catastrophe filter ONLY; floor-first shortlist -> 5k
      decides vs vh1 bar (13,080 / 9,323 / P5 1,222 / <1000 3.5%).
      Expectation (HISTORY 180 calibration): +3-8% median.
+
+182. **dagger1 REGRESSED at 5k despite the validated gate — postmortem measured,
+     peer review requested.** (2026-07-26)
+
+     Trained per 181 (RUN=small128_dagger1, gate-3 recipe, 3ep + step saves).
+     500-seed screens: no catastrophe across the whole 100-1,570-step grid.
+     5k evals (775000-779999) of the floor-first shortlist — ALL regress vh1
+     (bar: 13,080 / 9,323 / P5 1,222 / <1000 3.5%):
+       e2_s200: 12,312 / 8,554 (-8.2% P50) / 1,021 / 4.9%
+       epoch_2: 12,678 / 8,816 (-5.4%) / 1,124 / 4.2%   (val 1.90 < vh1's 2.05
+                — val IMPROVED while gameplay regressed; the val trap again)
+       e3_s400: 12,610 / 8,917 (-4.4%) / 1,170 / 3.8%
+
+     **Diagnostics (scripts diag_dagger1_regression.py / _direction.py):**
+     - ABSORPTION on the 47,308 trained confident-correction rows: vh1 10.8%
+       (near-tie fp16/fp32 baseline) -> trained 18% (+7pp only). keep_vh1
+       80->66%; THIRD moves 9->16% (corruption on the very states we fixed).
+     - DRIFT: 6.8-7.9% of argmaxes changed on held-out quiet states AND the
+       rehearsal sample; fully formed at step 100 (warmup LR ~2e-5), partially
+       heals later.
+     - DIRECTION: mimicry-pull REFUTED. Match-to-pillar3k: ep87 73.0 / vh1
+       73.0 / e3_s400 72.8 / e1_s100 72.4 — drift is AWAY from the teacher,
+       incoherent, not re-distillation.
+     - Near-tie contamination: vh1 keeps only 80.2% of its own recorded moves
+       under fp32 recompute -> part of the "confident disagreement" set is
+       tie-flips, not real preference conflicts.
+
+     **The puzzle:** judge-validated +1.69pp single-move signal (HISTORY 180)
+     fails to install (18%) and costs -3..-6% at 5k, while the structurally
+     identical gate-3 recipe (same warm-start/LR/blend/rehearsal tensor) had
+     WON +4.6% with MCTS-on-student labels at natural (low) correction density.
+     Deltas: label function (search-on-self vs bigger-net policy), correction
+     density (82% vs natural), contested-ness (gap median 0.65, soft top-share
+     0.41 labels). Echo of pillar3c ("argmax-flip too aggressive").
+
+     Peer-review brief: docs/small128_dagger1_postmortem_for_review.md
+     (mechanism candidates: contradiction-gradient churn / BN stats shift /
+     hard-CE aggression; round-2 arm menu with pre-registered early-abort).
+     NO round-2 compute before review + arm selection. vh1 REMAINS the
+     deployed best.
