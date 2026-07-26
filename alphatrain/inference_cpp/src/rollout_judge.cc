@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,11 @@ struct JudgeState {
 
 struct Args {
   std::string model = "data/policy_ts.pt";
+  // Optional: continue with THIS model for the first burst_len moves after the
+  // judged move (both arms identically), then switch to `model`. Measures how
+  // long the stronger policy must stay in control before its edge is cashable.
+  std::string burst_model;
+  int burst_len = 0;
   std::string device = "mps";
   std::string states = "data/judge_states.bin";
   std::string out = "data/judge_results.csv";
@@ -54,6 +60,8 @@ Args ParseArgs(int argc, char** argv) {
     if (k == "--fp32") { a.fp32 = true; continue; }
     if (i + 1 >= argc) break;
     if (k == "--model") a.model = argv[++i];
+    else if (k == "--burst-model") a.burst_model = argv[++i];
+    else if (k == "--burst-len") a.burst_len = std::stoi(argv[++i]);
     else if (k == "--device") a.device = argv[++i];
     else if (k == "--states") a.states = argv[++i];
     else if (k == "--out") a.out = argv[++i];
@@ -109,10 +117,17 @@ int main(int argc, char** argv) {
     return 1;
   }
   clines::InferenceServer server(args.model, dev, fp16);
+  const bool burst = !args.burst_model.empty() && args.burst_len > 0;
+  std::unique_ptr<clines::InferenceServer> burst_server;
+  if (burst)
+    burst_server = std::make_unique<clines::InferenceServer>(
+        args.burst_model, dev, fp16);
   const int N = (int)states.size(), R = args.reps;
   std::printf("rollout_judge: %d correction states x 2 arms x %d reps, "
-              "horizon %d, %s %s\n",
-              N, R, args.horizon, args.device.c_str(), fp16 ? "fp16" : "fp32");
+              "horizon %d, %s %s%s\n",
+              N, R, args.horizon, args.device.c_str(), fp16 ? "fp16" : "fp32",
+              burst ? (" burst_len=" + std::to_string(args.burst_len)).c_str()
+                    : "");
   std::fflush(stdout);
 
   // outcome[state][arm][rep] = turns survived (capped at horizon); died flag
@@ -164,13 +179,38 @@ int main(int argc, char** argv) {
   size_t done = 0;
   auto t0 = Clock::now();
 
+  std::vector<float> burst_obs, burst_logits;
   while (!slots.empty()) {
     int n = (int)slots.size();
     obs_buf.resize((size_t)n * 18 * clines::kNN);
     logits_buf.resize((size_t)n * clines::kActions);
     for (int i = 0; i < n; ++i)
       slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
-    server.Eval(obs_buf.data(), n, logits_buf.data());
+    if (!burst) {
+      server.Eval(obs_buf.data(), n, logits_buf.data());
+    } else {
+      // Continuation moves made so far = turns() - 1 (the judged move was #1).
+      // First burst_len continuation moves use the burst model, both arms.
+      std::vector<int> bidx, midx;
+      for (int i = 0; i < n; ++i)
+        (slots[i].game.turns() - 1 < args.burst_len ? bidx : midx).push_back(i);
+      for (const auto* grp : {&bidx, &midx}) {
+        if (grp->empty()) continue;
+        const bool is_burst = grp == &bidx;
+        burst_obs.resize(grp->size() * 18 * clines::kNN);
+        burst_logits.resize(grp->size() * clines::kActions);
+        for (size_t g = 0; g < grp->size(); ++g)
+          std::memcpy(burst_obs.data() + g * 18 * clines::kNN,
+                      obs_buf.data() + (size_t)(*grp)[g] * 18 * clines::kNN,
+                      sizeof(float) * 18 * clines::kNN);
+        (is_burst ? *burst_server : server)
+            .Eval(burst_obs.data(), (int)grp->size(), burst_logits.data());
+        for (size_t g = 0; g < grp->size(); ++g)
+          std::memcpy(logits_buf.data() + (size_t)(*grp)[g] * clines::kActions,
+                      burst_logits.data() + g * clines::kActions,
+                      sizeof(float) * clines::kActions);
+      }
+    }
 
     std::vector<Slot> live;
     live.reserve(n);
