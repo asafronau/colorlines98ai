@@ -30,6 +30,18 @@ from alphatrain.evaluate import load_model
 from alphatrain.observation import build_observation
 from alphatrain.counterfactual import soft_correction_loss
 from alphatrain.train_path_b import frozen_bn
+from alphatrain.mcts import _legal_priors_jit
+
+
+def build_legal_mask(boards, device):
+    """Dense bool legal-move mask per state (True = legal)."""
+    n = boards.shape[0]
+    mask = np.zeros((n, 6561), dtype=bool)
+    dummy = np.zeros(6561, dtype=np.float32)
+    for i in range(n):
+        k, fi, _ = _legal_priors_jit(boards[i], dummy, 6561)
+        mask[i, fi[:k]] = True
+    return torch.from_numpy(mask).to(device)
 
 
 def load_corpus(path, device, holdout_frac, split_seed):
@@ -47,6 +59,9 @@ def load_corpus(path, device, holdout_frac, split_seed):
                     for i in range(n)])
     print(f"obs built in {time.time()-t0:.0f}s", flush=True)
     obs = torch.from_numpy(obs).to(device)
+    legal = build_legal_mask(boards, device)
+    print(f"legal mask built ({legal.sum(1).float().mean():.0f} legal/state avg)",
+          flush=True)
 
     seeds_all = c['seed'].tolist()
     uniq = sorted(set(int(s) for s in seeds_all))
@@ -62,6 +77,7 @@ def load_corpus(path, device, holdout_frac, split_seed):
     w_tr = (w_tr / w_tr.mean().clamp(min=1e-6)).to(device)
     mk = lambda ix: {'obs': obs[ix], 'tgt_idx': c['tgt_idx'][ix].to(device),
                      'tgt_prob': c['tgt_prob'][ix].to(device),
+                     'legal': legal[ix],
                      **({'vh1_move': c['vh1_move'][ix].to(device)}
                         if 'vh1_move' in c else {})}
     train, held = mk(tr), (mk(ho) if ho.numel() else None)
@@ -80,9 +96,11 @@ def split_metrics(model, sub, bs=2048):
         out = model(sub['obs'][i:i + bs])
         logits = (out[0] if isinstance(out, tuple) else out).float()
         ti, tp = sub['tgt_idx'][i:i + bs], sub['tgt_prob'][i:i + bs]
-        match += (logits.argmax(1) == ti[:, 0]).sum().item()
-        logp = torch.log_softmax(logits, 1)
+        logp = torch.log_softmax(logits, 1)  # CE on raw logits (padded ti rows)
         ce += (-(tp * torch.gather(logp, 1, ti)).sum(1)).sum().item()
+        if 'legal' in sub:  # deployment-equivalent: argmax over LEGAL moves
+            logits = logits.masked_fill(~sub['legal'][i:i + bs], float('-inf'))
+        match += (logits.argmax(1) == ti[:, 0]).sum().item()
         if 'vh1_move' in sub:
             lt = logits.gather(1, ti[:, :1]).squeeze(1)
             ls = logits.gather(1, sub['vh1_move'][i:i + bs].unsqueeze(1)).squeeze(1)
@@ -101,11 +119,23 @@ def main():
                    help='0: weight decay would shrink the task vector toward the '
                         'origin, not toward base — off by default.')
     p.add_argument('--target-temperature', type=float, default=0.5)
-    p.add_argument('--loss', choices=['soft', 'margin'], default='soft',
-                   help="margin: pairwise hinge relu(m - (logit[teacher_mv] - "
-                        "logit[vh1_mv])) — teaches ONLY the judged preference "
-                        "(R2 review arm 1); needs corpus with vh1_move.")
+    p.add_argument('--loss', choices=['soft', 'margin', 'legalmax'],
+                   default='soft',
+                   help="margin: pairwise hinge vs vh1's move only. legalmax "
+                        "(R2b review arm): relu(m + max_{legal a != teacher} "
+                        "logit[a] - logit[teacher]) — directly optimizes legal "
+                        "top-1 adoption with dynamic hard negatives, stops "
+                        "once the teacher wins by m.")
     p.add_argument('--margin', type=float, default=0.15)
+    p.add_argument('--kl-anchor-weight', type=float, default=0.0,
+                   help='lambda for CE-to-base anchor on independent quiet '
+                        'states (KL(base||model) up to a constant).')
+    p.add_argument('--anchor-games-dir', default='data/dagger_games_v1')
+    p.add_argument('--anchor-skip-games', type=int, default=200,
+                   help='skip the first N games (used by the gate holdout).')
+    p.add_argument('--anchor-games', type=int, default=150)
+    p.add_argument('--anchor-batch', type=int, default=1024)
+    p.add_argument('--shuffle-seed', type=int, default=0)
     p.add_argument('--weighted', action='store_true', default=True)
     p.add_argument('--holdout-frac', type=float, default=0.15)
     p.add_argument('--split-seed', type=int, default=0)
@@ -115,9 +145,37 @@ def main():
     a = p.parse_args()
 
     dev = torch.device(a.device)
+    torch.manual_seed(a.shuffle_seed)
     net, _ = load_model(a.base, dev, fp16=False)
     base_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
     train, held = load_corpus(a.corpus, dev, a.holdout_frac, a.split_seed)
+
+    anchor_obs, anchor_probs = None, None
+    if a.kl_anchor_weight > 0:
+        from alphatrain.scripts.diag_dagger1_regression import build_holdout
+        os.makedirs(a.save_dir, exist_ok=True)
+        tmp = os.path.join(a.save_dir, 'anchor.tmp')
+        n_anchor = build_holdout(a.anchor_games_dir, a.corpus, a.anchor_games,
+                                 100, tmp, np.random.default_rng(7),
+                                 skip=a.anchor_skip_games)
+        t = torch.load(tmp, map_location='cpu', weights_only=True)
+        os.remove(tmp)
+        ao = np.stack([build_observation(
+            t['boards'][i].numpy(), t['next_pos'][i, :, 0].numpy().astype(np.int64),
+            t['next_pos'][i, :, 1].numpy().astype(np.int64),
+            t['next_col'][i].numpy().astype(np.int64), int(t['n_next'][i]))
+            for i in range(n_anchor)])
+        anchor_obs = torch.from_numpy(ao).to(dev)
+        with torch.no_grad():
+            ps = []
+            for i in range(0, n_anchor, 2048):
+                out = net(anchor_obs[i:i + 2048])
+                lg = (out[0] if isinstance(out, tuple) else out).float()
+                ps.append(torch.softmax(lg, 1).half())
+            anchor_probs = torch.cat(ps)
+        print(f"anchor: {n_anchor:,} quiet states from games "
+              f"[{a.anchor_skip_games}:{a.anchor_skip_games + a.anchor_games}], "
+              f"lambda={a.kl_anchor_weight}", flush=True)
     N = train['obs'].size(0)
     steps = (N + a.batch - 1) // a.batch
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr,
@@ -148,11 +206,26 @@ def main():
                 ls = logits.gather(
                     1, train['vh1_move'][idx].unsqueeze(1)).squeeze(1)
                 loss = torch.relu(a.margin - (lt - ls)).mean()
+            elif a.loss == 'legalmax':
+                t1 = train['tgt_idx'][idx][:, :1]
+                lg = logits.masked_fill(~train['legal'][idx], float('-inf'))
+                lt = lg.gather(1, t1).squeeze(1)
+                hard_neg = lg.scatter(1, t1, float('-inf')).max(1).values
+                loss = torch.relu(a.margin + hard_neg - lt).mean()
             else:
                 loss = soft_correction_loss(
                     logits, train['tgt_idx'][idx], train['tgt_prob'][idx],
                     anchor_weight=(train['weight'][idx] if a.weighted else None),
                     target_temperature=a.target_temperature)
+            if anchor_probs is not None:
+                aidx = torch.randint(0, anchor_probs.shape[0],
+                                     (a.anchor_batch,), device=dev)
+                with frozen_bn(net):
+                    aout = net(anchor_obs[aidx])
+                alg = aout[0] if isinstance(aout, tuple) else aout
+                ce_a = -(anchor_probs[aidx].float()
+                         * torch.log_softmax(alg.float(), 1)).sum(1).mean()
+                loss = loss + a.kl_anchor_weight * ce_a
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
