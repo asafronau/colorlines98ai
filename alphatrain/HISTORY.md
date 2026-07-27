@@ -3651,3 +3651,49 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Arm 2 control (labels-vs-loss-geometry): current 0.5 soft/hard +
      rehearsal on the SAME gap>=1 corpus. Venue for the ~minutes fine-tune
      (M5 per ta15 precedent vs Colab per standing rule) = user's call.
+
+184. **R2 arm-1 (task-vector margin) — NO-GO at the pre-registered gate; the
+     correction-vs-collateral frontier is bad at EVERY alpha. Cross-function
+     per-state installation is now closed with receipts from two loss
+     geometries.** (2026-07-26)
+
+     Run: run_dagger_r2.sh — train_crisis_ft --loss margin --margin 0.15 on
+     dagger_r2_gap1.pt (25,116 judged gap>=1.0 rows), frozen BN (verified
+     bit-identical), 20ep @ 4s/ep on M5; merges alpha={0.05,0.1,0.2,0.4};
+     gate_dagger_r2.py (fp16, 3,799 by-seed held-out corrections + 18,321
+     quiet holdout states).
+
+     **Training curves — the decisive fact:** train pref (logit_t > logit_s)
+     climbed 0.11 -> 0.77, but HELD pref plateaued at ~0.49 from ep5 onward.
+     The corrections DO NOT generalize across seeds — each is ~a lookup
+     entry. Argmax adoption stayed low even on TRAIN rows (~0.08; the hinge
+     lifts teacher-vs-vh1 without making teacher top-1 overall).
+
+     **Gate table (bars: adoption >= +10pp, drift <= 3%, third <= adoption):**
+       model    adopt%  pref%  marg_med  drift%  third%
+       vh1         0.5    0.0    -1.062     0.0     0.4
+       a005        3.7    3.6    -0.953     3.8     5.0
+       a01         6.8    7.5    -0.875     8.2    10.6
+       a02        10.9   13.7    -0.719    18.2    19.4
+       a04        15.7   25.9    -0.438    40.5    35.6
+       ft(a=1)     7.4   50.4    +0.008    89.6    85.6   (fabric destroyed;
+                                                           adoption NON-monotonic in alpha)
+     Collateral >= useful at every point (needed 2:1 the other way). NO
+     gameplay evals run — the bars exist to stop here.
+
+     **Where this leaves the theory:** labels are good (+2.4..+2.8pp row-
+     validated, 180/183) but pillar3k's contested-state preferences are
+     OFF-MANIFOLD for vh1's 128ch feature geometry — pointwise supervised
+     installation (dense soft/hard R1, pairwise-margin task-vector R2) buys
+     <=1 useful flip per collateral flip at any dose. Contrast gate-3's WIN:
+     MCTS-on-vh1 corrections are ON-manifold (search amplifies the net's own
+     latent preferences) and installed cleanly (+4.6%).
+
+     **Named next options:** (a) same-forward gradient-cosine audit among
+     corrections (documents interference; cheap); (b) STRATEGIC: re-arm the
+     on-manifold channel — retrain the survival value head on the 2k+ recorded
+     vh1 games (generate more overnight, ~4.5 games/s), gate-1 calibration,
+     gate-2 judge of MCTS-on-vh1 with the better head (value-function law:
+     leaf value = teacher strength); if positive -> the proven gate-3 recipe;
+     (c) 192ch capacity control (standing contingency — multiple channels now
+     read "uninstallable at 128ch/3M").
