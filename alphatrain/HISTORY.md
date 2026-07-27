@@ -3606,3 +3606,48 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      hard-CE aggression; round-2 arm menu with pre-registered early-abort).
      NO round-2 compute before review + arm selection. vh1 REMAINS the
      deployed best.
+
+183. **R2 diagnostics VINDICATE the data (row-level judge + fp16 re-audit);
+     round-2 arm = task-vector margin fine-tune, machinery built.** (2026-07-26)
+
+     ChatGPT review of the 182 postmortem: all checkable claims verified
+     (gap counts 31,659/25,116/15,649/7,609 of 54,917; HISTORY 146 BN-recal
+     precedent; HISTORY 168-170 task-vector channel). Its key corrections:
+     fp32 diagnostics were off-protocol; "mimicry-pull refuted" overclaimed
+     (val CE 2.05->1.90 IS distributional movement toward the teacher);
+     42% of trained disagreement rows were never judge-validated; effective
+     top-1 target mass was already 0.705 (one-hot hardening = wrong arm);
+     its own BN swap audit: amplifier, not primary cause. Mechanism verdict:
+     OBJECTIVE/PROJECTION MISMATCH — judge validated action replacement;
+     training demanded the 256ch teacher's full truncated top-5 logit
+     geometry, which a 128ch net cannot fit pointwise without rotating
+     unrelated rankings (the 7% quiet churn).
+
+     **New measurements (scripts diag_dagger1_fp16.py, rowjudge_analysis.py):**
+     - fp16 protocol: recorded corpus actions = vh1's deployment argmax 98.9%
+       (the fp32 "80.2% near-tie contamination" was MY measurement artifact);
+       true baseline teacher-play 0.6%; true absorption 11.8%; third 12.6%
+       (67% inside teacher top-5).
+     - ROW-LEVEL judge (750 actual corpus rows, exact fp16 label actions,
+       vh1 continuation, seed-cluster bootstrap):
+         gap>=1.0 x margin-large : +2.42pp [+1.15,+3.70]
+         gap>=1.0 x margin-small : +2.80pp [+1.67,+4.02]
+         gap 0.5-1.0 (both)      : +0.7pp, CIs cross zero
+         gap<0.5                 : +0.08pp
+       Student top-2 margin does NOT gate installability. Labels are GOOD
+       where validated; 42% of the trained corpus was dead weight.
+     - THIRD-action judge (300 rows): the trained model's invented moves are
+       +1.53pp [+0.59,+2.50] BETTER than vh1's originals. Per-move learning
+       was fine; the -4% regression is the COLLATERAL quiet-state churn.
+
+     **Round-2 build (committed):** dagger_r2_gap1.pt = 25,116 judged-domain
+     gap>=1.0 recovery/prevention rows, 1,997 seeds, gap median 1.94
+     (build_dagger_r2_corpus.py). train_crisis_ft.py extended with
+     --loss margin --margin 0.15 (pairwise hinge teacher-vs-vh1 action,
+     frozen BN, corrections-only) + pref metric. Plan: fine-tune ->
+     merge_checkpoints.py alpha={0.05,0.1,0.2,0.4} -> gate_dagger_r2.py
+     (pre-registered: adoption >= +10pp, quiet drift <= 3%, third <=
+     adoption, margin median up) -> 500-seed catastrophe screen -> 5k.
+     Arm 2 control (labels-vs-loss-geometry): current 0.5 soft/hard +
+     rehearsal on the SAME gap>=1 corpus. Venue for the ~minutes fine-tune
+     (M5 per ta15 precedent vs Colab per standing rule) = user's call.

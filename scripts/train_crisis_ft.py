@@ -61,7 +61,9 @@ def load_corpus(path, device, holdout_frac, split_seed):
     w_tr = c['weight'][tr]
     w_tr = (w_tr / w_tr.mean().clamp(min=1e-6)).to(device)
     mk = lambda ix: {'obs': obs[ix], 'tgt_idx': c['tgt_idx'][ix].to(device),
-                     'tgt_prob': c['tgt_prob'][ix].to(device)}
+                     'tgt_prob': c['tgt_prob'][ix].to(device),
+                     **({'vh1_move': c['vh1_move'][ix].to(device)}
+                        if 'vh1_move' in c else {})}
     train, held = mk(tr), (mk(ho) if ho.numel() else None)
     train['weight'] = w_tr
     print(f"train={tr.numel()} heldout={ho.numel()} "
@@ -73,7 +75,7 @@ def load_corpus(path, device, holdout_frac, split_seed):
 def split_metrics(model, sub, bs=2048):
     model.train(False)
     N = sub['obs'].size(0)
-    match, ce = 0, 0.0
+    match, ce, pref = 0, 0.0, 0
     for i in range(0, N, bs):
         out = model(sub['obs'][i:i + bs])
         logits = (out[0] if isinstance(out, tuple) else out).float()
@@ -81,7 +83,11 @@ def split_metrics(model, sub, bs=2048):
         match += (logits.argmax(1) == ti[:, 0]).sum().item()
         logp = torch.log_softmax(logits, 1)
         ce += (-(tp * torch.gather(logp, 1, ti)).sum(1)).sum().item()
-    return match / N, ce / N
+        if 'vh1_move' in sub:
+            lt = logits.gather(1, ti[:, :1]).squeeze(1)
+            ls = logits.gather(1, sub['vh1_move'][i:i + bs].unsqueeze(1)).squeeze(1)
+            pref += (lt > ls).sum().item()
+    return match / N, ce / N, (pref / N if 'vh1_move' in sub else -1.0)
 
 
 def main():
@@ -95,6 +101,11 @@ def main():
                    help='0: weight decay would shrink the task vector toward the '
                         'origin, not toward base — off by default.')
     p.add_argument('--target-temperature', type=float, default=0.5)
+    p.add_argument('--loss', choices=['soft', 'margin'], default='soft',
+                   help="margin: pairwise hinge relu(m - (logit[teacher_mv] - "
+                        "logit[vh1_mv])) — teaches ONLY the judged preference "
+                        "(R2 review arm 1); needs corpus with vh1_move.")
+    p.add_argument('--margin', type=float, default=0.15)
     p.add_argument('--weighted', action='store_true', default=True)
     p.add_argument('--holdout-frac', type=float, default=0.15)
     p.add_argument('--split-seed', type=int, default=0)
@@ -113,11 +124,11 @@ def main():
                             weight_decay=a.weight_decay)
     os.makedirs(a.save_dir, exist_ok=True)
 
-    mr, ce = split_metrics(net, train)
-    line = f"[ep0] train match={mr:.3f} ce={ce:.3f}"
+    mr, ce, pf = split_metrics(net, train)
+    line = f"[ep0] train match={mr:.3f} ce={ce:.3f} pref={pf:.3f}"
     if held:
-        mh, ch = split_metrics(net, held)
-        line += f" | HELD match={mh:.3f} ce={ch:.3f}"
+        mh, ch, ph = split_metrics(net, held)
+        line += f" | HELD match={mh:.3f} ce={ch:.3f} pref={ph:.3f}"
     print(line, flush=True)
 
     for ep in range(1, a.epochs + 1):
@@ -132,21 +143,27 @@ def main():
             with frozen_bn(net):
                 out = net(train['obs'][idx])
             logits = out[0] if isinstance(out, tuple) else out
-            loss = soft_correction_loss(
-                logits, train['tgt_idx'][idx], train['tgt_prob'][idx],
-                anchor_weight=(train['weight'][idx] if a.weighted else None),
-                target_temperature=a.target_temperature)
+            if a.loss == 'margin':
+                lt = logits.gather(1, train['tgt_idx'][idx][:, :1]).squeeze(1)
+                ls = logits.gather(
+                    1, train['vh1_move'][idx].unsqueeze(1)).squeeze(1)
+                loss = torch.relu(a.margin - (lt - ls)).mean()
+            else:
+                loss = soft_correction_loss(
+                    logits, train['tgt_idx'][idx], train['tgt_prob'][idx],
+                    anchor_weight=(train['weight'][idx] if a.weighted else None),
+                    target_temperature=a.target_temperature)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step()
             tot += float(loss.detach())
-        mr, ce = split_metrics(net, train)
+        mr, ce, pf = split_metrics(net, train)
         line = (f"[ep{ep}] loss={tot/steps:.4f} train match={mr:.3f} "
-                f"ce={ce:.3f}")
+                f"ce={ce:.3f} pref={pf:.3f}")
         if held:
-            mh, ch = split_metrics(net, held)
-            line += f" | HELD match={mh:.3f} ce={ch:.3f}"
+            mh, ch, ph = split_metrics(net, held)
+            line += f" | HELD match={mh:.3f} ce={ch:.3f} pref={ph:.3f}"
         print(line + f"  [{time.time()-t0:.0f}s]", flush=True)
 
         if ep % a.save_every == 0 or ep == a.epochs:
