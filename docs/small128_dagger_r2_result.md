@@ -8,7 +8,7 @@ Corpus: the 25,116 judged-domain rows (recovery/prevention, teacher gap ≥1.0 �
 
 ## The decisive training fact
 
-Train pref (logit_t > logit_s) climbed 0.11 → 0.77. **Held pref plateaued at ~0.49 from epoch 5 onward.** The validated corrections do not generalize across source seeds — the network learns them as ~lookup entries. Argmax adoption stayed ~0.08 even on train rows (the hinge lifts teacher-over-vh1 without making the teacher move top-1 overall).
+Train pref (logit_t > logit_s) climbed 0.11 → 0.77. **Held pref plateaued at ~0.49 from epoch 5 onward** — substantial transfer of the trained inequality to unseen seeds (0.11 → 0.49), with a large overfitting gap on top (0.77 train). [Revised per review: this is an overfitting gap, NOT absence of generalization; and the low adoption is the expected failure mode of a loss that only enforces teacher > vh1's-original-move, saying nothing about the other legal actions. Train-metric caveat: in-training adoption used unrestricted argmax, not legal fp16 argmax — gate numbers are the reliable ones.]
 
 ## Gate table (3,799 held-out corrections; 18,321 quiet holdout states; all fp16)
 

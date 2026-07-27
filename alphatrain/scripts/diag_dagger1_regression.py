@@ -41,14 +41,16 @@ def legal_argmax(net, ds, idx, dev, batch=2048):
     return out
 
 
-def build_holdout(games_dir, corpus_path, n_games, per_game, out_path, rng):
+def build_holdout(games_dir, corpus_path, n_games, per_game, out_path, rng,
+                  skip=0):
     corpus = torch.load(corpus_path, map_location='cpu', weights_only=False)
     seen = set()
     cb = corpus['boards'].numpy().reshape(len(corpus['boards']), 81)
     for i in range(len(cb)):
         seen.add(cb[i].tobytes())
     boards, next_pos, next_col, n_next = [], [], [], []
-    for fp in sorted(glob.glob(os.path.join(games_dir, 'game_*.json')))[:n_games]:
+    files = sorted(glob.glob(os.path.join(games_dir, 'game_*.json')))
+    for fp in files[skip:skip + n_games]:
         d = json.load(open(fp))
         states = [s for s in d['states']][::4]
         rng.shuffle(states)
