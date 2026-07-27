@@ -3697,3 +3697,46 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      leaf value = teacher strength); if positive -> the proven gate-3 recipe;
      (c) 192ch capacity control (standing contingency — multiple channels now
      read "uninstallable at 128ch/3M").
+
+185. **legalmax (hard-negative + KL anchor) — best frontier points REGRESS at
+     5k. The supervised-corrections channel at 128ch is CLOSED by the review's
+     own criterion, with a complete frontier map.** (2026-07-27)
+
+     R2c/d/e per the follow-up review: loss = relu(0.15 + max_{legal!=teacher}
+     logit[a] - logit[teacher]) + lambda * CE-to-vh1 on 13,958 disjoint quiet
+     states, frozen BN, 3 shuffle seeds (reproducible to ~0.3pp), lambda x
+     epoch frontier (fp16 gate, 3,799 by-seed held-out corrections):
+
+       lambda/ep   adopt%  drift%  ratio(useful:collateral)
+       1 / 20       16.6    11.1      1.4:1
+       3 / 20       14.7     8.0      1.7:1
+       6 / 5        11.4     5.6      2.0:1
+       10 / 5       10.0     4.5      2.1:1   <- best; ratio bar met,
+                                                 drift bar (<=3%) missed
+     Monotone, smooth, seed-stable. Epoch-invariance of the PAIRWISE vectors
+     also confirmed (ep5/10/15 merges == ep20 within noise at every alpha —
+     the vector direction stabilizes by ep5).
+
+     **5k verdicts (775000-779999) vs vh1 (13,080 / 9,323 / P5 1,222 / 3.5%):**
+       l100_ep5: mean 12,650 / P50 8,780 (-5.8%) / P5 1,126 / <1000 4.1%
+       l60_ep5:  mean 12,108 / P50 8,347 (-10.5%) / P5 1,065 / <1000 4.5%
+     NOTE: l100_ep5's 500-seed screen read mean 13,115 / P50 9,421 / <1000
+     3.0% — BETTER than vh1 — then flipped at 5k. The FOURTH 500<->5k flip.
+     500 seeds decide NOTHING.
+
+     **Closure:** three loss geometries (dense soft/hard + rehearsal; pairwise
+     task-vector across epoch x alpha; legal hard-negative + KL anchor across
+     lambda x epoch), all on row-validated +2.4..+2.8pp labels, all regress at
+     5k. 4.5% quiet-state drift costs more than 10pp of installed validated
+     corrections buy. Per the review: "if that still has no adoption-versus-
+     drift operating point, closing this channel at 128 is justified." Closed.
+     (192ch control: OFF THE TABLE by user directive — 128ch only; fallback
+     is keeping pillar3k, not intermediate widths.)
+
+     **LIVE next:** the on-manifold re-arm — 20k on-policy games (seeds
+     870000-890000) generating for the value-head scaling replication;
+     protocol: disjoint splits (head-train / calibration / judge), decision-
+     level bars (judge LCB > +1pp, genuine >= 15%, phantom < 5%; winning
+     reference +4.5pp / 27-29%). Calibration = sanity gate only (the r=0.76
+     fresh head already failed the judge at -0.1pp once — this is a 5x-data
+     replication, not a guaranteed unlock).
