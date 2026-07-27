@@ -3740,3 +3740,36 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      reference +4.5pp / 27-29%). Calibration = sanity gate only (the r=0.76
      fresh head already failed the judge at -0.1pp once — this is a 5x-data
      replication, not a guaranteed unlock).
+
+186. **vh5x decision judge: FIRST POSITIVE GATE SINCE vh1 — the on-manifold
+     channel re-arms with the 5x-data value head. Iteration-3 mining launched.**
+     (2026-07-27)
+
+     Value-head scaling replication (per follow-up review, disjoint seed
+     splits): 20k on-policy vh1 games (seeds 870000-890000; mean 12,810 ~=
+     the 5k bar). Targets: build_value_targets_slim.py, death-dense
+     (--broad-keep 0.15 after the raw build read 82-97% positive — the
+     saturated-val alarm), train <886000 (4.40M rows) / val 886000-888000
+     (551k) / judge >=888000 (untouched). Head: value_head_vh5x.pt (12 min,
+     frozen vh1 backbone). SANITY: AUC per-H on 100k identical val rows —
+     vh5x 0.9730/0.9443/0.8973/0.8596 vs the falsified fresh head
+     0.9709/0.9412/0.8890/0.8453 (better at every horizon).
+
+     **Decision judge (gate-2 protocol @600 sims, 400 identical direct-sampled
+     death-band states from reserved seeds, vh1 continuation, 64 paired reps,
+     seed-cluster CIs):**
+       q=0 control:        1/400 disagreements (all signal flows via the head)
+       q=2 + OLD head:     49 dis, +2.84pp [+0.75, +5.06], 16%/2%
+       q=2 + vh5x:         51 dis, **+3.37pp [+1.17, +5.73]**, 22%/6%
+     Bars: LCB>+1pp PASS, genuine>=15% PASS, phantom<5% marginal (3/51).
+     **KEY REVISION: the OLD head also reads positive on directly-sampled
+     fresh death-band states — iter-2's "consumed" verdict was partly a
+     property of the OLD miner's band selection, not the whole distribution.**
+     Fresh deaths still carry per-move signal; vh5x finds more of it.
+
+     **LAUNCHED: iteration-3 micro-corpus mine** — mcts_crisis, fused
+     pv_vh1_vh5x_ts.pt (verified 0.00e+00), seeds 900000-900150, recovery
+     15-back@1200 / prevention 30-back@800 / q=2.0 (the exact winning gate-3
+     settings) -> data/crisis_vh5x_micro. Next: build_expert_v2_tensor
+     (policy-only) -> mix 3:1 rehearsal -> gate-3 recipe on Colab
+     (RUN=small128_vh2try) -> 500 catastrophe screen -> 5k vs vh1.
