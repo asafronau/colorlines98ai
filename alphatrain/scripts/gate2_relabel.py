@@ -15,19 +15,29 @@ from alphatrain.evaluate import load_model
 from alphatrain.mcts import MCTS, _legal_priors_jit
 
 
-def sample_states(games_dir, n, rng):
+def sample_states(games_dir, n, rng, min_seed=0):
+    """Sample death-band + broad states. Handles both the moves-schema and the
+    slim recorder schema (states/turn); returns (state_dict, source_seed)."""
     files = sorted(glob.glob(f'{games_dir}/game_seed*.json'))
     rng.shuffle(files)
     out = []
     for f in files:
         d = json.load(open(f))
-        mv = d['moves']
+        seed = int(d.get('seed', d.get('original_seed', 0)))
+        if seed < min_seed:
+            continue
+        mv = d.get('moves') or d.get('states')
         if len(mv) < 10:
             continue
+        if 'states' in d and not d.get('died', True):
+            continue  # slim schema: capped game — no death band
         picks = {max(0, len(mv) - 1 - int(rng.integers(0, 40))),
                  int(rng.integers(0, len(mv)))}
         for i in picks:
-            out.append(mv[i])
+            m = dict(mv[i])
+            if 'num_next' in m:  # slim schema: trim padded next_balls
+                m['next_balls'] = m['next_balls'][:m['num_next']]
+            out.append((m, seed))
         if len(out) >= n:
             break
     return out[:n]
@@ -41,19 +51,21 @@ def main():
     p.add_argument('--n', type=int, default=400)
     p.add_argument('--sims', type=int, default=600)
     p.add_argument('--q-values', type=float, nargs='+', default=[0.0, 1.0, 2.0, 3.0])
+    p.add_argument('--min-seed', type=int, default=0)
     p.add_argument('--out-prefix', default='alphatrain/inference_cpp/data/gate2')
     a = p.parse_args()
 
     rng = np.random.default_rng(4242)
-    states = sample_states(a.games_dir, a.n, rng)
-    print(f'{len(states)} states sampled from {a.games_dir}')
+    states = sample_states(a.games_dir, a.n, rng, min_seed=a.min_seed)
+    print(f'{len(states)} states sampled from {a.games_dir} '
+          f'(min_seed {a.min_seed})')
 
     dev = torch.device('mps')
     net, max_score = load_model(a.model, dev, fp16=False)
 
     # base argmax per state
     prepared = []
-    for m in states:
+    for m, src_seed in states:
         board = np.array(m['board'], dtype=np.int8)
         nb = m['next_balls']
         nr = np.zeros(3, dtype=np.int64); nc = np.zeros(3, dtype=np.int64)
@@ -68,7 +80,7 @@ def main():
         if k == 0:
             continue
         base = int(fi[np.argmax(pr[:k])])
-        prepared.append((board, nb, nn, base))
+        prepared.append((board, nb, nn, base, src_seed))
     print(f'{len(prepared)} states with legal moves')
 
     for q in a.q_values:
@@ -76,7 +88,7 @@ def main():
                     num_simulations=a.sims, c_puct=2.5, top_k=30, batch_size=8,
                     q_weight=q, value_head_path=a.head)
         recs = []
-        for si, (board, nb, nn, base) in enumerate(prepared):
+        for si, (board, nb, nn, base, src_seed) in enumerate(prepared):
             g = ColorLinesGame(seed=1)
             g.reset(board=board.copy(),
                     next_balls=[((b['row'], b['col']), b['color']) for b in nb])
@@ -86,16 +98,20 @@ def main():
             (sr, sc), (tr, tc) = mv
             search_flat = (sr * 9 + sc) * 81 + (tr * 9 + tc)
             if search_flat != base:
-                recs.append((board, nb, nn, search_flat, base))
+                recs.append((board, nb, nn, search_flat, base, src_seed))
             if (si + 1) % 100 == 0:
                 print(f'  q={q}: {si+1}/{len(prepared)} searched, '
                       f'{len(recs)} disagreements', flush=True)
 
         out = f'{a.out_prefix}_q{q:g}.bin'
+        with open(f'{a.out_prefix}_q{q:g}_meta.csv', 'w') as f:
+            f.write('state,original_seed,label,turns,gap\n')
+            for j, r in enumerate(recs):
+                f.write(f'{j},{r[5]},all,-1,0.0\n')
         with open(out, 'wb') as f:
             f.write(b'CLRJ')
             f.write(struct.pack('<i', len(recs)))
-            for board, nb, nn, search_flat, base in recs:
+            for board, nb, nn, search_flat, base, _ in recs:
                 f.write(board.astype(np.int8).tobytes())
                 f.write(struct.pack('<i', nn))
                 for t in range(3):
