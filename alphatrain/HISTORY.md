@@ -3773,3 +3773,33 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      settings) -> data/crisis_vh5x_micro. Next: build_expert_v2_tensor
      (policy-only) -> mix 3:1 rehearsal -> gate-3 recipe on Colab
      (RUN=small128_vh2try) -> 500 catastrophe screen -> 5k vs vh1.
+
+187. **Iteration-3 (vh2try) REGRESSED at 5k despite the positive judge — and
+     the cross-round pattern now reads as a SIGNAL THRESHOLD, not a slope.**
+     (2026-07-27)
+
+     Local end-to-end round (M5, first fully-local loop turn): train_path_b on
+     MPS, 3 epochs / 24 min (gate-3 recipe exactly; no --compile/--amp).
+     500-screens: all 14 checkpoints pass (no catastrophe). 5k verdicts vs
+     vh1 (13,080 / 9,323 / 1,222 / 3.5%):
+       epoch_1: 12,351 / 8,579 (-8.0% P50) / 1,103 / 4.1%
+       e1_s400: 12,134 / 8,701 (-6.7%) / 1,118 / 4.2%
+       e3_s100: 11,697 / 8,342 (-10.5%) / 1,047 / 4.7%
+
+     **The (judge -> 5k) record, all rounds ever measured:**
+       gate-2 -> vh1 : +4.5pp / 27-29% genuine  ->  +4.6%   (WON)
+       dagger R1     : +1.69pp / 18%            ->  -4%
+       vh5x iter-3   : +3.37pp / 22%            ->  -7%
+       iter-2 levers : <=+0.3pp                 ->  -11..-15%
+     Reading: warm-start training pays a ~fixed collateral tax (~4-6% at 5k;
+     the quiet-state churn measured directly in 182/184); mined per-move
+     signal must EXCEED the tax. +4.5pp cleared it; +3.37pp did not.
+     Expectation-setting by linear interpolation was wrong — it's a threshold.
+
+     **DUE DILIGENCE LAUNCHED:** (a) 5k on the untested earliest checkpoints
+     (e1_s100/s200); (b) the decisive measurement: gate-2 judge @2400 sims
+     (vh5x head, same 400 reserved states) — can search on vh1 produce
+     +4.5pp-class corrections AT ALL? If yes -> iteration-3b mines at those
+     settings. If no -> vh1 is measured as sitting where its search-teacher's
+     per-round yield < training's per-round cost (a real plateau statement,
+     to peer review with the full table).
