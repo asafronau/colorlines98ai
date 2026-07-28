@@ -3803,3 +3803,24 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      settings. If no -> vh1 is measured as sitting where its search-teacher's
      per-round yield < training's per-round cost (a real plateau statement,
      to peer review with the full table).
+
+188. **Tax sweep: rehearsal ratio is a REAL tax knob — 6:1 recovers 2/3 of the
+     iteration-3 regression. Iteration-3b (deep corpus x 6:1) launched.**
+     (2026-07-28)
+
+     Three arms on the UNCHANGED iteration-3 corpus (local M5, ~3h total):
+     5k vs vh1 (13,080 / 9,323 / 3.5%):
+       3:1 (187 ref) : 12,351 / 8,579 (-8.0%) / 4.1%
+       6:1 r6/ep1    : 12,764 / 9,098 (-2.4%) / 3.9%   <- best post-vh1 yet
+       10:1 r10/ep1  : 12,788 / 8,897 (-4.6%) / 4.3%   (diminishing past 6:1)
+       3:1 lr 5e-5   : 12,336 / 8,693 (-6.8%) / 4.4%   (LR is not the lever)
+     Screens again over-promised (r6/ep1 screened mean 14,074 = +7.6%; 5k
+     says -2.4% — flip #5). Monotone tax curve 3:1 -> 6:1 confirms the
+     threshold model's tax side; LR halving does nothing.
+
+     **Ledger: 6:1 tax ~2-3% at 5k; current corpus signal +3.37pp — just
+     short. Deep judge (187 diligence): @2400 sims +3.88pp [+2.37,+5.45],
+     17.5% disagreement, 0% PHANTOMS.** Iteration-3b = both knobs:
+     LAUNCHED mcts_crisis @ recovery 2400 / prevention 1600, q=2.0, seeds
+     901000-901150 -> data/crisis_vh5x_deep; then 6:1 mix -> gate-3 recipe
+     (2 epochs, step saves) -> screens (catastrophe only) -> 5k.
