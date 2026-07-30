@@ -147,7 +147,8 @@ _GRAD_AUDIT = []   # accumulates (|g_main|, |g_aux|, lam, cos) for --grad-audit
 def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                  log_interval=100, blend_alpha=1.0, target_temperature=1.0,
                  aux=None, epoch=0, grad_audit=0, decisiveness_power=0.0,
-                 disagree_gamma=0.0, save_every_steps=0, save_hook=None):
+                 disagree_gamma=0.0, save_every_steps=0, save_hook=None,
+                 anchor=None):
     """One epoch. Optionally adds the listwise margin aux loss.
 
     `aux`, when not None, is a dict with:
@@ -235,6 +236,21 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                     loss = main_loss
             else:
                 loss = main_loss
+
+            if anchor is not None:
+                # KL(base || model) preservation anchor on independent quiet
+                # states (review #5: separate signal learning from
+                # preservation). Frozen BN + eager module, same rationale as
+                # the aux path above.
+                aidx = torch.randint(0, anchor['obs'].shape[0],
+                                     (anchor['batch'],),
+                                     device=anchor['obs'].device)
+                with frozen_bn(base_model):
+                    an_out = base_model(anchor['obs'][aidx])
+                an_lg = an_out[0] if isinstance(an_out, tuple) else an_out
+                an_ce = -(anchor['probs'][aidx].float()
+                          * F.log_softmax(an_lg.float(), -1)).sum(-1).mean()
+                loss = loss + anchor['weight'] * an_ce
 
         # --- gradient audit: measure main vs aux gradient magnitude + alignment ---
         # Is the aux stream a gentle nudge or a sledgehammer? Run with --grad-audit N
@@ -454,6 +470,14 @@ def main():
                    help='Also save mid-epoch checkpoints every N optimizer '
                         'steps (e{epoch}_s{step}.pt). The absorption optimum '
                         'lives at a ~constant STEP count, not epoch count.')
+    p.add_argument('--kl-anchor-weight', type=float, default=0.0,
+                   help='lambda for the CE-to-resumed-base anchor on '
+                        'independent quiet states (preservation without '
+                        'rehearsal mixing; review #5 iteration-4 pilot).')
+    p.add_argument('--anchor-games-dir', default='data/dagger_games_v1')
+    p.add_argument('--anchor-skip-games', type=int, default=200)
+    p.add_argument('--anchor-games', type=int, default=150)
+    p.add_argument('--anchor-batch', type=int, default=1024)
     p.add_argument('--disagree-gamma', type=float, default=0.0,
                    help='gamma-disagreement weighting: per-state CE weight '
                         '1 + gamma*disagree_mask (tensor must contain '
@@ -935,6 +959,46 @@ def main():
                             steps_per_epoch=len(train_loader))
 
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # --- optional preservation anchor: independent quiet states + the RESUMED
+    # base's soft policy (computed now, before any training step) ---
+    anchor_data = None
+    if args.kl_anchor_weight > 0:
+        from alphatrain.scripts.diag_dagger1_regression import build_holdout
+        from alphatrain.observation import build_observation
+        import numpy as np
+        tmp = os.path.join(args.save_dir, 'anchor.tmp')
+        n_anchor = build_holdout(args.anchor_games_dir, args.tensor_file,
+                                 args.anchor_games, 100, tmp,
+                                 np.random.default_rng(7),
+                                 skip=args.anchor_skip_games)
+        t = torch.load(tmp, map_location='cpu', weights_only=True)
+        os.remove(tmp)
+        ao = np.stack([build_observation(
+            t['boards'][i].numpy(),
+            t['next_pos'][i, :, 0].numpy().astype(np.int64),
+            t['next_pos'][i, :, 1].numpy().astype(np.int64),
+            t['next_col'][i].numpy().astype(np.int64), int(t['n_next'][i]))
+            for i in range(n_anchor)])
+        a_obs = torch.from_numpy(ao).to(device)
+        base_eval = getattr(model, '_orig_mod', model)
+        was_training = base_eval.training
+        base_eval.train(False)
+        with torch.no_grad():
+            ps = []
+            for i in range(0, n_anchor, 2048):
+                out = base_eval(a_obs[i:i + 2048])
+                lg = (out[0] if isinstance(out, tuple) else out).float()
+                ps.append(torch.softmax(lg, 1).half())
+        base_eval.train(was_training)
+        anchor_data = {'obs': a_obs, 'probs': torch.cat(ps),
+                       'batch': args.anchor_batch,
+                       'weight': args.kl_anchor_weight}
+        print(f"anchor: {n_anchor:,} quiet states from "
+              f"{args.anchor_games_dir}[{args.anchor_skip_games}:"
+              f"{args.anchor_skip_games + args.anchor_games}], "
+              f"lambda={args.kl_anchor_weight}", flush=True)
+
     print(f"\n=== Training {args.epochs} epochs ===", flush=True)
     t_total = time.time()
 
@@ -957,7 +1021,8 @@ def main():
                                   save_every_steps=args.save_every_steps,
                                   save_hook=_step_hook,
                                   aux=aux, epoch=epoch, grad_audit=args.grad_audit,
-                                  decisiveness_power=args.decisiveness_power)
+                                  decisiveness_power=args.decisiveness_power,
+                                  anchor=anchor_data)
         vl = validate(model, val_loader, device, amp_dtype=amp_dtype)
         scheduler.step()
 
