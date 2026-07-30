@@ -3854,3 +3854,24 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      USER DECISION: stop and review (docs/small128_campaign_review.md).
      Hypothesis on the table: the 256ch line progressed fine on dw3/T0.7
      full-corpus deep-visit distillation — put the small model on that track.
+
+190. **Iteration-4 pilot (composite weighting + KL anchor) DEAD at every
+     lambda; pivot to the review's fallback = advantage-filtered policy
+     improvement. Per-row judging of all 15,655 disagreements launched.**
+     (2026-07-29)
+
+     Pilot arms (vh2c_crisis only, w=top_share^P*(1+gamma*disagree), lambda=1):
+     screens DEGRADE MONOTONICALLY (arm A ep1 10,502 -> ep6 5,839; arm B
+     10,481 -> 5,949) — concentrated correction gradient destroys the policy;
+     lambda=1 anchor far too weak. Lambda sweep (P1.5/gamma2): lambda=10 best
+     ~11.3k, lambda=30 best ~11.7k, still 15-20% below the vh1 screen range
+     and decaying by ep3. NOT close-call territory (screen noise is ±5-8%);
+     no 5k spent. The design has no viable operating point on this corpus.
+
+     Running (overnight): export_advantage_judge.py -> rollout_judge on ALL
+     15,655 full-legal fp16 disagreement rows of vh2c_crisis (64 paired reps,
+     vh1 continuation) -> per-row advantage estimates. Next: train ONLY
+     judged-positive executable disagreements (hard CE, advantage-weighted,
+     strong quiet anchor via train_crisis_ft machinery), screens, 5k.
+     Permanent asset either way: the corpus's actual row-level value,
+     closing the judge!=corpus gap the review flagged.
