@@ -3824,3 +3824,33 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      LAUNCHED mcts_crisis @ recovery 2400 / prevention 1600, q=2.0, seeds
      901000-901150 -> data/crisis_vh5x_deep; then 6:1 mix -> gate-3 recipe
      (2 epochs, step saves) -> screens (catastrophe only) -> 5k.
+
+189. **Iteration-3b (deep corpus x 6:1) FAILED — deep corpus trained WORSE
+     than shallow at the same tax point. CAMPAIGN HALTED for full review;
+     pivot question = put the small line on the 256ch track (dw/T0.7).**
+     (2026-07-29)
+
+     5k vs vh1 (13,080 / 9,323 / 1,222 / 3.5%):
+       vh2c/epoch_1 (deep 2400/1600 @ 6:1): 12,543 / 8,791 (-5.7%) / 4.1%
+       vh2c/e1_s700:                        12,348 / 8,671 (-7.0%) / 4.9%
+     vs r6 (shallow 1200/800 @ 6:1):        12,764 / 9,098 (-2.4%) / 3.9%
+
+     **THE TWIST:** the better-JUDGED corpus (+3.88pp, 0% phantoms) trained
+     worse than the +3.37pp one — the simple signal-minus-tax model breaks.
+     Matching receipt: HISTORY 174 lesson 2 — deeper search = FLATTER visit
+     distributions; the 256ch line's cure was DECISIVENESS WEIGHTING (dw=3).
+     Every small-line run since gate-3 used dw=0. Per-move argmax quality
+     improved while target-distribution quality for a greedy student fell.
+
+     **Campaign record (vh1 = bar, 6 challenger rounds, all failed):**
+       iter-2 (own-MCTS, 3 methods)      : judge <=+0.3pp -> -11..-15%
+       dagger R1/R2 (pillar3k labels, 3
+       loss geometries)                  : +1.69pp row-valid -> -4..-8%
+       iter-3 (vh5x @1200/800, 3:1, dw0) : +3.37pp -> -7%
+       tax arms (same corpus)            : 6:1 -2.4% (best), 10:1 -4.6%
+       iter-3b (deep @2400/1600, 6:1)    : +3.88pp/0-phantom -> -5.7%
+     Screens 0-for-5 on close calls. vh1 REMAINS best.
+
+     USER DECISION: stop and review (docs/small128_campaign_review.md).
+     Hypothesis on the table: the 256ch line progressed fine on dw3/T0.7
+     full-corpus deep-visit distillation — put the small model on that track.
