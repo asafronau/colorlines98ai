@@ -34,6 +34,7 @@ struct Args {
   int batch = 256;
   long max_turns = 1000000;
   bool fp32 = false;  // default: fp16 on MPS (like eval_policy.py)
+  std::string scores_out;  // optional CSV: seed,score (paired-seed bootstraps)
   // On-policy trajectory recording (DAgger harvest + value-head fuel):
   // keep the FULL last `record_tail` turns (death band) + every
   // `record_every`-th turn before that (broad coverage). Empty dir = off.
@@ -131,6 +132,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--seed-end") a.seed_end = std::stoull(argv[++i]);
     else if (k == "--batch") a.batch = std::stoi(argv[++i]);
     else if (k == "--max-turns") a.max_turns = std::stol(argv[++i]);
+    else if (k == "--scores-out") a.scores_out = argv[++i];
     else if (k == "--record-dir") a.record_dir = argv[++i];
     else if (k == "--record-every") a.record_every = std::stoi(argv[++i]);
     else if (k == "--record-tail") a.record_tail = std::stoi(argv[++i]);
@@ -205,6 +207,8 @@ int main(int argc, char** argv) {
 
   std::vector<int> scores;
   scores.reserve(todo.size());
+  std::vector<std::pair<uint64_t, int>> seed_scores;
+  if (!args.scores_out.empty()) seed_scores.reserve(todo.size());
   std::vector<float> obs_buf, legal_buf;
   long fwd = 0;
   auto t0 = Clock::now();
@@ -271,6 +275,8 @@ int main(int argc, char** argv) {
                           slots[i].game.turns(), slots[i].game.over(),
                           slots[i].broad, slots[i].ring, slots[i].ring_head);
         scores.push_back(slots[i].game.score());
+        if (!args.scores_out.empty())
+          seed_scores.push_back({slots[i].seed, slots[i].game.score()});
         ++done;
         Slot repl{0, Game(0)};
         if (make_slot(repl)) survivors.push_back(std::move(repl));
@@ -297,5 +303,13 @@ int main(int argc, char** argv) {
   std::snprintf(tag, sizeof(tag), "scores [%llu,%llu):",
                 (unsigned long long)args.seed_start, (unsigned long long)args.seed_end);
   Percentile(scores, tag);
+  if (!args.scores_out.empty()) {
+    FILE* f = std::fopen(args.scores_out.c_str(), "w");
+    std::fprintf(f, "seed,score\n");
+    for (auto& p : seed_scores)
+      std::fprintf(f, "%llu,%d\n", (unsigned long long)p.first, p.second);
+    std::fclose(f);
+    std::printf("per-seed scores: %s\n", args.scores_out.c_str());
+  }
   return 0;
 }
