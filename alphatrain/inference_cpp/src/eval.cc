@@ -1,0 +1,315 @@
+// native_eval_policy in C++: greedy policy play, batched.
+//
+// Mirrors scripts/eval_policy.py: hold B games in flight, do ONE batched
+// forward per step (build obs -> forward -> argmax over legal -> move), refill a
+// slot when a game dies. Reports the score distribution over a seed range.
+//
+// Run from inference_cpp/ (so it finds data/). Examples:
+//   ./build/eval --seed-start 50000 --seed-end 50300 --batch 256
+//   ./build/eval --device mps --batch 512 --seed-start 50000 --seed-end 51000
+
+#include <torch/script.h>
+#include <torch/torch.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include "game.h"
+#include "game_json.h"
+
+using clines::Game;
+using Clock = std::chrono::high_resolution_clock;
+
+namespace {
+struct Args {
+  std::string model = "data/policy_ts.pt";
+  std::string device = "cpu";
+  uint64_t seed_start = 50000, seed_end = 50300;  // [start, end)
+  int batch = 256;
+  long max_turns = 1000000;
+  bool fp32 = false;  // default: fp16 on MPS (like eval_policy.py)
+  std::string scores_out;  // optional CSV: seed,score (paired-seed bootstraps)
+  // On-policy trajectory recording (DAgger harvest + value-head fuel):
+  // keep the FULL last `record_tail` turns (death band) + every
+  // `record_every`-th turn before that (broad coverage). Empty dir = off.
+  std::string record_dir;
+  int record_every = 8;
+  int record_tail = 160;
+};
+
+// One recorded pre-move snapshot: state + the move the policy chose there.
+struct TurnRec {
+  int8_t board[81];
+  int8_t nb[9];  // (r, c, color) x up to 3
+  int8_t n_next;
+  int32_t move;
+  int32_t turn;  // 0-based move index within the game
+};
+
+TurnRec SnapTurn(const Game& g, int move) {
+  TurnRec t;
+  std::memcpy(t.board, g.board().data(), 81);
+  const auto& nb = g.next_balls();
+  t.n_next = (int8_t)std::min<size_t>(nb.size(), 3);
+  std::memset(t.nb, 0, sizeof(t.nb));
+  for (int i = 0; i < t.n_next; ++i) {
+    t.nb[i * 3 + 0] = (int8_t)nb[i].r;
+    t.nb[i * 3 + 1] = (int8_t)nb[i].c;
+    t.nb[i * 3 + 2] = (int8_t)nb[i].color;
+  }
+  t.move = move;
+  t.turn = (int)g.turns();
+  return t;
+}
+
+void AppendTurnRec(std::string& s, const TurnRec& t) {
+  s += "{\"turn\": " + std::to_string(t.turn) + ", \"board\": [";
+  for (int r = 0; r < 9; ++r) {
+    if (r) s += ", ";
+    s += "[";
+    for (int c = 0; c < 9; ++c) {
+      if (c) s += ", ";
+      s += std::to_string((int)t.board[r * 9 + c]);
+    }
+    s += "]";
+  }
+  s += "], \"next_balls\": [";
+  for (int i = 0; i < t.n_next; ++i) {
+    if (i) s += ", ";
+    s += "{\"row\": " + std::to_string((int)t.nb[i * 3]) +
+         ", \"col\": " + std::to_string((int)t.nb[i * 3 + 1]) +
+         ", \"color\": " + std::to_string((int)t.nb[i * 3 + 2]) + "}";
+  }
+  s += "], \"num_next\": " + std::to_string((int)t.n_next);
+  s += ", \"move\": " + std::to_string(t.move) + "}";
+}
+
+void WriteGameRecord(const Args& args, uint64_t seed, int score, long turns,
+                     bool died, const std::vector<TurnRec>& broad,
+                     const std::vector<TurnRec>& tail_ring, size_t ring_head) {
+  std::string s = "{\"seed\": " + std::to_string(seed) +
+                  ", \"final_score\": " + std::to_string(score) +
+                  ", \"final_turns\": " + std::to_string(turns) +
+                  ", \"died\": " + (died ? "true" : "false") +
+                  ", \"record_every\": " + std::to_string(args.record_every) +
+                  ", \"record_tail\": " + std::to_string(args.record_tail) +
+                  ", \"states\": [";
+  // Tail window start (turn index): everything at or after this is in the ring.
+  long tail_start = std::max<long>(0, turns - (long)tail_ring.size());
+  bool first = true;
+  for (const TurnRec& t : broad) {
+    if (t.turn >= tail_start) break;  // avoid duplicating tail states
+    if (!first) s += ", ";
+    AppendTurnRec(s, t);
+    first = false;
+  }
+  for (size_t i = 0; i < tail_ring.size(); ++i) {
+    const TurnRec& t = tail_ring[(ring_head + i) % tail_ring.size()];
+    if (!first) s += ", ";
+    AppendTurnRec(s, t);
+    first = false;
+  }
+  s += "]}";
+  clines::WriteFileOrDie(
+      args.record_dir + "/game_seed" + std::to_string(seed) + ".json", s);
+}
+
+Args ParseArgs(int argc, char** argv) {
+  Args a;
+  for (int i = 1; i < argc; ++i) {
+    std::string k = argv[i];
+    if (k == "--fp32") { a.fp32 = true; continue; }
+    if (i + 1 >= argc) break;  // remaining flags take a value
+    if (k == "--model") a.model = argv[++i];
+    else if (k == "--device") a.device = argv[++i];
+    else if (k == "--seed-start") a.seed_start = std::stoull(argv[++i]);
+    else if (k == "--seed-end") a.seed_end = std::stoull(argv[++i]);
+    else if (k == "--batch") a.batch = std::stoi(argv[++i]);
+    else if (k == "--max-turns") a.max_turns = std::stol(argv[++i]);
+    else if (k == "--scores-out") a.scores_out = argv[++i];
+    else if (k == "--record-dir") a.record_dir = argv[++i];
+    else if (k == "--record-every") a.record_every = std::stoi(argv[++i]);
+    else if (k == "--record-tail") a.record_tail = std::stoi(argv[++i]);
+  }
+  return a;
+}
+
+void Percentile(std::vector<int>& s, const char* tag) {
+  std::sort(s.begin(), s.end());
+  auto pct = [&](double p) { return s[std::min((size_t)(p / 100.0 * s.size()), s.size() - 1)]; };
+  double mean = 0; for (int v : s) mean += v; mean /= s.size();
+  int lt500 = 0, lt1000 = 0, gt5000 = 0, gt10000 = 0;
+  for (int v : s) { lt500 += v < 500; lt1000 += v < 1000; gt5000 += v > 5000; gt10000 += v > 10000; }
+  std::printf("%s  n=%zu  min=%d max=%d mean=%.0f\n", tag, s.size(), s.front(), s.back(), mean);
+  std::printf("  P1=%d P5=%d P10=%d P25=%d P50=%d P75=%d P90=%d P95=%d\n",
+              pct(1), pct(5), pct(10), pct(25), pct(50), pct(75), pct(90), pct(95));
+  std::printf("  <500: %d (%.1f%%)  <1000: %d (%.1f%%)  >5000: %d (%.0f%%)  >10000: %d (%.0f%%)\n",
+              lt500, 100.0 * lt500 / s.size(), lt1000, 100.0 * lt1000 / s.size(),
+              gt5000, 100.0 * gt5000 / s.size(), gt10000, 100.0 * gt10000 / s.size());
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+  torch::InferenceMode guard;
+  Args args = ParseArgs(argc, argv);
+  torch::Device dev(args.device == "mps" ? torch::kMPS : torch::kCPU);
+  if (dev.is_mps() && !torch::mps::is_available()) {
+    std::printf("MPS requested but unavailable; using CPU\n");
+    dev = torch::Device(torch::kCPU);
+  }
+
+  // fp16 only on the GPU (CPU fp16 ops are slow/unsupported); fp32 on CPU.
+  const bool use_half = dev.is_mps() && !args.fp32;
+
+  torch::jit::Module net;
+  try { net = torch::jit::load(args.model); }
+  catch (const c10::Error& e) {
+    std::printf("could not load %s: %s\n", args.model.c_str(), e.what());
+    return 1;
+  }
+  net.to(dev);
+  if (use_half) net.to(torch::kHalf);  // convert weights + BN buffers to fp16
+
+  // Seed queue.
+  std::vector<uint64_t> todo;
+  for (uint64_t s = args.seed_start; s < args.seed_end; ++s) todo.push_back(s);
+  size_t next = 0;
+  const int B = std::min<int>(args.batch, (int)todo.size());
+
+  struct Slot {
+    uint64_t seed; Game game;
+    std::vector<TurnRec> broad, ring;  // recording only
+    size_t ring_head = 0;
+  };
+  const bool recording = !args.record_dir.empty();
+  std::vector<Slot> slots;
+  auto make_slot = [&](Slot& dst) -> bool {
+    if (next >= todo.size()) return false;
+    dst.seed = todo[next++];
+    dst.game = Game(dst.seed);
+    dst.game.Reset();
+    dst.broad.clear();
+    dst.ring.clear();
+    dst.ring_head = 0;
+    return true;
+  };
+  slots.reserve(B);
+  for (int i = 0; i < B; ++i) {
+    Slot s{0, Game(0)};
+    if (make_slot(s)) slots.push_back(std::move(s));
+  }
+
+  std::vector<int> scores;
+  scores.reserve(todo.size());
+  std::vector<std::pair<uint64_t, int>> seed_scores;
+  if (!args.scores_out.empty()) seed_scores.reserve(todo.size());
+  std::vector<float> obs_buf, legal_buf;
+  long fwd = 0;
+  auto t0 = Clock::now();
+  size_t done = 0, log_next = 5000;
+
+  while (!slots.empty()) {
+    int n = (int)slots.size();
+    obs_buf.resize((size_t)n * 18 * clines::kNN);
+    legal_buf.resize((size_t)n * clines::kActions);
+    // Build each game's obs+legal. Single-threaded on purpose: profiling showed
+    // this eval is forward-bound (the heavy-tail long games run solo at tiny
+    // batch and dominate wall-clock), so parallelizing this loop gave ~0 gain.
+    for (int i = 0; i < n; ++i) {
+      slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
+      slots[i].game.LegalMask(legal_buf.data() + (size_t)i * clines::kActions);
+    }
+    // --- Shrink the CPU->GPU transfer (the profiled copy_and_sync bottleneck) ---
+    // Obs: convert fp32->fp16 on the CPU *before* uploading, so we ship half the
+    // bytes. (Uploading fp32 then .to(kHalf) on the GPU pays the full fp32
+    // transfer plus an extra GPU kernel.)
+    torch::Tensor obs = torch::from_blob(obs_buf.data(), {n, 18, 9, 9});
+    if (use_half) obs = obs.to(torch::kHalf);
+    obs = obs.to(dev);
+    // Legal mask: it's just 0/1, so upload it as uint8 (1 byte) instead of fp32
+    // (4 bytes) -> 4x less, and it's the single biggest per-step transfer.
+    // `legal == 0` is then the bool "illegal" mask for masked_fill (works on the
+    // fp16 logits regardless of the mask's own dtype).
+    torch::Tensor legal = torch::from_blob(legal_buf.data(), {n, clines::kActions})
+                              .to(torch::kByte)
+                              .to(dev);
+    torch::Tensor logits = net.forward({obs}).toTensor();
+    float ninf = -std::numeric_limits<float>::infinity();
+    torch::Tensor moves = logits.masked_fill(legal == 0, ninf).argmax(1).to(torch::kCPU);
+    auto mv = moves.accessor<int64_t, 1>();
+    ++fwd;
+
+    std::vector<Slot> survivors;
+    survivors.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      // legal-move count for this game (no legal moves => dead)
+      const float* lg = legal_buf.data() + (size_t)i * clines::kActions;
+      bool any_legal = false;
+      for (int a = 0; a < clines::kActions; ++a) if (lg[a] > 0.5f) { any_legal = true; break; }
+      bool dead = !any_legal;
+      if (!dead) {
+        int64_t m = mv[i];
+        if (recording) {
+          TurnRec tr = SnapTurn(slots[i].game, (int)m);
+          if (tr.turn % args.record_every == 0) slots[i].broad.push_back(tr);
+          if ((int)slots[i].ring.size() < args.record_tail) {
+            slots[i].ring.push_back(tr);
+          } else {
+            slots[i].ring[slots[i].ring_head] = tr;
+            slots[i].ring_head = (slots[i].ring_head + 1) % slots[i].ring.size();
+          }
+        }
+        int s = (int)(m / 81), t = (int)(m % 81);
+        bool ok = slots[i].game.Move(s / 9, s % 9, t / 9, t % 9);
+        dead = !ok || slots[i].game.over() || slots[i].game.turns() >= args.max_turns;
+      }
+      if (dead) {
+        if (recording)
+          WriteGameRecord(args, slots[i].seed, slots[i].game.score(),
+                          slots[i].game.turns(), slots[i].game.over(),
+                          slots[i].broad, slots[i].ring, slots[i].ring_head);
+        scores.push_back(slots[i].game.score());
+        if (!args.scores_out.empty())
+          seed_scores.push_back({slots[i].seed, slots[i].game.score()});
+        ++done;
+        Slot repl{0, Game(0)};
+        if (make_slot(repl)) survivors.push_back(std::move(repl));
+      } else {
+        survivors.push_back(std::move(slots[i]));
+      }
+    }
+    slots.swap(survivors);
+
+    if (done >= log_next) {
+      double el = std::chrono::duration<double>(Clock::now() - t0).count();
+      std::printf("  %zu/%zu games  %ld fwd  %.0f games/s  %.0f fwd/s\n",
+                  done, todo.size(), fwd, done / el, fwd / el);
+      std::fflush(stdout);
+      log_next += 5000;
+    }
+  }
+
+  double el = std::chrono::duration<double>(Clock::now() - t0).count();
+  std::printf("\ndone: %zu games in %.1fs (%.0f games/s, %ld forwards, batch=%d, %s %s)\n",
+              scores.size(), el, scores.size() / el, fwd, B, args.device.c_str(),
+              use_half ? "fp16" : "fp32");
+  char tag[64];
+  std::snprintf(tag, sizeof(tag), "scores [%llu,%llu):",
+                (unsigned long long)args.seed_start, (unsigned long long)args.seed_end);
+  Percentile(scores, tag);
+  if (!args.scores_out.empty()) {
+    FILE* f = std::fopen(args.scores_out.c_str(), "w");
+    std::fprintf(f, "seed,score\n");
+    for (auto& p : seed_scores)
+      std::fprintf(f, "%llu,%d\n", (unsigned long long)p.first, p.second);
+    std::fclose(f);
+    std::printf("per-seed scores: %s\n", args.scores_out.c_str());
+  }
+  return 0;
+}

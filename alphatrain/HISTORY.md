@@ -3294,3 +3294,647 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      (the AlphaZero self-improvement loop), unlike re-mining pillar3f's now-saturated crises.
      Rebuild + distill → pillar3k iter 2. Side-bets: 85/15 crisis ratio (test selfplay
      dilution, lesson 8); DECISIVENESS=4 sweep.
+
+175. **pillar3k_small128_hardce_epoch_87 — the 4× smaller student (10b×128ch, 3.0M
+     params), distilled from pillar3k. LAUNCH PAD for the small-model improvement
+     loop.** (2026-07-05)
+
+     **Provenance (exact):** from-scratch distillation of pillar3k_r3_dw3_T0.7_epoch_22
+     (teacher, 256ch) into 10b×128ch. Corpus `distill_pillar3k.pt` = 3,846,619 states
+     (selfplay_v14 240 games ~2.16M broad + all crisis ~1.69M escapes, 56/44) relabeled
+     with the teacher's top-5 legal-softmax policy via `alphatrain/scripts/distill_relabel.py`.
+     Train (Colab, train_pillar3k_small_colab.ipynb, RUN=pillar3k_small128_hardce):
+       `train_path_b --channels 128 --epochs 100 --batch-size 4096 --lr 1e-3
+        --warmup-epochs 3 --flat-epochs 0 --target-temperature 0.5 --blend-alpha 0.5`
+     (0.5·soft-CE + 0.5·hard-CE on teacher argmax; plain cosine; from-scratch recipe
+     batch 4096/lr 1e-3 — larger batches step-starve from-scratch runs).
+     **Eval (eval_policy 775000-775499, 500 seeds, fp16 @1024):** ep87 mean 12,987 /
+     P50 8,889 / P10 1,799 / <1000 4.8% / max 131,845. Teacher-match 73.0% top-1,
+     96.6% top-3 (diag_student_match, 20k states).
+     **Key findings of the distillation arc:** (a) an ascending-vs-descending bug in
+     diag/relabel top-K reads faked "not learning" for a week (true match was 67-69%);
+     (b) match and gameplay DECOUPLE — match flat ~72% from ep19 while gameplay climbed
+     6,237→12,987 (mimicry limit ≠ capacity limit); (c) cosine tail consolidated
+     (ep49 10,877 → ep87 12,987); (d) truncation warm-start from the teacher's first
+     128 channels = random init (0.2% match) — trained channels aren't importance-ordered.
+
+176. **C++ engine (alphatrain/inference_cpp) = production for selfplay + crisis mining
+     + policy eval. Python RETIRED for those three (user directive). First loop
+     experiment sp1 (100% selfplay corpus) REGRESSED — lesson-3 replication.** (2026-07-06)
+
+     **C++ engine, all golden/distribution-validated:** game engine bit-exact vs Python
+     (obs/legal/clear 0.0e+00); 27-feature FV leaf evaluator bit-close (V 2.4e-07);
+     MCTS (PUCT/min-max-Q/virtual-loss/open-loop determinized) strength-matched vs
+     Python MCTS on a 100-seed A/B (median 11,112 vs 10,060, same seed list, noise);
+     eval ~1.1-1.4× Python; selfplay + crisis recorders emit the moves-schema JSON that
+     `build_expert_v2_tensor --policy-only-data` consumes directly (integration-tested;
+     zero illegal actions; real Q). Throughput (M5, 14 threads): ~20.8k leaf evals/s,
+     ~36-47k selfplay states/hour @1600 sims. Binaries: eval, mcts_eval, mcts_selfplay,
+     mcts_crisis (+ game_test/feature_test goldens). RNG note: C++ plays different
+     per-seed games than Python (own SplitMix64) — same distribution; compare
+     distributions over a seed range, never per-seed.
+     **MCTS-vs-greedy on the small model (n=100, 100 sims, q=1.0, fv-leaf):**
+     median +15-25% over greedy (early +61% was an n=48 lucky draw).
+     **sp1 NEGATIVE (controlled, cheap):** corpus = 100 C++ selfplay games @1600 sims
+     (seeds 920000-99, cap 1500) = 142,844 states, `selfplay_cpp128_v1_slim.pt`; train =
+     `train_path_b --resume ...epoch_87 --warm-start --channels 128 --epochs 16
+      --batch-size 4096 --lr 1e-4 --warmup-epochs 1 --target-temperature 0.7
+      --decisiveness-power 3.0`. Gate evals (775000-775499): ep1 10,865/6,800 →
+     ep8 9,066/6,032 → ep16 8,192/6,265 (mean/P50) vs base 12,987/8,889 — MONOTONIC
+     regression. Pre-flight had predicted it: ep87 prior top-share P50 0.565 (hard-CE
+     made it decisive) vs 1600-sim visit target P50 0.335 → de-peak regime; and the
+     corpus was 100% selfplay = ~0% decisive escapes, so decisiveness weighting had
+     nothing to upweight. REPLICATES lesson 3 (entry 174) on the small model: the
+     crisis (escape-or-die) share IS the load-bearing mitigation, not the trainer flags.
+     **NEXT:** mine ep87's own crises with `mcts_crisis` (recovery 15@1600 / prevention
+     75@2400 / continue 500), build ~70/30 crisis/selfplay corpus (selfplay anchor
+     already in hand), retrain dw3/T0.7 on Colab, floor-gated 500-seed then 5k eval.
+
+     **ERRATUM to 176 (2026-07-06, same day):** `data/policy_ts.pt` (the C++ tools'
+     default model) was a stale Jun-26 export of the PRE-hardce model (~7.4k mean) —
+     never re-exported after ep87 was chosen. Therefore: (a) selfplay_cpp128_v1
+     (142,844 states) was generated with the OLD model, not ep87 → sp1's regression is
+     CONFOUNDED (weaker-teacher data + de-peak; cannot attribute cleanly — the lesson-3
+     replication claim is weakened, both causes plausible); (b) the C++-vs-Python MCTS
+     "validation" A/B was CROSS-MODEL (C++ on old model vs Python on ep87) → redone
+     clean below; (c) engine-level validations unaffected (greedy C++-vs-Python used
+     the same model explicitly; goldens model-independent). Fix: ep87 re-exported and
+     VERIFIED (logit diff 0.0 vs checkpoint); selfplay_cpp128_v1 + its slim tensor
+     retired from training use; corpus to be regenerated with ep87. LESSON: never rely
+     on a default model path in generators — pass --model explicitly and verify the
+     export against the checkpoint before generating (a one-line logit-diff check).
+
+177. **small128 improvement loop UNBLOCKED: value_head_small128 + head-guided crisis
+     micro-corpus beats ep87 on the 5k gold standard. Three-gate validation ladder,
+     all gates passed.** (2026-07-09)
+
+     **Model: `checkpoints/gate3/epoch_1.pt`** (pick: ep1; ep3/5 overtrain).
+     **5k eval (775000-779999, C++ eval, fp16):**
+       ep1:  mean 13,080 / P50 9,323 / P5 1,222 / P10 1,889 / <1000 3.5% / >10k 48%
+       ep87: mean 12,895 / P50 8,917 / P5 1,103 / P10 1,810 / <1000 4.2% / >10k 46%
+     Better on EVERY metric (P50 +4.6%, <1000 −17%). The 500-seed gate eval had shown
+     P50 −6% — inverted at 5k (lesson 6 again: 500 seeds mislead close calls).
+
+     **Why this worked when iter-1 regressed 3× (recipe-invariant):** the FV-mined
+     corpus's corrections were 90% survival-neutral (rollout judge; signal only in the
+     danger band +2.6pp). Every historically-working corpus (V13/V14) was mined with a
+     NEURAL SURVIVAL HEAD @ q=2.0 (verified from notebook commands); every FV-mined
+     one failed on a strong base (HISTORY 171/172 + ours). Mechanism: chance-node
+     branching → sims carry ~no horizon; the leaf value function is the knowledge
+     carrier (600 sims + head beats 2400 + FV).
+
+     **Provenance (exact):**
+     1. value_head_small128.pt: survival ValueHead on ep87 FROZEN backbone;
+        labels = build_value_targets on data/crisis_cpp128_v1 + selfplay_cpp128_v2
+        (2.97M states, censoring-aware); train_value_head 5ep/bs4096/lr1e-3 (7.8 min).
+        Death-balanced K=64 val: r 0.79-0.84 (H25-200). NOTE: the old "128ch backbone
+        can't host a head" (val_acc 0.52) was a TRANSFER-DATA artifact — matched data
+        fixed it (HISTORY 158 rule). Afterstate-ranking acc 0.567 ≈ the production
+        value_head_pillar3f's 0.554 on the identical protocol (working heads consume
+        state-level calibration at diverged leaves, not sibling-afterstate deltas).
+     2. Gate-2 target audit (600 sims, no Dirichlet, q sweep): q=0 control = 0
+        corrections; q=1/2 corrections judge at +4.5-5.1pp died-rate gap, 27-29%
+        clear-wins, 0 phantoms (FV corpus: +0.1pp). Quiet states: still ties → the
+        head is a danger-band amplifier, not a broad-corpus unlock. q=2.0 = op point.
+     3. Micro-corpus: crisis_mining (Python, validation exception) ep87 +
+        value_head_small128, q=2.0, recovery 15@600 / prevention 30@400, continue 500,
+        seeds 960000-960099 → 84 deaths → 184 replays / 55,548 states (36 min).
+     4. Train: gate3_crisis.pt + mix_tensors REHEARSAL 3:1 from distill_pillar3k.pt
+        (222,192 states, 25% new signal); train_path_b --resume ep87 --warm-start
+        --channels 128 --seed 42 --epochs 5 --batch-size 4096 --lr 1e-4
+        --warmup-epochs 1 --target-temperature 1.0 --decisiveness-power 0
+        --blend-alpha 0.5.
+     **C++ engine gained NN-value MCTS** (export_policy_value.py fused policy+value
+     TS module; InferenceServer tuple mode; MctsConfig.nn_value; --value-module flag
+     on mcts_eval/mcts_selfplay/mcts_crisis) — production mining no longer needs the
+     Python exception.
+     **NEXT (scale + iterate):** full campaign ~1500-3000 probes @600/400 q=2 with
+     --value-module (C++), rehearsal mix, train, 5k gate; then RE-TRAIN THE HEAD on
+     the new model's own games each iteration (HISTORY 158) and repeat.
+
+178. **iter-2 + the distill-better grid: REJECTED end to end — and the cause measured.
+     vh1's per-move marginal gap is CONSUMED after one absorption step.** (2026-07-10/11)
+
+     **What was tried (all 5k-rejected or grid-rejected; vh1 stays baseline):**
+     - iter-2: 2.51M head-guided states (vh1's own deaths, 1200/800 sims, q=2.0,
+       C++-mined) + full rehearsal (6.35M, 39% signal), gate-3 recipe → 5k mean 11,599
+       (−11%). Epoch soup: no rescue.
+     - GRID (6 seeded arms × step-checkpoints every 500): γ-disagreement weighting
+       {0,2,6} × lr {1e-4,3e-4} × blend {0.5,0.3}, from vh1 on iter2_mixg
+       (418,802-correction mask). Control step-axis: best point = s500 (floor ties,
+       median −7%), monotonic-ish decline after — no winning window at ANY step.
+       Best arm g2_lr1_s1000 (only floor-above-bar read at 500 seeds) → 5k mean
+       11,156 (−15%). γ=6 collapses the floor; lr 3e-4 hurts everywhere.
+       (500-seed reads flipped at 5k for the THIRD time — coarse screen only.)
+     - New trainer machinery (kept): `--disagree-gamma` (+ add_disagree_mask.py),
+       `--save-every-steps`, `--seed`; mix_tensors rehearsal blending.
+
+     **The measured cause (rollout judge, vh1 continuation, R=64 H=300):**
+       gate-2 reference (600/400 from ep87):  gap +4.5-5.1pp, 27-29% win, 0 phantom
+       iter-2 corpus (1200/800 from vh1):     gap +0.3pp, 4% win, 94% tie
+       isolation (600/400 from vh1):          gap +0.2pp, 4% win, 93% tie
+     Sims exonerated; recipe exonerated (grid); volume exonerated. **After vh1
+     absorbed gate-3's corrections, the teacher's remaining advantage is no longer
+     expressible as single-move corrections** — yet its PLAY still escapes 84% of
+     vh1's deaths (prevention band): the residual edge is multi-step / rolling-search
+     knowledge. Decisive-share among corrections fell 20% → 5-6%.
+
+     **Levers for iteration 3 (ranked, untested):** (a) sharpen the value head
+     (fresh vh1-era labels, longer horizons) so finer Q differences become
+     expressible as corrections — cheap, judge-auditable before any mining;
+     (b) WIDENED deep search (the +37%-era teacher was 4800 sims with top-k~300
+     widened roots — our miner has only run top-k 30; "sim-limited not
+     value-limited" precedent, HISTORY 167/172); (c) multi-step distillation
+     (sequence targets) — new machinery. Loop yield after 1 step: ep87→vh1 +4.6%
+     median 5k; vh1→? requires one of the above.
+
+179. **Levers (a) and (b) falsified in one day — single-move distillation from this
+     teacher family into vh1 is CLOSED, with receipts from every angle.** (2026-07-11)
+
+     Judge protocol identical throughout (300 corrections vs vh1 argmax, R=64, H=300,
+     vh1 greedy continuation):
+     | teacher config                     | gap    | genuine/tie/phantom |
+     | 600/400 + fresh-label head (a)     | −0.1pp | 5% / 92% / 3%       |
+     | 4800 sims, top-k 300 widened (b)   | +0.3pp | 2% / 97% / 1%       |
+     | (prior: 600-1200 sims, old head)   | +0.2pp | 4% / 93-94% / 2-3%  |
+     | (reference vs ep87, gate-2)        | +4.5pp | 27-29% / — / 0%     |
+     Fresh-label head calibrates fine (r 0.76-0.84 on fresh death-balanced val) —
+     calibration was not the constraint. The widened teacher disagrees MORE (22%
+     correction rate, 16% decisive) but its alternatives are survival-neutral for a
+     greedy executor. The teacher's play edge persists (escapes ~84% of vh1's deaths
+     with rolling search): the residual advantage is structurally MULTI-STEP.
+
+     **State of the small model: `small128_vh1` (5k: mean 13,080 / P50 9,323 /
+     <1000 3.5%). The loop delivered exactly one iteration (+4.6% median over ep87)
+     and every subsequent lever was measured to zero: corpus volume, mix ratio,
+     step count, γ/lr/blend, head freshness, sim depth, tree width.**
+     Remaining directions: (c) multi-step/sequence distillation (research bet,
+     new machinery); (d) a stronger distillation SOURCE (the 256ch line's future
+     improvements, re-distilled); (e) ship vh1 (browser MVP was the point of the
+     4x compression). Strategy decision, not a compute decision.
+
+180. **Phase 0b (DAgger gate): MICRO-GO — pillar3k's single-move corrections ARE
+     greedy-cashable by vh1; the effect concentrates in confident disagreements;
+     burst ladder is FLAT (single-move labels valid).** (2026-07-26)
+
+     Context: single-move distillation from vh1's OWN MCTS teacher closed (179).
+     New hypothesis (peer-reviewed, docs/small128_dagger_for_review.md): the
+     256ch teacher pillar3k_ep22 (5k mean 43,390, GREEDY eval) is a different
+     signal — its per-move choices are cashable by a greedy executor.
+
+     **ChatGPT review corrections, all verified then adopted (commit 452afd4):**
+     crisis tensors are ~99.7% MCTS-replay states (only first-of-replay rows are
+     true student-visited anchors — original 0a measured the wrong distribution);
+     old judge exporter restricted base move to stored teacher top-5; the 2.5M
+     "3:1" mix is really 39.5% new + its ep1 = ~28.6x the winning run's optimizer
+     steps; a hard 500-seed ep1 gate would have rejected vh1 itself (HISTORY:3375).
+
+     **Corrected 0a (7,287 true anchors from 3,653 vh1 deaths, full-legal argmax
+     both policies):** agree 70.7% all / 69.0% recovery — NO aggregate drop, but
+     disagreements sharpen near death: teacher logit-gap median 0.95 in recovery,
+     49% >=1.0 (vs 0.40 / 27% in prevention). Aggregate agreement was the wrong
+     shift diagnostic.
+
+     **The gate (2,135 disagreement anchors x 2 arms x 64 common-seed reps,
+     H=300, 7 continuation conditions, seed-cluster bootstrap 95% CIs):**
+       ./scripts/run_dagger_judge.sh  (rollout_judge + new --burst-model/--burst-len)
+       python -m alphatrain.scripts.export_dagger_anchors   (anchors + .bin + meta)
+       python -m alphatrain.scripts.dagger_judge_analysis   (CIs + bars)
+     Models: vh1_policy_ts.pt / pillar3k_ep22_policy_ts.pt, both logit-diff
+     verified 0.00e+00 vs checkpoints (verify_ts_export.py — provenance rule).
+
+     Condition S (vh1 continuation, PRIMARY): **+1.69pp [+1.32,+2.09]** died-
+     within-300 uplift (turns +4.9). Genuine 18% : phantom 9% (own-MCTS levers
+     in 178/179 read 2-5% genuine, <=+0.3pp).
+       Strata: gap>=1.0 (n=822) **+3.73pp [+3.03,+4.42]**, turns +11.5 — near
+       the gate-2 win-predicting +4.5pp reference; gap<0.5 (n=934) +0.34pp = 0;
+       recovery +2.25pp vs prevention +1.06pp.
+       T (teacher continuation) +1.81pp; bursts L=1/2/4/8/16: +1.55/+1.30/+1.30/
+       +1.43/+1.54 — **FLAT ladder**: the advantage cashes at the single move,
+       is continuation-robust, and teacher control after the swap adds nothing.
+       So: single-move DAgger labels are VALID; short-sequence cloning adds no
+       value ON THESE anchors.
+
+     **Verdict per pre-registered bars: MICRO-GO** (lower CI > 0, point >= +1pp;
+     Strong GO needed lower CI > +2pp).
+
+     **NEXT (Phase 1, per review recipe + concentration finding):** 50-75k
+     genuinely on-policy corpus — add --record-games to eval.cc (slim JSON via
+     game_json.h) -> fresh vh1 greedy games -> harvest recovery/prevention/broad
+     bands, mostly disagreements (gap<0.5 carries ~nothing; emphasize confident
+     corrections), minority agreement states for calibration; pillar3k top-5 +
+     argmax labels; 3:1 rehearsal; warm-start vh1; checkpoints at ~100/250/400/
+     800 optimizer STEPS (absorption optimum, not epochs); 500-seed screens only
+     reject catastrophes; the 5k eval decides.
+
+181. **DAgger round-1 corpus BUILT (dagger_v1_mix.pt) + Colab package ready.**
+     (2026-07-26)
+
+     Follows the HISTORY 180 MICRO-GO. Master remains FROZEN by user directive
+     (pillar3k = static label source only; all evolution on the small line).
+
+     **On-policy generation (C++ eval, new --record-dir/--record-every/--record-tail):**
+       ./build/eval --model data/vh1_policy_ts.pt --device mps --batch 512
+         --seed-start 860000 --seed-end 862000 --max-turns 40000
+         --record-dir data/dagger_games_v1
+     2,000 vh1 greedy games in 443s. Distribution matched vh1's 5k bar (mean
+     12,860 / P50 9,005 / <1000 4.3%) = on-policy sanity OK. Record format:
+     full last-160-turn death band + every-8th-turn broad samples (~350/game),
+     with the PLAYED move per state (fp16 batched argmax = deployment truth).
+
+     **Harvest (alphatrain/scripts/harvest_dagger_corpus.py, seed 0):** 703,788
+     candidates -> teacher selection pass (pillar3k fp16, full-legal argmax +
+     logit gap vs the recorded student move) -> selection per HISTORY 180
+     concentration: band disagreements gap>=0.5 all (25% sample below), broad
+     only gap>=1.0, agreements downsampled to 18%; per-game caps 30/4/6; dedup.
+     **66,917 states**: recovery 23,139 (21,119 dis) / prevention 31,992
+     (27,255 dis) / broad 11,786 (6,543 dis, all confident) / agreements 12,000.
+     Meta sidecar dagger_v1_states_meta.npz (seed/turn/band/gap/moves).
+
+     **Labels:** distill_relabel.py (pillar3k ep22, top-5 legal softmax — the
+     IDENTICAL convention as the rehearsal corpus). Label top-share P50=0.41.
+     **Mix:** mix_tensors 3:1 -> 267,668 states, EXACTLY 25% new signal (the
+     proven gate-3 ratio; no rehearsal-cap distortion at this size). Mask:
+     patch_mix_mask.py -> disagree_mask on 47,308 confident-correction rows
+     (rehearsal rows 0). ~523 optimizer steps/epoch at batch 4096 aug 8.
+
+     **Colab (train_small128_dagger_colab.ipynb, RUN=small128_dagger1):**
+     gate-3 winner recipe: warm-start vh1, blend 0.5, T=1.0, dw 0, lr 1e-4,
+     bs 4096, seed 42, 3 epochs + --save-every-steps 100 (absorption window
+     100-1000 steps). Upload: colorlines_pillar3d_v4.tar.gz (523,429 B),
+     dagger_v1_mix.pt.gz (16,158,887 B), small128_vh1.pt (36,156,933 B).
+     Gate: 500-seed = catastrophe filter ONLY; floor-first shortlist -> 5k
+     decides vs vh1 bar (13,080 / 9,323 / P5 1,222 / <1000 3.5%).
+     Expectation (HISTORY 180 calibration): +3-8% median.
+
+182. **dagger1 REGRESSED at 5k despite the validated gate — postmortem measured,
+     peer review requested.** (2026-07-26)
+
+     Trained per 181 (RUN=small128_dagger1, gate-3 recipe, 3ep + step saves).
+     500-seed screens: no catastrophe across the whole 100-1,570-step grid.
+     5k evals (775000-779999) of the floor-first shortlist — ALL regress vh1
+     (bar: 13,080 / 9,323 / P5 1,222 / <1000 3.5%):
+       e2_s200: 12,312 / 8,554 (-8.2% P50) / 1,021 / 4.9%
+       epoch_2: 12,678 / 8,816 (-5.4%) / 1,124 / 4.2%   (val 1.90 < vh1's 2.05
+                — val IMPROVED while gameplay regressed; the val trap again)
+       e3_s400: 12,610 / 8,917 (-4.4%) / 1,170 / 3.8%
+
+     **Diagnostics (scripts diag_dagger1_regression.py / _direction.py):**
+     - ABSORPTION on the 47,308 trained confident-correction rows: vh1 10.8%
+       (near-tie fp16/fp32 baseline) -> trained 18% (+7pp only). keep_vh1
+       80->66%; THIRD moves 9->16% (corruption on the very states we fixed).
+     - DRIFT: 6.8-7.9% of argmaxes changed on held-out quiet states AND the
+       rehearsal sample; fully formed at step 100 (warmup LR ~2e-5), partially
+       heals later.
+     - DIRECTION: mimicry-pull REFUTED. Match-to-pillar3k: ep87 73.0 / vh1
+       73.0 / e3_s400 72.8 / e1_s100 72.4 — drift is AWAY from the teacher,
+       incoherent, not re-distillation.
+     - Near-tie contamination: vh1 keeps only 80.2% of its own recorded moves
+       under fp32 recompute -> part of the "confident disagreement" set is
+       tie-flips, not real preference conflicts.
+
+     **The puzzle:** judge-validated +1.69pp single-move signal (HISTORY 180)
+     fails to install (18%) and costs -3..-6% at 5k, while the structurally
+     identical gate-3 recipe (same warm-start/LR/blend/rehearsal tensor) had
+     WON +4.6% with MCTS-on-student labels at natural (low) correction density.
+     Deltas: label function (search-on-self vs bigger-net policy), correction
+     density (82% vs natural), contested-ness (gap median 0.65, soft top-share
+     0.41 labels). Echo of pillar3c ("argmax-flip too aggressive").
+
+     Peer-review brief: docs/small128_dagger1_postmortem_for_review.md
+     (mechanism candidates: contradiction-gradient churn / BN stats shift /
+     hard-CE aggression; round-2 arm menu with pre-registered early-abort).
+     NO round-2 compute before review + arm selection. vh1 REMAINS the
+     deployed best.
+
+183. **R2 diagnostics VINDICATE the data (row-level judge + fp16 re-audit);
+     round-2 arm = task-vector margin fine-tune, machinery built.** (2026-07-26)
+
+     ChatGPT review of the 182 postmortem: all checkable claims verified
+     (gap counts 31,659/25,116/15,649/7,609 of 54,917; HISTORY 146 BN-recal
+     precedent; HISTORY 168-170 task-vector channel). Its key corrections:
+     fp32 diagnostics were off-protocol; "mimicry-pull refuted" overclaimed
+     (val CE 2.05->1.90 IS distributional movement toward the teacher);
+     42% of trained disagreement rows were never judge-validated; effective
+     top-1 target mass was already 0.705 (one-hot hardening = wrong arm);
+     its own BN swap audit: amplifier, not primary cause. Mechanism verdict:
+     OBJECTIVE/PROJECTION MISMATCH — judge validated action replacement;
+     training demanded the 256ch teacher's full truncated top-5 logit
+     geometry, which a 128ch net cannot fit pointwise without rotating
+     unrelated rankings (the 7% quiet churn).
+
+     **New measurements (scripts diag_dagger1_fp16.py, rowjudge_analysis.py):**
+     - fp16 protocol: recorded corpus actions = vh1's deployment argmax 98.9%
+       (the fp32 "80.2% near-tie contamination" was MY measurement artifact);
+       true baseline teacher-play 0.6%; true absorption 11.8%; third 12.6%
+       (67% inside teacher top-5).
+     - ROW-LEVEL judge (750 actual corpus rows, exact fp16 label actions,
+       vh1 continuation, seed-cluster bootstrap):
+         gap>=1.0 x margin-large : +2.42pp [+1.15,+3.70]
+         gap>=1.0 x margin-small : +2.80pp [+1.67,+4.02]
+         gap 0.5-1.0 (both)      : +0.7pp, CIs cross zero
+         gap<0.5                 : +0.08pp
+       Student top-2 margin does NOT gate installability. Labels are GOOD
+       where validated; 42% of the trained corpus was dead weight.
+     - THIRD-action judge (300 rows): the trained model's invented moves are
+       +1.53pp [+0.59,+2.50] BETTER than vh1's originals. Per-move learning
+       was fine; the -4% regression is the COLLATERAL quiet-state churn.
+
+     **Round-2 build (committed):** dagger_r2_gap1.pt = 25,116 judged-domain
+     gap>=1.0 recovery/prevention rows, 1,997 seeds, gap median 1.94
+     (build_dagger_r2_corpus.py). train_crisis_ft.py extended with
+     --loss margin --margin 0.15 (pairwise hinge teacher-vs-vh1 action,
+     frozen BN, corrections-only) + pref metric. Plan: fine-tune ->
+     merge_checkpoints.py alpha={0.05,0.1,0.2,0.4} -> gate_dagger_r2.py
+     (pre-registered: adoption >= +10pp, quiet drift <= 3%, third <=
+     adoption, margin median up) -> 500-seed catastrophe screen -> 5k.
+     Arm 2 control (labels-vs-loss-geometry): current 0.5 soft/hard +
+     rehearsal on the SAME gap>=1 corpus. Venue for the ~minutes fine-tune
+     (M5 per ta15 precedent vs Colab per standing rule) = user's call.
+
+184. **R2 arm-1 (task-vector margin) — NO-GO at the pre-registered gate; the
+     correction-vs-collateral frontier is bad at EVERY alpha. Cross-function
+     per-state installation is now closed with receipts from two loss
+     geometries.** (2026-07-26)
+
+     Run: run_dagger_r2.sh — train_crisis_ft --loss margin --margin 0.15 on
+     dagger_r2_gap1.pt (25,116 judged gap>=1.0 rows), frozen BN (verified
+     bit-identical), 20ep @ 4s/ep on M5; merges alpha={0.05,0.1,0.2,0.4};
+     gate_dagger_r2.py (fp16, 3,799 by-seed held-out corrections + 18,321
+     quiet holdout states).
+
+     **Training curves — the decisive fact:** train pref (logit_t > logit_s)
+     climbed 0.11 -> 0.77, but HELD pref plateaued at ~0.49 from ep5 onward.
+     The corrections DO NOT generalize across seeds — each is ~a lookup
+     entry. Argmax adoption stayed low even on TRAIN rows (~0.08; the hinge
+     lifts teacher-vs-vh1 without making teacher top-1 overall).
+
+     **Gate table (bars: adoption >= +10pp, drift <= 3%, third <= adoption):**
+       model    adopt%  pref%  marg_med  drift%  third%
+       vh1         0.5    0.0    -1.062     0.0     0.4
+       a005        3.7    3.6    -0.953     3.8     5.0
+       a01         6.8    7.5    -0.875     8.2    10.6
+       a02        10.9   13.7    -0.719    18.2    19.4
+       a04        15.7   25.9    -0.438    40.5    35.6
+       ft(a=1)     7.4   50.4    +0.008    89.6    85.6   (fabric destroyed;
+                                                           adoption NON-monotonic in alpha)
+     Collateral >= useful at every point (needed 2:1 the other way). NO
+     gameplay evals run — the bars exist to stop here.
+
+     **Where this leaves the theory:** labels are good (+2.4..+2.8pp row-
+     validated, 180/183) but pillar3k's contested-state preferences are
+     OFF-MANIFOLD for vh1's 128ch feature geometry — pointwise supervised
+     installation (dense soft/hard R1, pairwise-margin task-vector R2) buys
+     <=1 useful flip per collateral flip at any dose. Contrast gate-3's WIN:
+     MCTS-on-vh1 corrections are ON-manifold (search amplifies the net's own
+     latent preferences) and installed cleanly (+4.6%).
+
+     **Named next options:** (a) same-forward gradient-cosine audit among
+     corrections (documents interference; cheap); (b) STRATEGIC: re-arm the
+     on-manifold channel — retrain the survival value head on the 2k+ recorded
+     vh1 games (generate more overnight, ~4.5 games/s), gate-1 calibration,
+     gate-2 judge of MCTS-on-vh1 with the better head (value-function law:
+     leaf value = teacher strength); if positive -> the proven gate-3 recipe;
+     (c) 192ch capacity control (standing contingency — multiple channels now
+     read "uninstallable at 128ch/3M").
+
+185. **legalmax (hard-negative + KL anchor) — best frontier points REGRESS at
+     5k. The supervised-corrections channel at 128ch is CLOSED by the review's
+     own criterion, with a complete frontier map.** (2026-07-27)
+
+     R2c/d/e per the follow-up review: loss = relu(0.15 + max_{legal!=teacher}
+     logit[a] - logit[teacher]) + lambda * CE-to-vh1 on 13,958 disjoint quiet
+     states, frozen BN, 3 shuffle seeds (reproducible to ~0.3pp), lambda x
+     epoch frontier (fp16 gate, 3,799 by-seed held-out corrections):
+
+       lambda/ep   adopt%  drift%  ratio(useful:collateral)
+       1 / 20       16.6    11.1      1.4:1
+       3 / 20       14.7     8.0      1.7:1
+       6 / 5        11.4     5.6      2.0:1
+       10 / 5       10.0     4.5      2.1:1   <- best; ratio bar met,
+                                                 drift bar (<=3%) missed
+     Monotone, smooth, seed-stable. Epoch-invariance of the PAIRWISE vectors
+     also confirmed (ep5/10/15 merges == ep20 within noise at every alpha —
+     the vector direction stabilizes by ep5).
+
+     **5k verdicts (775000-779999) vs vh1 (13,080 / 9,323 / P5 1,222 / 3.5%):**
+       l100_ep5: mean 12,650 / P50 8,780 (-5.8%) / P5 1,126 / <1000 4.1%
+       l60_ep5:  mean 12,108 / P50 8,347 (-10.5%) / P5 1,065 / <1000 4.5%
+     NOTE: l100_ep5's 500-seed screen read mean 13,115 / P50 9,421 / <1000
+     3.0% — BETTER than vh1 — then flipped at 5k. The FOURTH 500<->5k flip.
+     500 seeds decide NOTHING.
+
+     **Closure:** three loss geometries (dense soft/hard + rehearsal; pairwise
+     task-vector across epoch x alpha; legal hard-negative + KL anchor across
+     lambda x epoch), all on row-validated +2.4..+2.8pp labels, all regress at
+     5k. 4.5% quiet-state drift costs more than 10pp of installed validated
+     corrections buy. Per the review: "if that still has no adoption-versus-
+     drift operating point, closing this channel at 128 is justified." Closed.
+     (192ch control: OFF THE TABLE by user directive — 128ch only; fallback
+     is keeping pillar3k, not intermediate widths.)
+
+     **LIVE next:** the on-manifold re-arm — 20k on-policy games (seeds
+     870000-890000) generating for the value-head scaling replication;
+     protocol: disjoint splits (head-train / calibration / judge), decision-
+     level bars (judge LCB > +1pp, genuine >= 15%, phantom < 5%; winning
+     reference +4.5pp / 27-29%). Calibration = sanity gate only (the r=0.76
+     fresh head already failed the judge at -0.1pp once — this is a 5x-data
+     replication, not a guaranteed unlock).
+
+186. **vh5x decision judge: FIRST POSITIVE GATE SINCE vh1 — the on-manifold
+     channel re-arms with the 5x-data value head. Iteration-3 mining launched.**
+     (2026-07-27)
+
+     Value-head scaling replication (per follow-up review, disjoint seed
+     splits): 20k on-policy vh1 games (seeds 870000-890000; mean 12,810 ~=
+     the 5k bar). Targets: build_value_targets_slim.py, death-dense
+     (--broad-keep 0.15 after the raw build read 82-97% positive — the
+     saturated-val alarm), train <886000 (4.40M rows) / val 886000-888000
+     (551k) / judge >=888000 (untouched). Head: value_head_vh5x.pt (12 min,
+     frozen vh1 backbone). SANITY: AUC per-H on 100k identical val rows —
+     vh5x 0.9730/0.9443/0.8973/0.8596 vs the falsified fresh head
+     0.9709/0.9412/0.8890/0.8453 (better at every horizon).
+
+     **Decision judge (gate-2 protocol @600 sims, 400 identical direct-sampled
+     death-band states from reserved seeds, vh1 continuation, 64 paired reps,
+     seed-cluster CIs):**
+       q=0 control:        1/400 disagreements (all signal flows via the head)
+       q=2 + OLD head:     49 dis, +2.84pp [+0.75, +5.06], 16%/2%
+       q=2 + vh5x:         51 dis, **+3.37pp [+1.17, +5.73]**, 22%/6%
+     Bars: LCB>+1pp PASS, genuine>=15% PASS, phantom<5% marginal (3/51).
+     **KEY REVISION: the OLD head also reads positive on directly-sampled
+     fresh death-band states — iter-2's "consumed" verdict was partly a
+     property of the OLD miner's band selection, not the whole distribution.**
+     Fresh deaths still carry per-move signal; vh5x finds more of it.
+
+     **LAUNCHED: iteration-3 micro-corpus mine** — mcts_crisis, fused
+     pv_vh1_vh5x_ts.pt (verified 0.00e+00), seeds 900000-900150, recovery
+     15-back@1200 / prevention 30-back@800 / q=2.0 (the exact winning gate-3
+     settings) -> data/crisis_vh5x_micro. Next: build_expert_v2_tensor
+     (policy-only) -> mix 3:1 rehearsal -> gate-3 recipe on Colab
+     (RUN=small128_vh2try) -> 500 catastrophe screen -> 5k vs vh1.
+
+187. **Iteration-3 (vh2try) REGRESSED at 5k despite the positive judge — and
+     the cross-round pattern now reads as a SIGNAL THRESHOLD, not a slope.**
+     (2026-07-27)
+
+     Local end-to-end round (M5, first fully-local loop turn): train_path_b on
+     MPS, 3 epochs / 24 min (gate-3 recipe exactly; no --compile/--amp).
+     500-screens: all 14 checkpoints pass (no catastrophe). 5k verdicts vs
+     vh1 (13,080 / 9,323 / 1,222 / 3.5%):
+       epoch_1: 12,351 / 8,579 (-8.0% P50) / 1,103 / 4.1%
+       e1_s400: 12,134 / 8,701 (-6.7%) / 1,118 / 4.2%
+       e3_s100: 11,697 / 8,342 (-10.5%) / 1,047 / 4.7%
+
+     **The (judge -> 5k) record, all rounds ever measured:**
+       gate-2 -> vh1 : +4.5pp / 27-29% genuine  ->  +4.6%   (WON)
+       dagger R1     : +1.69pp / 18%            ->  -4%
+       vh5x iter-3   : +3.37pp / 22%            ->  -7%
+       iter-2 levers : <=+0.3pp                 ->  -11..-15%
+     Reading: warm-start training pays a ~fixed collateral tax (~4-6% at 5k;
+     the quiet-state churn measured directly in 182/184); mined per-move
+     signal must EXCEED the tax. +4.5pp cleared it; +3.37pp did not.
+     Expectation-setting by linear interpolation was wrong — it's a threshold.
+
+     **DUE DILIGENCE LAUNCHED:** (a) 5k on the untested earliest checkpoints
+     (e1_s100/s200); (b) the decisive measurement: gate-2 judge @2400 sims
+     (vh5x head, same 400 reserved states) — can search on vh1 produce
+     +4.5pp-class corrections AT ALL? If yes -> iteration-3b mines at those
+     settings. If no -> vh1 is measured as sitting where its search-teacher's
+     per-round yield < training's per-round cost (a real plateau statement,
+     to peer review with the full table).
+
+188. **Tax sweep: rehearsal ratio is a REAL tax knob — 6:1 recovers 2/3 of the
+     iteration-3 regression. Iteration-3b (deep corpus x 6:1) launched.**
+     (2026-07-28)
+
+     Three arms on the UNCHANGED iteration-3 corpus (local M5, ~3h total):
+     5k vs vh1 (13,080 / 9,323 / 3.5%):
+       3:1 (187 ref) : 12,351 / 8,579 (-8.0%) / 4.1%
+       6:1 r6/ep1    : 12,764 / 9,098 (-2.4%) / 3.9%   <- best post-vh1 yet
+       10:1 r10/ep1  : 12,788 / 8,897 (-4.6%) / 4.3%   (diminishing past 6:1)
+       3:1 lr 5e-5   : 12,336 / 8,693 (-6.8%) / 4.4%   (LR is not the lever)
+     Screens again over-promised (r6/ep1 screened mean 14,074 = +7.6%; 5k
+     says -2.4% — flip #5). Monotone tax curve 3:1 -> 6:1 confirms the
+     threshold model's tax side; LR halving does nothing.
+
+     **Ledger: 6:1 tax ~2-3% at 5k; current corpus signal +3.37pp — just
+     short. Deep judge (187 diligence): @2400 sims +3.88pp [+2.37,+5.45],
+     17.5% disagreement, 0% PHANTOMS.** Iteration-3b = both knobs:
+     LAUNCHED mcts_crisis @ recovery 2400 / prevention 1600, q=2.0, seeds
+     901000-901150 -> data/crisis_vh5x_deep; then 6:1 mix -> gate-3 recipe
+     (2 epochs, step saves) -> screens (catastrophe only) -> 5k.
+
+189. **Iteration-3b (deep corpus x 6:1) FAILED — deep corpus trained WORSE
+     than shallow at the same tax point. CAMPAIGN HALTED for full review;
+     pivot question = put the small line on the 256ch track (dw/T0.7).**
+     (2026-07-29)
+
+     5k vs vh1 (13,080 / 9,323 / 1,222 / 3.5%):
+       vh2c/epoch_1 (deep 2400/1600 @ 6:1): 12,543 / 8,791 (-5.7%) / 4.1%
+       vh2c/e1_s700:                        12,348 / 8,671 (-7.0%) / 4.9%
+     vs r6 (shallow 1200/800 @ 6:1):        12,764 / 9,098 (-2.4%) / 3.9%
+
+     **THE TWIST:** the better-JUDGED corpus (+3.88pp, 0% phantoms) trained
+     worse than the +3.37pp one — the simple signal-minus-tax model breaks.
+     Matching receipt: HISTORY 174 lesson 2 — deeper search = FLATTER visit
+     distributions; the 256ch line's cure was DECISIVENESS WEIGHTING (dw=3).
+     Every small-line run since gate-3 used dw=0. Per-move argmax quality
+     improved while target-distribution quality for a greedy student fell.
+
+     **Campaign record (vh1 = bar, 6 challenger rounds, all failed):**
+       iter-2 (own-MCTS, 3 methods)      : judge <=+0.3pp -> -11..-15%
+       dagger R1/R2 (pillar3k labels, 3
+       loss geometries)                  : +1.69pp row-valid -> -4..-8%
+       iter-3 (vh5x @1200/800, 3:1, dw0) : +3.37pp -> -7%
+       tax arms (same corpus)            : 6:1 -2.4% (best), 10:1 -4.6%
+       iter-3b (deep @2400/1600, 6:1)    : +3.88pp/0-phantom -> -5.7%
+     Screens 0-for-5 on close calls. vh1 REMAINS best.
+
+     USER DECISION: stop and review (docs/small128_campaign_review.md).
+     Hypothesis on the table: the 256ch line progressed fine on dw3/T0.7
+     full-corpus deep-visit distillation — put the small model on that track.
+
+190. **Iteration-4 pilot (composite weighting + KL anchor) DEAD at every
+     lambda; pivot to the review's fallback = advantage-filtered policy
+     improvement. Per-row judging of all 15,655 disagreements launched.**
+     (2026-07-29)
+
+     Pilot arms (vh2c_crisis only, w=top_share^P*(1+gamma*disagree), lambda=1):
+     screens DEGRADE MONOTONICALLY (arm A ep1 10,502 -> ep6 5,839; arm B
+     10,481 -> 5,949) — concentrated correction gradient destroys the policy;
+     lambda=1 anchor far too weak. Lambda sweep (P1.5/gamma2): lambda=10 best
+     ~11.3k, lambda=30 best ~11.7k, still 15-20% below the vh1 screen range
+     and decaying by ep3. NOT close-call territory (screen noise is ±5-8%);
+     no 5k spent. The design has no viable operating point on this corpus.
+
+     Running (overnight): export_advantage_judge.py -> rollout_judge on ALL
+     15,655 full-legal fp16 disagreement rows of vh2c_crisis (64 paired reps,
+     vh1 continuation) -> per-row advantage estimates. Next: train ONLY
+     judged-positive executable disagreements (hard CE, advantage-weighted,
+     strong quiet anchor via train_crisis_ft machinery), screens, 5k.
+     Permanent asset either way: the corpus's actual row-level value,
+     closing the judge!=corpus gap the review flagged.
+
+191. **METHODOLOGICAL LANDMARK: the 5k eval's resolution is ~±480 mean /
+     ~±550 P50 (95%) — measured via paired-seed bootstrap. The advantage-
+     filtered candidates are AHEAD but inside noise; 20k evals running.**
+     (2026-07-30)
+
+     Advantage-filtered round (review #5 fallback): judged all 15,655 vh2c
+     disagreement rows individually (overnight, 550M evals) -> mean row
+     uplift only +0.5pp (roots read +3.88pp — judge!=corpus now QUANTIFIED,
+     ~7x). Filtered to the 676 judged-genuine rows (uplift>=0.08, mean
+     0.145), advantage-weighted soft-CE fine-tune (train_crisis_ft, frozen
+     BN, lambda=3 quiet anchor) -> alpha-merges. 5k point estimates:
+       m02 (a=0.2): 13,318 / 9,475 (+1.8% / +1.6%)  <1000 3.8%
+       m04 (a=0.4): 13,474 / 9,553 (+3.0% / +2.5%)  <1000 4.2%
+     FIRST candidates ever AHEAD of vh1 at 5k.
+
+     **But: eval --scores-out (new) + paired_bootstrap.py (new) shows ALL
+     CIs cross zero** (m04 mean +394 [-120,+903]; P50 +232 [-349,+759]);
+     pairing doesn't help because same-seed games diverge into unrelated
+     trajectories (the butterfly effect, now measured). m04 floor warning:
+     <1000 +0.7pp [-0.0,+1.4] — near-significant worsening.
+
+     **Consequence for the whole campaign: differences under ~8% P50 were
+     never resolvable at 5k.** The -2.4% "near miss" (188), the +1.6-3%
+     "wins" here, and possibly vh1's own +4.6% (177) sit in or near the
+     noise band. Only the >=8-15% failures were conclusively measured.
+
+     RUNNING: 20k-seed evals (775000-795000, ~65 min each, C++ engine) of
+     vh1 / m02 / m04 -> CI halves to ~±240/±280 -> resolves the promotion.
+     Promotion bar: paired mean AND P50 CIs > 0 with no confirmed floor
+     loss (<1000 CI must not be clearly positive).
+
+192. **small128_vh2 PROMOTED — the advantage-filtered channel wins at 20k
+     paired seeds. First loop turn since vh1, and the first promotion under
+     the rigorous instrument.** (2026-07-30)
+
+     **small128_vh2 = alphatrain/data/small128_vh2.pt** (TS export
+     vh2_policy_ts.pt) = theta_vh1 + 0.2 * (theta_ft - theta_vh1), where the
+     fine-tune is train_crisis_ft on alphatrain/data/advfilt.pt: the 676
+     judged-genuine rows (per-row uplift >= 0.08 over 64 paired reps; mean
+     0.145) of vh2c_crisis's 15,655 full-legal disagreements, advantage-
+     weighted soft-CE T=0.5, frozen BN, lambda=3 quiet-anchor, 15 epochs.
+
+     **20k-seed paired verdict (775000-794999, paired_bootstrap):**
+       m02 vs vh1: mean +527 [+280,+774] WIN (+4.1%); P50 +322 [+46,+573]
+       WIN (+3.6%); P5/P10/<1000 all neutral (no floor loss).
+       m04: mean WIN but P50 CI crosses zero, floor leans worse — NOT promoted
+       (the 5k point estimates had ranked m04 first: noise, again).
+     **New bar (20k): mean 13,334 / P50 9,364 / P5 1,150 / P10 1,853 /
+     <1000 3.9%.** (vh1 @20k: 12,807 / 9,042 / 1,130 / 1,787 / 4.0% — note
+     the old 5k seed-set read vh1 ~2% friendly.)
+
+     **What the win validates end-to-end:** row-level judging (the corpus was
+     96% ties — training ONLY the verified 4% flipped nine rounds of
+     regression into a win), advantage weighting, alpha-metered task-vector
+     integration with a quiet anchor, and 20k paired bootstrap as the
+     promotion instrument. The channel's economics: 676 rows bought +4%;
+     judging is the bottleneck (~3.5h per 15k rows, C++).
+
+     **NEXT (the alternation, round 2 of this channel):** generate fresh vh2
+     games -> retrain the survival head on vh2's backbone -> mine + judge
+     MORE candidate rows (30-50k) -> advantage-filter -> fine-tune + merge ->
+     20k paired bar vs vh2. All machinery exists; no new methods needed.

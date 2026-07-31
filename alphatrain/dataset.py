@@ -201,6 +201,9 @@ def _load_backing(tensor_path, device):
         backing['obs_precomputed'] = data['obs_precomputed'].to(dev)
     else:
         backing['obs_precomputed'] = None
+    # Optional per-state disagreement mask (gamma-weighted distillation).
+    backing['disagree_mask'] = (data['disagree_mask'].to(dev)
+                                 if 'disagree_mask' in data else None)
     # Completed-Q (Gumbel trunk) fields — only present in slim/policy-only tensors.
     if 'cand_idx' in data:
         for k in ('cand_idx', 'cand_visit', 'cand_prior', 'cand_q',
@@ -253,6 +256,8 @@ class TensorDatasetGPU(Dataset):
         self.pol_values = backing['pol_values']
         self.max_score = backing['max_score']
         self.obs_precomputed = backing['obs_precomputed']
+        self.disagree_mask = backing.get('disagree_mask')
+        self.return_disagree = False  # opt-in: collate returns a 3rd element
 
         n_total = self.boards.shape[0]
         if base_indices is None:
@@ -363,6 +368,8 @@ class TensorDatasetGPU(Dataset):
                     )[:, :, self._obs_luts[t]].reshape(-1, NUM_CHANNELS, 9, 9)
                 policy[mask] = policy[mask][:, self._pol_luts[t]]
 
+        if self.return_disagree and self.disagree_mask is not None:
+            return obs, policy, self.disagree_mask[base_idx].float()
         return obs, policy
 
     @classmethod
