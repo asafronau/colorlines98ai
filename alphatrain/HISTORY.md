@@ -3875,3 +3875,34 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      strong quiet anchor via train_crisis_ft machinery), screens, 5k.
      Permanent asset either way: the corpus's actual row-level value,
      closing the judge!=corpus gap the review flagged.
+
+191. **METHODOLOGICAL LANDMARK: the 5k eval's resolution is ~±480 mean /
+     ~±550 P50 (95%) — measured via paired-seed bootstrap. The advantage-
+     filtered candidates are AHEAD but inside noise; 20k evals running.**
+     (2026-07-30)
+
+     Advantage-filtered round (review #5 fallback): judged all 15,655 vh2c
+     disagreement rows individually (overnight, 550M evals) -> mean row
+     uplift only +0.5pp (roots read +3.88pp — judge!=corpus now QUANTIFIED,
+     ~7x). Filtered to the 676 judged-genuine rows (uplift>=0.08, mean
+     0.145), advantage-weighted soft-CE fine-tune (train_crisis_ft, frozen
+     BN, lambda=3 quiet anchor) -> alpha-merges. 5k point estimates:
+       m02 (a=0.2): 13,318 / 9,475 (+1.8% / +1.6%)  <1000 3.8%
+       m04 (a=0.4): 13,474 / 9,553 (+3.0% / +2.5%)  <1000 4.2%
+     FIRST candidates ever AHEAD of vh1 at 5k.
+
+     **But: eval --scores-out (new) + paired_bootstrap.py (new) shows ALL
+     CIs cross zero** (m04 mean +394 [-120,+903]; P50 +232 [-349,+759]);
+     pairing doesn't help because same-seed games diverge into unrelated
+     trajectories (the butterfly effect, now measured). m04 floor warning:
+     <1000 +0.7pp [-0.0,+1.4] — near-significant worsening.
+
+     **Consequence for the whole campaign: differences under ~8% P50 were
+     never resolvable at 5k.** The -2.4% "near miss" (188), the +1.6-3%
+     "wins" here, and possibly vh1's own +4.6% (177) sit in or near the
+     noise band. Only the >=8-15% failures were conclusively measured.
+
+     RUNNING: 20k-seed evals (775000-795000, ~65 min each, C++ engine) of
+     vh1 / m02 / m04 -> CI halves to ~±240/±280 -> resolves the promotion.
+     Promotion bar: paired mean AND P50 CIs > 0 with no confirmed floor
+     loss (<1000 CI must not be clearly positive).
