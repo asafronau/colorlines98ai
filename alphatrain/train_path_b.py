@@ -88,7 +88,8 @@ def cross_entropy_soft(logits, targets):
 
 
 def distillation_loss(logits, soft_targets, blend_alpha=1.0,
-                      target_temperature=1.0, decisiveness_power=0.0):
+                      target_temperature=1.0, decisiveness_power=0.0,
+                      state_weights=None):
     """Cross-entropy on a visit-distribution target.
 
     target_temperature=1.0 (default): targets used as-stored.
@@ -109,6 +110,11 @@ def distillation_loss(logits, soft_targets, blend_alpha=1.0,
         # peakedness from the RAW (pre-sharpen) target = the position's decisiveness.
         raw_top = soft_targets.max(dim=-1).values.clamp(min=1e-6)   # (B,)
         w = raw_top.pow(decisiveness_power)
+    if state_weights is not None:
+        # e.g. gamma-disagreement weights (1 + gamma*mask): concentrate gradient
+        # on states whose target argmax differs from the base policy's.
+        w = state_weights if w is None else w * state_weights
+    if w is not None:
         w = w / w.mean().clamp(min=1e-8)                            # mean -> 1
     if target_temperature != 1.0:
         sharp = soft_targets.pow(1.0 / target_temperature)
@@ -140,7 +146,9 @@ _GRAD_AUDIT = []   # accumulates (|g_main|, |g_aux|, lam, cos) for --grad-audit
 
 def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                  log_interval=100, blend_alpha=1.0, target_temperature=1.0,
-                 aux=None, epoch=0, grad_audit=0, decisiveness_power=0.0):
+                 aux=None, epoch=0, grad_audit=0, decisiveness_power=0.0,
+                 disagree_gamma=0.0, save_every_steps=0, save_hook=None,
+                 anchor=None):
     """One epoch. Optionally adds the listwise margin aux loss.
 
     `aux`, when not None, is a dict with:
@@ -164,7 +172,12 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
     steps_per_epoch = len(loader)
 
     for bi, batch in enumerate(loader):
-        obs, pol_tgt = batch
+        if len(batch) == 3:
+            obs, pol_tgt, dmask = batch
+            state_w = 1.0 + disagree_gamma * dmask.to(device, non_blocking=True)
+        else:
+            obs, pol_tgt = batch
+            state_w = None
         obs = obs.to(device, non_blocking=True)
         pol_tgt = pol_tgt.to(device, non_blocking=True)
 
@@ -175,7 +188,8 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                 logits, pol_tgt,
                 blend_alpha=blend_alpha,
                 target_temperature=target_temperature,
-                decisiveness_power=decisiveness_power)
+                decisiveness_power=decisiveness_power,
+                state_weights=state_w)
 
             if aux is not None:
                 lam = _aux_lambda_schedule(
@@ -222,6 +236,21 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                     loss = main_loss
             else:
                 loss = main_loss
+
+            if anchor is not None:
+                # KL(base || model) preservation anchor on independent quiet
+                # states (review #5: separate signal learning from
+                # preservation). Frozen BN + eager module, same rationale as
+                # the aux path above.
+                aidx = torch.randint(0, anchor['obs'].shape[0],
+                                     (anchor['batch'],),
+                                     device=anchor['obs'].device)
+                with frozen_bn(base_model):
+                    an_out = base_model(anchor['obs'][aidx])
+                an_lg = an_out[0] if isinstance(an_out, tuple) else an_out
+                an_ce = -(anchor['probs'][aidx].float()
+                          * F.log_softmax(an_lg.float(), -1)).sum(-1).mean()
+                loss = loss + anchor['weight'] * an_ce
 
         # --- gradient audit: measure main vs aux gradient magnitude + alignment ---
         # Is the aux stream a gentle nudge or a sledgehammer? Run with --grad-audit N
@@ -273,6 +302,8 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
         total_loss += loss.item()
         n += 1
 
+        if save_every_steps and (bi + 1) % save_every_steps == 0 and save_hook:
+            save_hook(epoch, bi + 1)
         if (bi + 1) % log_interval == 0:
             elapsed = time.time() - t0
             sps = (bi + 1) * loader.batch_size / elapsed
@@ -435,6 +466,31 @@ def main():
     p.add_argument('--batch-size', type=int, default=32768)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--warmup-epochs', type=int, default=1)
+    p.add_argument('--save-every-steps', type=int, default=0,
+                   help='Also save mid-epoch checkpoints every N optimizer '
+                        'steps (e{epoch}_s{step}.pt). The absorption optimum '
+                        'lives at a ~constant STEP count, not epoch count.')
+    p.add_argument('--kl-anchor-weight', type=float, default=0.0,
+                   help='lambda for the CE-to-resumed-base anchor on '
+                        'independent quiet states (preservation without '
+                        'rehearsal mixing; review #5 iteration-4 pilot).')
+    p.add_argument('--anchor-games-dir', default='data/dagger_games_v1')
+    p.add_argument('--anchor-skip-games', type=int, default=200)
+    p.add_argument('--anchor-games', type=int, default=150)
+    p.add_argument('--anchor-batch', type=int, default=1024)
+    p.add_argument('--disagree-gamma', type=float, default=0.0,
+                   help='gamma-disagreement weighting: per-state CE weight '
+                        '1 + gamma*disagree_mask (tensor must contain '
+                        'disagree_mask; reviewers\' fix for correction '
+                        'starvation). 0 = off.')
+    p.add_argument('--seed', type=int, default=None,
+                   help='Seed torch/numpy/random for reproducible runs '
+                        '(unseeded near-replicates differ by ~1k median).')
+    p.add_argument('--flat-epochs', type=int, default=0,
+                   help='Hold LR flat at peak for N epochs AFTER warmup and '
+                        'BEFORE cosine decay. For from-scratch distillation that '
+                        'is still climbing, keep LR flat for ~70%% of training, '
+                        'then cosine-decay the rest (Gemini recipe).')
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
@@ -553,6 +609,16 @@ def main():
         raise SystemExit("Pick ONE aux mode: --aux-counterfactual, "
                          "--aux-crisis[-corpus], or --aux-corrections-corpus.")
 
+    # Reproducibility: σ_train ≈ 1k median between unseeded near-replicates
+    # (HISTORY 165) — seed everything so close A/Bs compare recipes, not RNG.
+    if args.seed is not None:
+        import random as _random
+        import numpy as _np
+        torch.manual_seed(args.seed)
+        _np.random.seed(args.seed % (2**32))
+        _random.seed(args.seed)
+        print(f"Seeded: {args.seed}", flush=True)
+
     # Device
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -581,6 +647,14 @@ def main():
         train_set.base_indices = train_set.base_indices[:args.max_train_states]
         print(f"  SUBSAMPLE: train base states capped to "
               f"{len(train_set.base_indices):,} (local smoke)", flush=True)
+    if args.disagree_gamma > 0.0:
+        if train_set.disagree_mask is None:
+            raise SystemExit("--disagree-gamma needs a 'disagree_mask' in the "
+                             "tensor (run add_disagree_mask.py first).")
+        train_set.return_disagree = True
+        n_dis = int(train_set.disagree_mask.sum())
+        print(f"gamma-disagreement weighting: gamma={args.disagree_gamma}, "
+              f"{n_dis:,} flagged states", flush=True)
     train_loader = DataLoader(train_set, batch_size=args.batch_size,
                               shuffle=True, num_workers=0,
                               collate_fn=train_set.collate)
@@ -637,11 +711,21 @@ def main():
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0,
         total_iters=args.warmup_epochs)
+    scheds = [warmup]
+    milestones = [args.warmup_epochs]
+    if args.flat_epochs > 0:
+        # Hold LR flat at peak after warmup, before cosine (Gemini: for a
+        # from-scratch student still climbing, decaying early starves it).
+        scheds.append(torch.optim.lr_scheduler.ConstantLR(
+            optimizer, factor=1.0, total_iters=args.flat_epochs))
+        milestones.append(args.warmup_epochs + args.flat_epochs)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, args.epochs - args.warmup_epochs),
+        optimizer,
+        T_max=max(1, args.epochs - args.warmup_epochs - args.flat_epochs),
         eta_min=args.lr * 0.01)
+    scheds.append(cosine)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, [warmup, cosine], milestones=[args.warmup_epochs])
+        optimizer, scheds, milestones=milestones)
 
     if (args.resume and not args.warm_start and ckpt is not None
             and 'optimizer' in ckpt):
@@ -875,6 +959,46 @@ def main():
                             steps_per_epoch=len(train_loader))
 
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # --- optional preservation anchor: independent quiet states + the RESUMED
+    # base's soft policy (computed now, before any training step) ---
+    anchor_data = None
+    if args.kl_anchor_weight > 0:
+        from alphatrain.scripts.diag_dagger1_regression import build_holdout
+        from alphatrain.observation import build_observation
+        import numpy as np
+        tmp = os.path.join(args.save_dir, 'anchor.tmp')
+        n_anchor = build_holdout(args.anchor_games_dir, args.tensor_file,
+                                 args.anchor_games, 100, tmp,
+                                 np.random.default_rng(7),
+                                 skip=args.anchor_skip_games)
+        t = torch.load(tmp, map_location='cpu', weights_only=True)
+        os.remove(tmp)
+        ao = np.stack([build_observation(
+            t['boards'][i].numpy(),
+            t['next_pos'][i, :, 0].numpy().astype(np.int64),
+            t['next_pos'][i, :, 1].numpy().astype(np.int64),
+            t['next_col'][i].numpy().astype(np.int64), int(t['n_next'][i]))
+            for i in range(n_anchor)])
+        a_obs = torch.from_numpy(ao).to(device)
+        base_eval = getattr(model, '_orig_mod', model)
+        was_training = base_eval.training
+        base_eval.train(False)
+        with torch.no_grad():
+            ps = []
+            for i in range(0, n_anchor, 2048):
+                out = base_eval(a_obs[i:i + 2048])
+                lg = (out[0] if isinstance(out, tuple) else out).float()
+                ps.append(torch.softmax(lg, 1).half())
+        base_eval.train(was_training)
+        anchor_data = {'obs': a_obs, 'probs': torch.cat(ps),
+                       'batch': args.anchor_batch,
+                       'weight': args.kl_anchor_weight}
+        print(f"anchor: {n_anchor:,} quiet states from "
+              f"{args.anchor_games_dir}[{args.anchor_skip_games}:"
+              f"{args.anchor_skip_games + args.anchor_games}], "
+              f"lambda={args.kl_anchor_weight}", flush=True)
+
     print(f"\n=== Training {args.epochs} epochs ===", flush=True)
     t_total = time.time()
 
@@ -883,12 +1007,22 @@ def main():
         lr = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {epoch+1}/{args.epochs} (lr={lr:.2e})", flush=True)
 
+        def _step_hook(ep, step):
+            ck_s = {'epoch': ep, 'model': model.state_dict(),
+                    'args': vars(args), 'policy_only': True, 'step': step}
+            torch.save(ck_s, os.path.join(args.save_dir,
+                                          f'e{ep+1}_s{step}.pt'))
+            print(f"  [ckpt] e{ep+1}_s{step}.pt", flush=True)
         tl, aux_tl = train_epoch(model, train_loader, optimizer, device,
                                   scaler, amp_dtype,
                                   blend_alpha=args.blend_alpha,
                                   target_temperature=args.target_temperature,
+                                  disagree_gamma=args.disagree_gamma,
+                                  save_every_steps=args.save_every_steps,
+                                  save_hook=_step_hook,
                                   aux=aux, epoch=epoch, grad_audit=args.grad_audit,
-                                  decisiveness_power=args.decisiveness_power)
+                                  decisiveness_power=args.decisiveness_power,
+                                  anchor=anchor_data)
         vl = validate(model, val_loader, device, amp_dtype=amp_dtype)
         scheduler.step()
 

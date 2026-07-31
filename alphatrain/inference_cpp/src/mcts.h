@@ -1,0 +1,85 @@
+// Neural MCTS — port of alphatrain/mcts.py (the MCTS class, feature-value
+// leaf mode). Open-loop determinized search: every simulation clones the root
+// game and replays the tree path with fresh stochastic spawns drawn from one
+// shared per-search RNG. Batched virtual-loss selection feeds the policy net
+// in batches of `batch_size`.
+//
+// NOTE on reproducibility: the per-search sim RNG is seeded from a hash of the
+// game state using OUR SplitMix64 (Python uses MD5 + numpy PCG64), so C++
+// visit counts will NOT bit-match Python's. Validation is by playing STRENGTH
+// (score distribution), same principle as the C++ eval.
+
+#ifndef CLINES_MCTS_H_
+#define CLINES_MCTS_H_
+
+#include <cstdint>
+#include <functional>
+#include <vector>
+
+#include "feature_value.h"
+#include "game.h"
+#include "rng.h"
+
+namespace clines {
+
+// Batched policy(+value) forward: `obs` holds n contiguous (18,9,9) fp32
+// observations; writes n*6561 logits to `out`, and (if out_values != nullptr
+// and the module is a fused policy+value export) n scalars to `out_values`.
+using PolicyFn = std::function<void(const float* obs, int n, float* out,
+                                    float* out_values)>;
+
+struct MctsConfig {
+  int num_simulations = 100;
+  double c_puct = 2.5;
+  int top_k = 30;
+  int batch_size = 8;      // leaves per batched policy forward (virtual loss)
+  double q_weight = 1.0;   // PUCT: q_weight*q_norm + U
+  bool early_stop = false; // eval-only: stop when the argmax can't change
+  // Root exploration noise (selfplay): prior = (1-w)*p + w*Dirichlet(alpha).
+  // 0 = off (eval). selfplay.py defaults: alpha 0.3, weight 0.25.
+  double dirichlet_alpha = 0.0;
+  double dirichlet_weight = 0.0;
+  // Leaf value from the fused NN value head (q=2.0 operating point) instead of
+  // the 27-feature linear evaluator. Gate-validated 2026-07-09.
+  bool nn_value = false;
+};
+
+struct Candidate {
+  int action;     // flat = (sr*9+sc)*81 + (tr*9+tc)
+  int visits;
+  double prior;   // CLEAN pre-Dirichlet prior (what selfplay records)
+  double q;       // value_sum / visits (0 if unvisited)
+};
+
+struct SearchResult {
+  int action = -1;                // chosen move; -1 = no legal moves (dead)
+  double root_value = 0.0;
+  double q_min = 0.0, q_max = 0.0;
+  std::vector<Candidate> cands;   // root children, visit-count descending
+};
+
+// Top-K legal moves by policy logit, softmax over just those K logits.
+// Port of mcts.py::_legal_priors_jit (top-k over ALL legal moves, never
+// top-k-then-filter). Returns k; fills out_actions/out_priors (descending
+// logit order). out_* must hold at least top_k entries.
+int LegalPriors(const int8_t* board, const float* logits, int top_k,
+                int* out_actions, double* out_priors);
+
+class MCTS {
+ public:
+  MCTS(PolicyFn policy, const FeatureEval* fe, const MctsConfig& cfg)
+      : policy_(std::move(policy)), fe_(fe), cfg_(cfg) {}
+
+  // One search from `game`. temperature: 0 = argmax visits; >0 = sample
+  // visits^(1/T) using move_rng (selfplay exploration).
+  SearchResult Search(const Game& game, double temperature, SimpleRng& move_rng);
+
+ private:
+  PolicyFn policy_;
+  const FeatureEval* fe_;
+  MctsConfig cfg_;
+};
+
+}  // namespace clines
+
+#endif  // CLINES_MCTS_H_
