@@ -3906,3 +3906,35 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      vh1 / m02 / m04 -> CI halves to ~±240/±280 -> resolves the promotion.
      Promotion bar: paired mean AND P50 CIs > 0 with no confirmed floor
      loss (<1000 CI must not be clearly positive).
+
+192. **small128_vh2 PROMOTED — the advantage-filtered channel wins at 20k
+     paired seeds. First loop turn since vh1, and the first promotion under
+     the rigorous instrument.** (2026-07-30)
+
+     **small128_vh2 = alphatrain/data/small128_vh2.pt** (TS export
+     vh2_policy_ts.pt) = theta_vh1 + 0.2 * (theta_ft - theta_vh1), where the
+     fine-tune is train_crisis_ft on alphatrain/data/advfilt.pt: the 676
+     judged-genuine rows (per-row uplift >= 0.08 over 64 paired reps; mean
+     0.145) of vh2c_crisis's 15,655 full-legal disagreements, advantage-
+     weighted soft-CE T=0.5, frozen BN, lambda=3 quiet-anchor, 15 epochs.
+
+     **20k-seed paired verdict (775000-794999, paired_bootstrap):**
+       m02 vs vh1: mean +527 [+280,+774] WIN (+4.1%); P50 +322 [+46,+573]
+       WIN (+3.6%); P5/P10/<1000 all neutral (no floor loss).
+       m04: mean WIN but P50 CI crosses zero, floor leans worse — NOT promoted
+       (the 5k point estimates had ranked m04 first: noise, again).
+     **New bar (20k): mean 13,334 / P50 9,364 / P5 1,150 / P10 1,853 /
+     <1000 3.9%.** (vh1 @20k: 12,807 / 9,042 / 1,130 / 1,787 / 4.0% — note
+     the old 5k seed-set read vh1 ~2% friendly.)
+
+     **What the win validates end-to-end:** row-level judging (the corpus was
+     96% ties — training ONLY the verified 4% flipped nine rounds of
+     regression into a win), advantage weighting, alpha-metered task-vector
+     integration with a quiet anchor, and 20k paired bootstrap as the
+     promotion instrument. The channel's economics: 676 rows bought +4%;
+     judging is the bottleneck (~3.5h per 15k rows, C++).
+
+     **NEXT (the alternation, round 2 of this channel):** generate fresh vh2
+     games -> retrain the survival head on vh2's backbone -> mine + judge
+     MORE candidate rows (30-50k) -> advantage-filter -> fine-tune + merge ->
+     20k paired bar vs vh2. All machinery exists; no new methods needed.
