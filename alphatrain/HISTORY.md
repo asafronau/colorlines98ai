@@ -3992,3 +3992,25 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      round-2 vector at alpha={0.02,0.05} on vh2 -> 20k paired (the direct
      dose test). Also on the table if confirmed: dose-response mapping of
      theta_vh1 + beta*(D1+D2).
+
+195. **Dose hypothesis FALSIFIED — the round-2 vector helps at NO dose.
+     Loop halted at vh2; rounds 1+2 receipts to peer review.** (2026-08-01)
+
+     20k paired vs vh2, round-2 vector at all doses:
+       a=0.02: mean -254 [-501,-9] LOSS;  a=0.05: -26 [-277,+227];
+       a=0.1: -231;  a=0.2: -226;  a=0.4: -195.
+     Same recipe, same judged row quality (uplift 0.142 vs 0.145), 1.7x the
+     rows — but THIS vector's direction is unhelpful at every strength,
+     where round-1's identical construction bought +527 [+280,+774].
+
+     Open explanations (for review, not asserted): round-1's effect partly
+     fortunate (high side of a smaller true effect + favorable vector draw);
+     an unidentified asymmetry (fine-tune base vh1-vs-vh2, anchor set,
+     corpus band mix); or the channel fundamentally yields one-shot gains
+     whose repeatability is below instrument resolution. The field-tilt
+     probe (194) stands: vh2's gain was sub-argmax, its fuel unabsorbed
+     and still judged +6.4pp — knowledge the training methods cannot yet
+     cash twice.
+
+     STATE: small128_vh2 = best (20k: 13,334 / 9,364 / <1000 3.9%).
+     Compute HALTED. Brief: docs/small128_round2_for_review.md.
