@@ -3938,3 +3938,36 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      games -> retrain the survival head on vh2's backbone -> mine + judge
      MORE candidate rows (30-50k) -> advantage-filter -> fine-tune + merge ->
      20k paired bar vs vh2. All machinery exists; no new methods needed.
+
+193. **Round 2 of the advantage-filtered channel: NO-GO at 20k — the recipe
+     did not compound against the improved base. vh2 remains best.**
+     (2026-08-01)
+
+     Pipeline (all base=vh2, resume after session kill): 20k fresh games ->
+     value_head_vh2_5x (inner-val 0.2979) -> 599 replays @1200/800 ->
+     181,074 states -> 26,179 full-legal disagreements -> row-judged (vh2
+     continuation): mean +0.4pp, GENUINE 1,137 (4%) / phantom 583 (2%) —
+     same profile as round 1, 1.7x the genuine count (well refilled).
+     advfilt2: 1,137 rows, mean uplift 0.142 (~= round 1's 0.145).
+     Fine-tune identical to the winner (soft T0.5, adv-weighted, frozen BN,
+     lambda=3 anchor on vh2's own quiet states); merges alpha={0.1,0.2,0.4}.
+
+     **20k paired vs vh2 (pair20k_m02 reference): ALL NEGATIVE-LEANING.**
+       m01: mean -231 [-476,+16]; <1000 +0.4pp [+0.0,+0.7] = floor LOSS
+       m02: mean -226 [-479,+22]; P50 -128 [-375,+166]
+       m04: mean -195 [-444,+54]; P50 -11 [-265,+289]
+     Nothing near the bar (mean AND P50 CIs > 0).
+
+     **Reading (recorded, not asserted):** the channel's round-1 yield
+     (+527 mean) did not repeat with MORE verified rows of equal judged
+     quality against the improved base. Candidate explanations for review:
+     (a) vh2's merge vector already occupies the correction direction —
+     new vectors interfere; (b) per-round true yield is small (~+0-300)
+     and both rounds' outcomes are within the joint noise of judge
+     selection + 20k resolution; (c) genuine-row value doesn't transfer
+     once the base has moved. The loop now operates at the edge of
+     measurability: ~1 day/round vs ±240 instrument resolution.
+
+     STATE: small128_vh2 (20k: 13,334 / 9,364 / <1000 3.9%) = deployed
+     best. Round-2 assets kept (26k judged rows, head, games). PAUSED for
+     stocktake with the user.
