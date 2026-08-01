@@ -3971,3 +3971,24 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      STATE: small128_vh2 (20k: 13,334 / 9,364 / <1000 3.9%) = deployed
      best. Round-2 assets kept (26k judged rows, head, games). PAUSED for
      stocktake with the user.
+
+194. **MECHANISM PROBE: vh2 installed ~NONE of its winning corrections — the
+     +4.1% came from a sub-argmax "field tilt," and the fuel is still live.
+     Dose hypothesis for round-2's failure; low-dose merges testing now.**
+     (2026-08-01)
+
+     probe_vh2_absorption.py on the 676 rows that created vh2:
+       ABSORBED (vh2 plays teacher move): 7.2%
+       kept vh1's original move        : 89.1%   third: 3.7%
+     Judge of the 627 still-contested rows UNDER VH2 (64 paired reps):
+       teacher 0.321 vs current 0.385 = **+6.4pp, 36% genuine / 3% phantom**
+       (selection regression from 14.5 avg -> 6.4, but strongly alive).
+
+     **Reframe:** the alpha-merge does NOT install moves; it tilts logits
+     sub-argmax in a rollout-verified direction. Round-1's dose-response
+     already peaked at alpha=0.2 (0.4 was worse). Round-2 merges stacked a
+     heavily-overlapping direction ON TOP of vh2's existing 0.2 -> total
+     dose past the peak -> the observed negative lean (193). RUNNING:
+     round-2 vector at alpha={0.02,0.05} on vh2 -> 20k paired (the direct
+     dose test). Also on the table if confirmed: dose-response mapping of
+     theta_vh1 + beta*(D1+D2).
