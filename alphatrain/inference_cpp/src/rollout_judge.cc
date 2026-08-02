@@ -50,6 +50,7 @@ struct Args {
   int reps = 64;
   int horizon = 300;
   int batch = 512;
+  uint64_t seed_offset = 0;  // fresh-seed rejudging (seeds derive from row idx)
   bool fp32 = false;
 };
 
@@ -67,6 +68,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--out") a.out = argv[++i];
     else if (k == "--reps") a.reps = std::stoi(argv[++i]);
     else if (k == "--horizon") a.horizon = std::stoi(argv[++i]);
+    else if (k == "--seed-offset") a.seed_offset = std::stoull(argv[++i]);
     else if (k == "--batch") a.batch = std::stoi(argv[++i]);
   }
   return a;
@@ -149,7 +151,8 @@ int main(int argc, char** argv) {
       Job j = jobs[next_job++];
       const JudgeState& st = states[j.si];
       // Common seed list across arms: seed depends on (state, rep) only.
-      uint64_t seed = 777000000ULL + (uint64_t)j.si * 1000 + j.rep;
+      uint64_t seed = 777000000ULL + args.seed_offset
+                      + (uint64_t)j.si * 1000 + j.rep;
       clines::Game g(seed);
       g.SetState(st.board, st.nb, 0, 0);
       int mv = j.arm == 0 ? st.teacher_move : st.base_move;
