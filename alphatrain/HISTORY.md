@@ -4064,3 +4064,26 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Decision tree: wins -> channel repeatable, r2's direction was bad;
      loses -> one-shot/integration limit -> ship vh2, close the line.
      (Iter-5 scale ladder A/B/C mining in parallel throughout.)
+
+198. **Final-candidate NO-GO: the r1 vector re-derived at vh2 — with every
+     methodological correction — does not improve vh2. Per the pre-registered
+     decision tree, the MICRO-CHANNEL IS CLOSED; vh2 is its deliverable.**
+     (2026-08-02)
+
+     The cleanest extraction the channel can produce: r1 rows rejudged under
+     vh2 (R=256, fresh seeds: +6.0pp mean, 32% genuine, 1% phantom — the
+     fuel is REAL), corpus of the 199 fresh-verified rows weighted by
+     curse-free estimates against vh2's current moves, 4 fixed-batch
+     replicas averaged (coherence 0.95+), alpha=0.2. 20k paired vs vh2:
+       mean -86 [-332,+166]; P50 -156 [-407,+140];
+       <1000 +0.4pp [+0.0,+0.8] = confirmed FLOOR LOSS.
+
+     Review #6's tree: "rows remain valuable but retraining fails -> the
+     improvement was one-shot or the new base cannot integrate another
+     edit; stop." Both conditions met exactly. vh2 took one edit; a second
+     edit — any corpus, any dose, any extraction — does not integrate.
+
+     THE LINE'S LEDGER: vh1 (+4.6% over ep87) -> vh2 (+4.1% over vh1,
+     20k-paired-verified) -> closed. Remaining open thread: the iter-5
+     scale ladder (A 2.3M / B 4.3M / C 8.6M, literal 256ch recipe),
+     mining now — the user's main directive and the sole active program.
