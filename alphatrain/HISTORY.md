@@ -4014,3 +4014,23 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 
      STATE: small128_vh2 = best (20k: 13,334 / 9,364 / <1000 3.9%).
      Compute HALTED. Brief: docs/small128_round2_for_review.md.
+
+196. **ITERATION-5 LAUNCHED: the literal 256ch recipe at literal scale on the
+     small model (user directive — capacity assumption stands, target =
+     parity with 256ch then beyond).** (2026-08-02)
+
+     Design (matched to the +18% round, HISTORY 173): base vh2; crisis
+     @600 sims (the winning corpus's bulk was @600), 2,600 seeds, recovery
+     15 / prevention 30, pv_vh2_ts (vh5x-class head) at the leaves, q=2.0
+     -> ~1.6M states; selfplay @400 sims, 80 games -> ~0.7M (70/30 mix);
+     train_path_b warm-start, dw=3, T=0.7, PURE soft (no blend, no anchor —
+     the selfplay fraction IS the anchor), lr 3e-4, step-matched (~15.5k
+     optimizer steps ~= 552x28 of the 256ch run), step checkpoints.
+     Kept protections: screens = catastrophe filter only; promotion = 20k
+     paired bootstrap vs vh2 (bar unchanged). ~28h fully local
+     (scripts/run_iter5.sh, resumable; waits for the review-#6 rejudges).
+
+     Known risk on record (review #5): dw=3 routed 4.7-9% of gradient to
+     corrections on our PRIOR corpora — but those were @1200-2400; the @600
+     corpus's top-share profile may differ (the 256ch winner's did). The
+     experiment decides, not the extrapolation.
