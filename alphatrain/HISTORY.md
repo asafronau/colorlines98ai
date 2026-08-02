@@ -4034,3 +4034,33 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      corrections on our PRIOR corpora — but those were @1200-2400; the @600
      corpus's top-share profile may differ (the 256ch winner's did). The
      experiment decides, not the extrapolation.
+
+197. **Review-#6 forensics: winner's curse CONFIRMED (x0.44-0.50 shrinkage)
+     but BOTH corpora equally good fresh; replica extraction COHERENT (cos
+     0.95-0.97) — suspects eliminated; the final-candidate experiment
+     (r1 vector re-derived at vh2) is running.** (2026-08-02)
+
+     Independent rejudges (R=256, --seed-offset NEW, fresh seeds):
+       r1 rows: 0.145 -> 0.063 fresh (x0.44), corr 0.65, 75% positive,
+                phantoms 0.3%
+       r2 rows: 0.142 -> 0.071 fresh (x0.50), corr 0.63, 78% positive,
+                phantoms 0.2%
+     -> Selection curse exactly as predicted (1.5 SE threshold), AND the
+     two corpora are statistically indistinguishable in true row quality
+     (r2 slightly better) — selection noise CANNOT explain r1-won/r2-lost.
+
+     Shuffle-replica coherence (8+8, scripts/replica_coherence.py):
+       r1 corpus: pairwise cos 0.951-0.962, |d| cv 1%
+       r2 corpus: pairwise cos 0.969-0.973
+     -> Extraction is nearly deterministic; the 63-row-tail lottery is
+     REFUTED. Same-quality fuel + deterministic extraction + opposite
+     gameplay outcomes = the difference lives in WHERE the corpus points
+     the vector, not in noise.
+
+     RUNNING (scripts/run_r1_at_vh2.sh, alongside iter-5 mining): the
+     review's discriminator — r1 rows rejudged under vh2 (R=256, fresh
+     seeds), corpus rebuilt with FRESH weights and vh2-current base moves,
+     4 fixed-batch replicas averaged, alpha=0.2, ONE 20k paired vs vh2.
+     Decision tree: wins -> channel repeatable, r2's direction was bad;
+     loses -> one-shot/integration limit -> ship vh2, close the line.
+     (Iter-5 scale ladder A/B/C mining in parallel throughout.)
