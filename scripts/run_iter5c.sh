@@ -30,7 +30,13 @@ python -m alphatrain.scripts.build_expert_v2_tensor \
     --games-dir data/crisis_iter5 data/selfplay_iter5 data/selfplay_iter5b \
     --policy-only-data --output alphatrain/data/iter5c.pt 2>&1 | tail -2
 
-echo "=== phase 4: train (same recipe, step-matched: 2 epochs) ==="
+echo "=== phase 4: gzip for Colab (training moved off-box per user) ==="
+gzip -9 -c alphatrain/data/iter5c.pt > alphatrain/data/iter5c.pt.gz
+ls -la alphatrain/data/iter5c.pt alphatrain/data/iter5c.pt.gz
+echo "ITER5C PIPELINE DONE"
+exit 0
+
+echo "=== (disabled) local train ==="
 PYTHONPATH=. python -m alphatrain.train_path_b \
     --tensor-file alphatrain/data/iter5c.pt \
     --resume alphatrain/data/small128_vh2.pt --warm-start \
