@@ -4111,3 +4111,39 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      dw=0, lr 1e-4, 3 epochs — train_iter5a2_colab.ipynb, same Drive data.
      Also requested: iter5a step checkpoints (e1_s500/1000/2000, epoch_1)
      for the destruction-onset ladder screen.
+
+200. **ERRATUM for 196/199 + review #7 verdict: "good teacher, wrong corpus
+     weighting and loss." Faithful-corpus arms built.** (2026-08-05)
+
+     ChatGPT review (docs/small128_iter5_for_review.md) caught MY errors:
+     (1) iter5.pt was NOT 70/30 — it is 23.5% crisis / 76.5% selfplay
+     (1,453,708 + 4,721,555; the 80 UNCAPPED selfplay games ballooned;
+     "70/30 by construction" in run_iter5.sh was written unverified);
+     (2) "step-matched" conflated total steps with examples/update, warmup
+     length and LR trajectory (bs8192x3ep vs the winner's bs32768x28ep);
+     (3) "monotone collapse from step one" overclaimed (early ckpts uneval;
+     ep3/ep8 from DIFFERENT runs — user's ep8 came from an epochs=12 run);
+     (4) my "95% of gradient" was a row-weight proxy (its diagnostic: dis
+     rows ~5.4% row-weight but 7.8% of weighted logit-grad norm);
+     (5) the table supports RECIPE-wrong (dw3 anti-selects corrections;
+     a2's effective top-1 target 0.656 vs iter5a's 0.360 explains a2's
+     stability), not corpus-inert; (6) a2 1k eval cannot distinguish
+     gain/parity/loss; (7) B/C composition confounds the scale axis.
+
+     Verified myself: tensor boundary 1,453,708/4,721,555 exact (selfplay
+     matches to the digit; crisis dir has since grown from B's mining).
+
+     BUILT per its prescription: iter5_bal.pt = ALL 1,453,708 crisis +
+     623,018 sampled selfplay = 2,076,726 @ TRUE 70/30, + full-legal vh2
+     disagree_mask (230,370 rows, 11.1%). train_path_b --freeze-bn added
+     (eager-module frozen-BN main forward; guarded against --compile).
+     Tarball v5 (26,277,598 B). Two arms:
+       iter5a3 EXACT CONTROL: bs32768, lr3e-4, 28ep, dw3/T0.7/pure-soft
+               — the actual 256ch recipe, finally literal.
+       iter5a4 EXTRACTION: bs8192, lr1e-4, 3ep, dw0/T1/blend.5,
+               --disagree-gamma 3 (~33% of mass on the 11.1% disagreement
+               rows; stratification proxy), --freeze-bn, no compile.
+     User reframe accepted: all big-model wins were WARM-START (my
+     from-scratch/warm-start dichotomy in #7 was wrong for the 256ch line
+     — its warm starts had 22% teachable rows; the constraint is corpus
+     geometry, not warm-starting per se).

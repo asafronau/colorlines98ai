@@ -148,7 +148,7 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                  log_interval=100, blend_alpha=1.0, target_temperature=1.0,
                  aux=None, epoch=0, grad_audit=0, decisiveness_power=0.0,
                  disagree_gamma=0.0, save_every_steps=0, save_hook=None,
-                 anchor=None):
+                 anchor=None, freeze_bn=False):
     """One epoch. Optionally adds the listwise margin aux loss.
 
     `aux`, when not None, is a dict with:
@@ -182,7 +182,13 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
         pol_tgt = pol_tgt.to(device, non_blocking=True)
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            out = model(obs)
+            if freeze_bn:
+                # --freeze-bn: main forward through the eager module with the
+                # base's running stats (extraction-arm protocol, review #7).
+                with frozen_bn(base_model):
+                    out = base_model(obs)
+            else:
+                out = model(obs)
             logits = out[0] if isinstance(out, tuple) else out
             main_loss = distillation_loss(
                 logits, pol_tgt,
@@ -470,6 +476,11 @@ def main():
                    help='Also save mid-epoch checkpoints every N optimizer '
                         'steps (e{epoch}_s{step}.pt). The absorption optimum '
                         'lives at a ~constant STEP count, not epoch count.')
+    p.add_argument('--freeze-bn', action='store_true',
+                   help='BN uses (and never updates) the resumed base\'s '
+                        'running stats for the MAIN forward too. Requires '
+                        'no --compile (BN-mode toggling under compile is '
+                        'unreliable — see the aux-path comment).')
     p.add_argument('--kl-anchor-weight', type=float, default=0.0,
                    help='lambda for the CE-to-resumed-base anchor on '
                         'independent quiet states (preservation without '
@@ -675,6 +686,9 @@ def main():
     # Resume / warm start (load BEFORE compile to avoid prefix issues)
     start_epoch = 0
     best_val = float('inf')
+    if args.freeze_bn and args.compile:
+        raise SystemExit('--freeze-bn requires running WITHOUT --compile '
+                         '(BN-mode toggling under torch.compile is unreliable)')
     if args.resume and not os.path.exists(args.resume):
         raise FileNotFoundError(f"--resume not found: {args.resume}")
     ckpt = None
@@ -1022,7 +1036,7 @@ def main():
                                   save_hook=_step_hook,
                                   aux=aux, epoch=epoch, grad_audit=args.grad_audit,
                                   decisiveness_power=args.decisiveness_power,
-                                  anchor=anchor_data)
+                                  anchor=anchor_data, freeze_bn=args.freeze_bn)
         vl = validate(model, val_loader, device, amp_dtype=amp_dtype)
         scheduler.step()
 
