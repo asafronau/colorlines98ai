@@ -4087,3 +4087,27 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      20k-paired-verified) -> closed. Remaining open thread: the iter-5
      scale ladder (A 2.3M / B 4.3M / C 8.6M, literal 256ch recipe),
      mining now — the user's main directive and the sole active program.
+
+199. **Scale A verdict: the literal 256ch recipe DEGRADES the small model
+     monotonically from the start — epoch 3 (step-matched) already -32%,
+     epoch 8 catastrophic. Scale axis (B/C) proceeds; recipe axis opens.**
+     (2026-08-05)
+
+     iter5a (Colab A100, user ran 12 epochs): corpus 6,175,263 states
+     (5,866,500 train @ aug 8 = 46.9M samples/ep, 5,730 steps/ep).
+     Train loss 1.68 -> 1.63 (barely moves); val FLAT 2.267 -> 2.257 while
+     gameplay COLLAPSES — the corpus targets are largely already-fit;
+     what IS learned (dw-emphasized/sharpened tails) hurts play:
+       ep3  (~17k steps, the matched budget): 5k mean 9,092 / P50 6,438
+             / <1000 6.3%   (vh2: 13,318 / 9,475 / 3.8%)  = -32% mean
+       ep8: 5k mean 3,579 / P50 2,561 / <1000 17.6%        = -73% mean
+     Same monotone-destruction signature as iter-3/pilot, now at 6.2M
+     states — scale alone (at this recipe) did not bend the curve at A.
+
+     USER PLAN: complete B (9M) and C (15M) at the SAME recipe to measure
+     the scale axis cleanly even if negative; open a RECIPE axis on A's
+     corpus in parallel. Arm a2 = the small line's own winning recipe at
+     6M scale (UNTESTED: gate-3 was 394k): blend 0.5 hard-CE, T=1.0,
+     dw=0, lr 1e-4, 3 epochs — train_iter5a2_colab.ipynb, same Drive data.
+     Also requested: iter5a step checkpoints (e1_s500/1000/2000, epoch_1)
+     for the destruction-onset ladder screen.
