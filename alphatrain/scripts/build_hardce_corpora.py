@@ -27,11 +27,16 @@ TEMP_MOVES = 30
 ROW_B = {'board': None}  # placeholder
 
 
-def rows_of_game(d, kind):
+def rows_of_game(d, kind, mode='strata'):
     mv = d['moves']
     if kind == 'crisis':
         if d.get('capped', False):
-            keep = range(0, min(128, len(mv)))
+            # 'all': the WHOLE successful replay — escape + the healthy
+            # continuation ("crisis is escaping + selfplay from a new
+            # position", owner 2026-08-06). 'strata': first 128 only.
+            keep = range(0, len(mv) if mode == 'all' else min(128, len(mv)))
+        elif mode == 'all':
+            keep = range(0, max(0, len(mv) - 20))  # drop terminal tail only
         else:
             keep = range(0, max(0, min(96, len(mv) - 20)))
     elif kind == 'uncapped':
@@ -91,13 +96,17 @@ def pack(rows_meta):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--mode', choices=['strata', 'all'], default='strata')
+    args = ap.parse_args()
     rng = np.random.default_rng(0)
     crisis, broad = [], []
     for d in CRISIS_DIRS:
         for fp in sorted(glob.glob(f'{d}/game_seed*.json')):
             g = json.load(open(fp))
             st = ('c_succ_' if g.get('capped') else 'c_fail_') + g.get('label', '?')
-            crisis += [(m, st) for m in rows_of_game(g, 'crisis')]
+            crisis += [(m, st) for m in rows_of_game(g, 'crisis', args.mode)]
     for fp in sorted(glob.glob(f'{BROAD_UNCAPPED}/game_seed*.json')):
         g = json.load(open(fp))
         broad += [(m, 'b_uncap') for m in rows_of_game(g, 'uncapped')]
@@ -105,6 +114,17 @@ def main():
         g = json.load(open(fp))
         broad += [(m, 'b_cap') for m in rows_of_game(g, 'capped')]
     print(f'pools: crisis={len(crisis):,}  broad={len(broad):,}')
+
+    if args.mode == 'all':
+        rows = crisis + broad
+        rng.shuffle(rows)
+        out = pack(rows)
+        torch.save(out, 'alphatrain/data/h_all.pt')
+        from collections import Counter
+        cnt = Counter(out['strata'].tolist())
+        print(f'h_all.pt: {len(rows):,} rows '
+              f'({100*len(crisis)/len(rows):.0f}% crisis-replay) | {dict(cnt)}')
+        return
 
     for name, cfrac in (('h70', 0.70), ('h44', 0.44)):
         n_c = len(crisis)
