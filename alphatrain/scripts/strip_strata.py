@@ -3,10 +3,12 @@ the trainer's weights_only=True load works. Verifies the safe load after.
 
     python -m alphatrain.scripts.strip_strata
 """
+import sys
+
 import numpy as np
 import torch
 
-for name in ('h_all', 'h70', 'h44'):
+for name in (sys.argv[1:] or ('h_all', 'h70', 'h44')):
     p = f'alphatrain/data/{name}.pt'
     d = torch.load(p, map_location='cpu', weights_only=False)
     if 'strata' in d:

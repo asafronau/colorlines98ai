@@ -41,9 +41,10 @@ def rows_of_game(d, kind, mode='strata'):
             keep = range(0, max(0, min(96, len(mv) - 20)))
     elif kind == 'uncapped':
         idx = np.arange(TEMP_MOVES, len(mv))
-        if len(idx) > 10000:
+        cap = int(os.environ.get('SELFPLAY_CAP', '10000'))
+        if len(idx) > cap:
             idx = np.sort(np.random.default_rng(d['seed']).choice(
-                idx, 10000, replace=False))
+                idx, cap, replace=False))
         keep = idx
     else:  # capped broad
         keep = range(TEMP_MOVES, len(mv))
