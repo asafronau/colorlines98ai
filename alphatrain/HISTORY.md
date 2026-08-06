@@ -4255,3 +4255,23 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      amplification dial (44.8% of rows; augmentation-invariant).
      Arms (hall3 geometry, 12ep): hall4g0 = uniform (pure 2x-data test);
      hall4g2 = crisis x3 (amplification test). One upload (605,588,900 B).
+
+206. **hall4 finals + the CROSS-EXPERIMENT verdict: x3k (the 256ch winning
+     corpus, native recipe) collapses vh2 to ~8.5k — failure follows the
+     soft-target family + student, not corpus origin. And the hard-CE
+     ceiling MOVES with data: 20k gap −1,493 (5.3M) → −424 (10.7M).**
+     (2026-08-06)
+
+     hall4g0 (10.7M, 12ep): 1k ladder 11.3→13.4(ep12, mirage #7 — 20k says
+     12,910); 20k paired: ep12 −424 [−674,−181], ep5 −1,070. hall4g2
+     (crisis ×3): flat 11.0-12.0 — amplification closed. x3k: ep1-12 flat
+     ~8.1-9.1 — the historically-winning corpus destroys THIS student under
+     soft targets exactly like ours did.
+
+     LIVE AXES: (1) brute demonstration-scaling (mint more uncapped search
+     selfplay; naive extrapolation crosses vh2 at ~2× more rows; unlimited
+     locally); (2) owner's master-teacher proposal (search-on-256ch
+     demonstrations — denser signal/row, ~1M-turn games; needs a pillar3k-
+     backbone survival head ~1h). Dossier v2 FINALIZED for dual review
+     (docs/small128_recipe_dossier_v2.md) with updated theory questions +
+     pre-registered closure criteria ask. vh2 remains best.
