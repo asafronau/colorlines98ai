@@ -4183,3 +4183,23 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Implication: any viable full-corpus recipe must handle BN running
      stats explicitly AND fix the loss direction — protecting BN alone
      would not have saved a3.
+
+203. **a2 demoted (5k ladder: -9..-12% at every epoch — the 1k "parity" was
+     noise); a5 pins composition toxicity; THE SELFPLAY DISCOVERY: the
+     search teacher's uncapped games score median 99,144 / max 486,992
+     (~10x greedy vh2, 2-10x the frozen master). Recipe dossier out for
+     dual review (ChatGPT + Gemini).** (2026-08-06)
+
+     a2 5k: ep1 11,663/8,302, ep2 11,620/8,263, ep3 12,157/8,707.
+     a5 (same recipe, 70% crisis): screens 10,591 -> 8,950 monotone.
+     Matrix complete: every visit-target recipe negative; damage scales
+     with crisis fraction; BN stats a first-class channel (202); targets
+     carry zero Q/prior (slim format) = deliberation-vs-decision
+     unresolvable in-corpus.
+
+     LEAD PROPOSAL (owner's): imitate DECISIONS not deliberation — hard
+     one-hot CE on the PLAYED moves, selfplay-only corpus (4.7M states of
+     median-99k demonstrations; blend_alpha=0), warm-start and/or the
+     proven from-scratch hardce recipe; mask temperature moves.
+     docs/small128_recipe_dossier.md (self-contained, for two reviewers).
+     NO training until reviews land.
