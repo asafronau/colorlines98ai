@@ -4229,3 +4229,29 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      h44.pt = 2,106,179 @44%. Arms: warm-start vh2, blend 0.0, dw0, T1,
      lr1e-4, bs8192, NORMAL BN, save-every-100. H70 = one-variable label
      test vs a3/a5; H44 = historically credible composition.
+
+205. **The hall arc: hard-CE imitation is the first full-corpus recipe that
+     CLIMBS — but converges to a mimicry ceiling ~1.3k below vh2 (path- and
+     optimizer-independent). h_big built: ALL data, 10.69M rows, crisis-
+     amplification mask. hall4 gamma arms out.** (2026-08-06)
+
+     hall (bs8192/lr1e-4, 8+10ep spliced): 1k screens 10,690 -> 12,454
+     rising; ep7 at 20k paired = mean -1,493 / P50 -1,111 vs vh2 (LOSS —
+     the 1k flattered by ~600; screen-optimism instance #6). hall2: plateau
+     11.4-12.6 band. hall3 (bs32768/lr3e-4, 20ep, clean cosine): FLAT from
+     ep1 (~11.1-11.9) — arrived instantly at the same optimum hall crawled
+     to. READING: pure imitation of this teacher at 3M params has a fixed
+     point ~11.8-12k true — BELOW vh2 (13.3), which = mimicry ceiling +
+     verified-edit stack. Echo of ep87 (mimicry of the 43k master also
+     capped ~13k). Val loss under blend-0 is structurally anti-correlated
+     (soft-CE vs a sharpening policy) — ignored by design.
+
+     USER PRINCIPLE (standing): use ALL data, AMPLIFY the useful, discard
+     nothing; test and measure. h_big.pt = 10,687,089 rows: every replay
+     (full continuations) + every selfplay game UNCAPPED (the 10k/game cap
+     was reviewer heuristic, dropped on challenge — it had discarded 4M
+     rows); only label-quality trims (temperature moves, terminal death
+     rows of failed replays). disagree_mask repurposed as CRISIS-provenance
+     amplification dial (44.8% of rows; augmentation-invariant).
+     Arms (hall3 geometry, 12ep): hall4g0 = uniform (pure 2x-data test);
+     hall4g2 = crisis x3 (amplification test). One upload (605,588,900 B).
