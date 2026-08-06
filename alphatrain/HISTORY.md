@@ -4203,3 +4203,29 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      proven from-scratch hardce recipe; mask temperature moves.
      docs/small128_recipe_dossier.md (self-contained, for two reviewers).
      NO training until reviews land.
+
+204. **Dual review (ChatGPT + Gemini) CONVERGES: crisis states are mandatory;
+     the poison was soft visit targets + BN exposure. Stage-1 arms built:
+     H70/H44 pure hard-CE with full sampling hygiene.** (2026-08-06)
+
+     Shared verdict: (a) played-move hard CE (blend_alpha=0) replaces soft
+     visit distributions — "in danger boards, deliberation is noise"; visit
+     mass on delaying death-traps flips greedy argmaxes (Gemini's mechanism);
+     (b) BN must not learn a crisis-heavy world: ChatGPT = train normal BN
+     then post-hoc recalibration grid on deployment-like states; Gemini =
+     split-batch training (crisis pass under eval-mode BN) — staged as
+     take-5 if H-arms show promise; (c) sampling hygiene: per-replay caps
+     (successful: first 128; failed: first len-20 capped at 96 — keep hard
+     prefixes, drop terminal tails), stratify prevention/recovery ×
+     success/failure, 10k-row cap per uncapped selfplay game, mask first 30
+     temperature moves, split train/val by death game; (d) Q-recording
+     canary before any big re-mine; (e) evaluation: add tail metrics +
+     held-out crisis action accuracy; a neutral-mean/better-tail candidate
+     is a WIN here.
+
+     BUILT (build_hardce_corpora.py): pools crisis=926,719 (830k successful-
+     escape rows, 97k failure prefixes) broad=1,911,185 (10k/game capped
+     uncapped + 1k-capped games). h70.pt = 1,323,884 rows @70% crisis;
+     h44.pt = 2,106,179 @44%. Arms: warm-start vh2, blend 0.0, dw0, T1,
+     lr1e-4, bs8192, NORMAL BN, save-every-100. H70 = one-variable label
+     test vs a3/a5; H44 = historically credible composition.
