@@ -1,0 +1,32 @@
+# Recipe dossier v2: the imitation ceiling — theory wanted, experiments queued
+
+Self-contained brief for independent review (assume no prior context). Hobby research project, limited but real compute (one A100 via Colab sessions + a local M5 Max with a fast custom C++ eval/search engine, ~18-35k NN evals/s). The owner's stance: *"We need a simple recipe and I'm certain we can find it. Amazing 400k-point games, crisis recovery — there should be a good and simple recipe. We also need to be theoretically convinced this is the right approach. We can extract insights from data (we have a TON of it). We won't arrive at the best solution by thinking only — we need experiments."* Please think deeply, theoretically AND experimentally.
+
+## Setup (compressed)
+
+Color Lines 98 (9×9, 7 colors, 3 spawns/turn, clear lines of 5+; score ≈ 2.03 × turns survived). **Student:** small128_vh2 — 10-block × 128-ch ResNet, 3.0M params; greedy play at 20k held-out seeds: **mean 13,334 / median 9,364**. **Teacher:** MCTS (400-600 sims, PUCT, top-k 30) over the student's own policy + a 4-horizon survival value head on the student's frozen backbone (q=2.0). **Teacher strength: uncapped self-play games score median 99,144, max 486,992 — ~10× the greedy student.** A frozen 256-ch sibling ("master," greedy mean 43,390) exists as a reference/label source but must not be retrained. Eval instruments and their measured 95% resolutions: 1k seeds ±~1,100 (mean), 5k ±480, 20k ±240. Score is effectively "turns survived"; crisis escape (recovering from unlucky spawn clusters) is the load-bearing skill.
+
+## Where we are: hard-CE imitation is the only recipe that doesn't destroy — and it has a ceiling
+
+Corpus family: search self-play games (states + visit counts + played move) and "crisis replays" (search re-plays the student's dying games from 15-30 turns pre-death @600 sims; ~60% escape and survive a further 500-turn cap; full continuations recorded). All targets are argmax==played-move; training = pure hard CE (blend 0), warm-start from vh2 unless stated.
+
+| run | corpus | recipe | outcome (1k screens unless noted) |
+|---|---|---|---|
+| soft-target era (5 arms) | 2-9M states, various | soft visit-CE ± dw/T/γ/BN variants | ALL regress −9% to −73%; damage ∝ crisis fraction & concentration |
+| hall | 5.3M all-data | hard-CE, bs8192, lr1e-4, 8+10ep | climbs 10,690→12,454; at 20k paired: **−1,493 mean vs vh2** (LOSS) |
+| hall3 | same | hard-CE, bs32768, lr3e-4, 20ep clean cosine | FLAT ~11.1-11.9 from epoch 1 — converges instantly to the same optimum |
+| hall4-γ0 | **10.7M — everything, uncapped** | same fast geometry | ep1 11,324 → ep3 12,038 (≈ hall3 ceiling; 2× data moved nothing) |
+| hall4-γ2 | same + crisis rows ×3 weight | same | ep1 11,054 → ep3 11,462 (amplification ≤ neutral) |
+
+Supporting measurements: the student's argmax already matches the corpus argmax on ~90% of rows; agreement-with-master is unchanged by hall-family training (72.6% vs vh2's 73.0 — policy fabric intact); BN running stats were a first-class damage channel in the soft era (component-swap experiments); the student's OWN earlier pure-mimicry run against the 43k master also capped ≈13k (from scratch, 100 epochs, monotone). vh2 itself = that mimicry ceiling + a stack of individually-rollout-verified corrections (+4.1% at 20k paired) which subsequently refused all further stacking (extensively measured).
+
+**The pattern asking for theory: pure imitation of a 10×-stronger search player, at 3M params, converges — fast, path-independently, data-insensitively (5.3M→10.7M), weighting-insensitively (γ0≈γ2) — to ~11.8-12k true, BELOW the 13.3k student it warm-started from.**
+
+## Questions
+
+1. **Theory first**: give us your best mechanistic account of this ceiling. Candidates we see — (a) state-distribution mismatch (teacher trajectories live where greedy play never goes; imitation there doesn't transfer); (b) capacity (3M cannot represent the search player's decision function; note the SAME cap ≈12-13k appeared when imitating the 43k master); (c) the played-move signal in ~90%-agreement data is information-thin (0.1 bit/row?), so the optimum barely differs from the prior policy minus transition damage; (d) something about warm-start basins. Which is it, what measurement on OUR data (we can compute anything locally: per-state visit entropy, Q if re-mined, state-density comparisons, agreement-by-game-phase, ...) would discriminate, and what does your account predict for the experiments below?
+2. **The owner's cross-experiment (queued, notebook ready)**: train vh2 on `v14_rev3` — the EXACT corpus+recipe that lifted the 256-ch master's line +18% (2.26M states, dw3/T0.7 soft targets, from a different lineage's play). Prediction under each theory in Q1? (Under (a)/(c) it should also fail on vh2; under corpus-side accounts it might work. We consider this the sharpest available discriminator — critique or improve it.)
+3. **Simple param tweaks first** (owner's preference): is there any single-knob change to the hall recipe you'd rank above the cross-experiment — e.g., much longer horizon at tiny LR, label smoothing, top-2 targets, entropy bonus, EMA of weights? Rank by expected information per A100-hour.
+4. **Data-insight mining**: we have ~11M labeled search states, 20k+ full games, per-row provenance, and a fast engine for arbitrary rollouts/judging. Propose 2-3 concrete analyses (cheap, local) that would tell us the most about WHY the ceiling sits where it does — e.g., "measure imitation-loss-vs-gameplay by game-phase bucket," "measure the fraction of played moves that are value-critical vs interchangeable via paired rollouts on a sample," etc. We will run them.
+5. **The Q question**: our slim data records visits but not root Q/priors (a re-mine with `--full-record` costs ~a day). Under your Q1 theory, does Q-aware training (advantage weighting, Q-argmax targets, "only imitate where it mattered") plausibly break the ceiling, or is it another weighting scheme destined for the same fixed point?
+6. **Or is the ceiling real and the conclusion different**: if imitation fundamentally can't exceed ~12-13k at 3M params, the search-augmented system (student+search = 99k median) is the actual achievement, and the research question becomes deployment-shaped (amortize search differently, e.g., multi-move/plan distillation, value-head deployment, tiny search at inference). Say so plainly if that's your read — with the theory that convinces us.
