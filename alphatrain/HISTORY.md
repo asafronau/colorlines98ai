@@ -4147,3 +4147,22 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      from-scratch/warm-start dichotomy in #7 was wrong for the 256ch line
      — its warm starts had 22% teachable rows; the constraint is corpus
      geometry, not warm-starting per se).
+
+201. **Faithful-corpus arms: a3 (the ACTUAL literal 256ch recipe) collapses
+     from inside the warmup epoch (ep1 8,592 -> ep10 6,606); a4 (extraction:
+     gamma3+freeze-BN+70/30) flat at -28%. a2's mild imitation remains the
+     only non-destructive point. Brief #8 out.** (2026-08-05)
+
+     Screens (vh2 ref ~13,700): a4 ep1-3: 9,653/9,231/9,661. a3 ep1/2/3/5/
+     7/10: 8,592/6,859/7,732/6,757/6,897/6,606 — ep1 is 508 steps at WARMUP
+     LR (~3e-5) and already -35%. Composition was NOT the fix: the literal
+     recipe is WORSE on true 70/30 than on 23.5/76.5 (selfplay was DILUTING
+     the destructive dw3/T0.7-on-crisis interaction). Cross-campaign law
+     sharpened: gradient CONCENTRATION of any kind damages this model
+     roughly in proportion; only mild uniform argmax-anchored self-imitation
+     (a2) is stable, and it extracts ~nothing. vh2 = a local optimum whose
+     measured neighborhood is downhill in every tried direction.
+     docs/small128_iter5_arms_for_review.md (Q: a2->a4 single-variable
+     decomposition; any full-corpus recipe left; next teacher change; or
+     terminus = ship vh2 + close with B/C dose-response under a2).
+     Scale-B corpus BANKED (iter5b.pt.gz, 576,807,301 B); C mining.
