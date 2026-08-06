@@ -4166,3 +4166,20 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      decomposition; any full-corpus recipe left; next teacher change; or
      terminus = ship vh2 + close with B/C dose-response under a2).
      Scale-B corpus BANKED (iter5b.pt.gz, 576,807,301 B); C mining.
+
+202. **BN-swap hybrids: BOTH components of a3's first epoch are severely
+     damaging ALONE, and the intact checkpoint is better than either —
+     weights and BN stats moved far off-manifold in entangled, partially
+     compensating ways. Running statistics are a first-class damage
+     channel.** (2026-08-05)
+
+     Screens (vh2 ref ~13,700; intact a3_ep1 = 8,592):
+       a3 weights + vh2 BN buffers: mean 4,160  (<1000 12.8%)
+       vh2 weights + a3 BN buffers: mean 6,475  (<1000 8.8%)
+     One warmup-LR epoch moved BN buffers enough to cost ~-53% BY
+     THEMSELVES (8.37% buffer displacement, per review #8's measurement),
+     while the weight update alone costs ~-70%; their entanglement partly
+     cancels. Confirms review #8's CPU-probe prediction at gameplay level.
+     Implication: any viable full-corpus recipe must handle BN running
+     stats explicitly AND fix the loss direction — protecting BN alone
+     would not have saved a3.
