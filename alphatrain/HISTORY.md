@@ -4275,3 +4275,34 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      backbone survival head ~1h). Dossier v2 FINALIZED for dual review
      (docs/small128_recipe_dossier_v2.md) with updated theory questions +
      pre-registered closure criteria ask. vh2 remains best.
+
+207. **Dual review of dossier v2 — verdicts + queue.** (2026-08-06)
+
+     ChatGPT's fresh measurements: (a) hall4 hard-target agreement FLAT
+     across ep5->ep12 (83.7% both; vh2 86.5%) while gameplay rose +646 —
+     the late gain lives BELOW the argmax (margins/BN/consolidation; the
+     field-tilt mechanism again); (b) vh2-vs-v14_rev3 target agreement only
+     65.0% (pillar3f's was 79.0%) — x3k confounded soft targets with denser
+     contradiction; defensible claim = "soft visit CE robustly destructive
+     for vh2 across two lineages"; (c) paired seeds: score correlation
+     -0.001/-0.002 — pairing adds NOTHING post-butterfly (drop the "paired"
+     language; independent bootstrap equivalent); (d) hall-vs-hall4 is NOT
+     a clean 2x-data point (composition 64->44.8% crisis, caps, geometry);
+     gamma2 = 71% weighted-loss on crisis and LOSES -> composition shift is
+     part of hall4's gain; (e) hall4 floor STILL worse than vh2 (<1000
+     +0.4pp) — naive selfplay minting would dilute crisis further.
+     Gemini: brute-scale #1 (predicts parity ~20-25M rows, log curve), EMA
+     cheap, master-teacher high-risk/high-reward #2, Q = the ceiling-
+     breaker if scaling walls.
+
+     ADOPTED QUEUE: (1) zero-training battery (interpolations alpha
+     .1/.25/.5 of hall4ep12 into vh2, ep10-12 average; BN recal pending)
+     — RUNNING; (2) tiny-LR continuation (3-5ep @ 3e-6 from ep12);
+     (3) CONTROLLED half-vs-full corpus pair (matched composition/schedule)
+     for a real scaling exponent; (4) controlled scaling arm: fresh
+     independent game bank WITH fixed crisis quotas + fresh anchors;
+     (5) bounded master-search pilot (20-40 games + master replaying vh2's
+     crisis anchors; measure before training); (6) Q-canary re-mine
+     (measure stability/Q-gaps first, no blind weighting). Closure only per
+     ChatGPT's 5-condition rule (controlled 20M fail + master pilot fail +
+     no hidden checkpoint via consolidation tricks).

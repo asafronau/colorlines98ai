@@ -12,7 +12,8 @@ import torch
 
 def sd_of(path):
     ck = torch.load(path, map_location='cpu', weights_only=False)
-    return ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
+    sd = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
+    return {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
 
 
 def main():
