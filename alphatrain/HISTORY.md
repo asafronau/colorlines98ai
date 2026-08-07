@@ -4306,3 +4306,30 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      (measure stability/Q-gaps first, no blind weighting). Closure only per
      ChatGPT's 5-condition rule (controlled 20M fail + master pilot fail +
      no hidden checkpoint via consolidation tricks).
+
+208. **small128_vh3 PROMOTED: vh2 + 0.5·(hall4g0_ep12 − vh2), full-state
+     interpolation — the consolidation channel works. 20k: mean +431
+     [+178,+686], P50 +294 [+49,+591], floor neutral. NEW BEST.** (2026-08-07)
+
+     **small128_vh3 = alphatrain/data/small128_vh3.pt** (TS: vh3_policy_ts)
+     = interp_checkpoints --alpha 0.5 of iter5_hall4g0_ckpts_epoch_12 (the
+     12-epoch pure hard-CE run on h_big: 10.69M rows, ALL data uncapped,
+     bs32768/lr3e-4, which by ITSELF was -424 vs vh2) into vh2, ALL params
+     AND BN buffers interpolated. **NEW 20k BAR: mean 13,765 / P50 9,658 /
+     P5 1,140 / P10 1,908 / <1000 3.9%.**
+     Dose curve: alpha=0.1 also passed (+289/+283); 0.5 took the mean.
+     Epoch-average with base-BN self-destructed (801 — BN/weight
+     entanglement, consistent with 202).
+
+     **THE WORKING CRANK (two independent wins now):** (1) mint all-data
+     demonstrations from the student's own search; (2) bulk hard-CE train
+     (the endpoint may LOSE — it is a VECTOR GENERATOR, not a candidate);
+     (3) alpha-interpolate the displacement into the current best;
+     (4) 20k bar. Credit chain: owner's all-data/hard-label instincts +
+     ChatGPT's "test vh2 + alpha(hall4-vh2)" + the field-tilt mechanism
+     (gains live below the argmax; agreement stayed 83.7% flat while this
+     vector was earning +431).
+
+     NEXT (round 2 of the crank): fold C's finishing selfplay into the
+     corpus, bulk-train FROM vh3, interpolate into vh3, re-bar. Optional
+     same-day: finer alpha sweep 0.3-0.75.
