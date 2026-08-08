@@ -4374,3 +4374,24 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      **TEST BANK RESERVED: seeds 1100000-1119999 (never used in any
      training/generation/eval; first use = final confirmation only).**
      ChatGPT predictions: exact design +12%, amended +16% central (9-23%).
+
+211. **H1/H2 discriminator pair queued (owner challenge: prove or retract
+     "the great-epoch regime is over for 128ch").** (2026-08-08)
+     Claim audit: NOTHING measured ties the stall to the 128ch architecture;
+     the 256ch line also stopped producing promotable epochs near ITS
+     frontier (task-arithmetic era). The real 128ch puzzle: stall DESPITE a
+     3x teacher. Hypotheses: H1 capacity / H2 warm-start-basin+params (all
+     recent runs warm-start vh3, <=12ep, one LR) / H3 corpus composition
+     (76% old-era rows; measured today: era+danger weighting leaves the
+     gradient direction cos 0.976 with unweighted — homeopathic).
+     New notebooks (from-scratch, 40ep, UNWEIGHTED r2_bulk, val meaningful
+     again): train_scratch128_colab.ipynb / train_scratch192_colab.ipynb
+     (192 = owner-proposed DIAGNOSTIC, not a capacity pivot).
+     Readout: both climb past vh3 => H2; 192 climbs, 128 stalls => H1;
+     both stall ~vh1 => H3 (next arm: fresh-teacher-heavy corpus).
+     Also: vector geometry of r2 arms (vector_stats.py) — ep1 is a warmup
+     transient in a NEW direction (cos 0.55 w/ round-1 vector), ep2-4
+     settle INTO the round-1 direction (0.85/0.93/0.955), g0 vs dg ep4
+     cos 0.976. The 12.5M corpus keeps prescribing the medicine vh3
+     already half-dosed. Merge screen (8 candidates, merge_vectors.py)
+     running on dev slice 775000-775999 (vh3 same-slice bar 14,429).
