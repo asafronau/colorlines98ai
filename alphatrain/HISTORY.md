@@ -4333,3 +4333,25 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      NEXT (round 2 of the crank): fold C's finishing selfplay into the
      corpus, bulk-train FROM vh3, interpolate into vh3, re-bar. Optional
      same-day: finer alpha sweep 0.3-0.75.
+
+209. **Round-2 (from vh3) corpora + vector notebooks shipped.** (2026-08-08)
+
+     Fresh generation (loop_vh3, all with the NEW vh3-backbone head per the
+     HISTORY-138 rule): 20k games -> value_head_vh3 -> 5,192 bulk replays
+     @600 (2,596 fresh vh3 deaths) + 598 DEEP replays @1600/2400 + 1,500
+     capped selfplay. Corpora:
+       r2_bulk.pt     = 12,512,995 rows — ALL data ever generated (both
+                        teacher eras, uncapped), hard-CE targets, plus a
+                        CONTINUOUS danger score per row (1-P(survive H100),
+                        vh3 head; median 0.067 / P90 0.471 / P99 0.927)
+                        stored in disagree_mask -> w = 1 + gamma*danger.
+       r2_frontier.pt = 576,576 rows — first-96-move escape windows of all
+                        fresh SUCCESSFUL replays (incl. deep tranche) + 50%
+                        broad anchor.
+     Notebooks (all FROM vh3, bs32768/lr3e-4/blend0/12ep): r2bulk_g0
+     (control), r2bulk_dg (gamma=6 danger amplification — critical MOMENTS,
+     not provenance), r2frontier. Then local merges theta = vh3 + a*Dbulk
+     + b*Dfrontier, dev/test 20k split. Pre-registered: exact-crank ~+2-5%;
+     bulk+frontier central ~+14%; owner's bar +15-20%.
+     (Stale iter5c selfplay generator killed at 81% — its 3,409 banked
+     games retained; only generation of MORE stale-teacher data stopped.)
