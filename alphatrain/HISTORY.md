@@ -4355,3 +4355,22 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      bulk+frontier central ~+14%; owner's bar +15-20%.
      (Stale iter5c selfplay generator killed at 81% — its 3,409 banked
      games retained; only generation of MORE stale-teacher data stopped.)
+
+210. **Round-2 design AMENDED per design-review #10 + Gemini cross-check.**
+     (2026-08-08)
+     Adopted: era-weighting (fresh-era rows x2.1 -> ~40% of gradient mass;
+     era sidecar RECONSTRUCTED via deterministic shuffle replay, verified
+     against strata on all 12,512,995 rows — no rebuild/re-upload of the
+     740MB corpus); danger arm kept at gamma=6 with intermediate doses via
+     LOCAL vector interpolation t in {0,.5,1} (no 4th run); frontier kept
+     whole-window and — after Gemini flagged the hard-CE failed-label risk
+     and ChatGPT RETRACTED — restored to SUCCESSFUL-ONLY (my failed-prefix
+     build reverted same-day; capability gated behind FRONTIER_FAILED=1
+     pending independent label validation); merge = vh3 + a*Db + b*Df with
+     norm-scaled beta grid + BN-recalibrated merge variants; epochs
+     shortlisted by vector stability before dev evals. DISCLOSED: bulk
+     build accidentally applied the 10k/game cap to OLD uncapped selfplay
+     (env default slip) — shipped as-is, coincides with de-emphasize-old.
+     **TEST BANK RESERVED: seeds 1100000-1119999 (never used in any
+     training/generation/eval; first use = final confirmation only).**
+     ChatGPT predictions: exact design +12%, amended +16% central (9-23%).

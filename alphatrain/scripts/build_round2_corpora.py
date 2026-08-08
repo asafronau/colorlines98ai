@@ -12,6 +12,7 @@ frontier (concentrated escape windows from fresh vh3 replays + broad anchor).
 """
 import argparse
 import glob
+import os
 import json
 
 import numpy as np
@@ -36,10 +37,17 @@ def load(dirs, kind, mode='all'):
                       + g.get('label', '?'))
                 rows += [(m, st) for m in rows_of_game(g, 'crisis', mode)]
             elif kind == 'frontier':
-                if not g.get('capped'):
-                    continue  # escape windows from SUCCESSFUL replays
-                rows += [(m, 'f_' + g.get('label', '?'))
-                         for m in g['moves'][:96]]
+                if g.get('capped'):
+                    rows += [(m, 'f_' + g.get('label', '?'))
+                             for m in g['moves'][:96]]
+                elif os.environ.get('FRONTIER_FAILED') == '1':
+                    # OFF by default (Gemini+ChatGPT consensus 2026-08-08:
+                    # hard-CE cannot distinguish unavoidable deaths from
+                    # teacher errors — failed rows need independent
+                    # validation before entering a concentrated arm).
+                    end = max(0, min(96, len(g['moves']) - 20))
+                    rows += [(m, 'ff_' + g.get('label', '?'))
+                             for m in g['moves'][:end]]
             else:
                 rows += [(m, 'b_' + kind) for m in rows_of_game(g, kind)]
     return rows
