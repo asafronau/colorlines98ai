@@ -52,7 +52,8 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
     # Filter dead value-head keys from old dual-head checkpoints.
     state = {k: v for k, v in state.items() if not k.startswith('value_')}
 
-    net = PolicyNet(in_channels=in_ch, num_blocks=nb, channels=ch).to(device)
+    from alphatrain.model import head_kwargs_from_state
+    net = PolicyNet(in_channels=in_ch, num_blocks=nb, channels=ch, **head_kwargs_from_state(state)).to(device)
     net.load_state_dict(state)
     net.train(False)
 

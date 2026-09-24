@@ -36,13 +36,15 @@ def main():
     ds = TensorDatasetGPU(a.tensor, augment=False, color_augment=False,
                           augment_factor=1, device=a.device)
     net, _ = load_model(a.base, dev, fp16=True)
+    infer_dtype = (torch.float16 if dev.type in ('mps', 'cuda')
+                   else torch.float32)
     varg = np.full(n, -1, dtype=np.int64)
     for s in range(0, n, 2048):
         e = min(s + 2048, n)
         obs = ds._build_obs_core(ds.boards[s:e], next_pos=ds.next_pos[s:e],
                                  next_col=ds.next_col[s:e], n_next=ds.n_next[s:e])
         with torch.no_grad():
-            lg = net(obs.to(torch.float16)).float().cpu().numpy()
+            lg = net(obs.to(infer_dtype)).float().cpu().numpy()
         bd = ds.boards[s:e].cpu().numpy().astype(np.int8)
         for i in range(e - s):
             k, fi, _ = _legal_priors_jit(bd[i], lg[i], 1)

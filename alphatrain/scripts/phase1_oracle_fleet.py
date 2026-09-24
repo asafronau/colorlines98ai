@@ -123,14 +123,13 @@ def main():
 
     @torch.inference_mode()
     def batched_forward(obs_batch_np):
-        """Forward pass on a batch of observations. Returns softmax probs."""
+        """Forward pass on a batch of observations. Returns raw logits."""
         x = torch.from_numpy(obs_batch_np).to(
             device, dtype=torch.float16 if fp16 else torch.float32)
         logits = net(x)
         if isinstance(logits, tuple):
             logits = logits[0]
-        pol = torch.softmax(logits.float(), dim=-1).cpu().numpy()
-        return pol
+        return logits.float().cpu().numpy()
 
     # ── Phase A: per-anchor top-K moves (batched) ──
     print(f"\nPhase A: computing top-{args.top_moves} moves for "

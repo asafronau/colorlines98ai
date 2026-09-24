@@ -6,7 +6,7 @@ For each sampled V12 state:
   - target_actions    : indices where pol_values > 0 (top-5)
   - target_top1_action: highest pol_value action
   - target_top1_prob  : the target's top-1 probability (≈ 0.26 on V12)
-  - model legal softmax = softmax(logits) renormalized over legal moves
+  - model legal softmax = exact softmax over every legal move by default
 
 Per-state metrics:
   - model_prob_at_target_top1  : ↑ means B IS committing to target winner
@@ -32,7 +32,10 @@ import time
 import numpy as np
 import torch
 
-from alphatrain.mcts import _get_legal_priors_flat
+from alphatrain.mcts import (
+    _get_all_legal_priors_flat,
+    _get_legal_priors_flat,
+)
 from alphatrain.model import AlphaTrainNet
 from alphatrain.observation import build_observation
 
@@ -63,10 +66,10 @@ def main():
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
     p.add_argument('--device', default='mps')
-    p.add_argument('--legal-top-k', type=int, default=60,
-                   help='How many top legal moves to consider for the '
-                        'renormalized softmax (60 to capture full legal set '
-                        'reliably).')
+    p.add_argument('--legal-top-k', type=int, default=0,
+                   help='0 (default) computes the exact all-legal softmax. '
+                        'A positive value uses a faster top-K-conditional '
+                        'approximation and labels the report accordingly.')
     p.add_argument('--batch-size', type=int, default=256)
     p.add_argument('--seed', type=int, default=2026)
     args = p.parse_args()
@@ -117,7 +120,10 @@ def main():
         out = model(ob)
         if isinstance(out, tuple):
             out = out[0]
-        return torch.softmax(out.float(), dim=-1).cpu().numpy()
+        # _get_legal_priors_flat expects raw logits and performs the legal-set
+        # softmax itself.  Passing probabilities here would softmax twice and
+        # make every model look spuriously flat.
+        return out.float().cpu().numpy()
 
     # ── Compute metrics ──
     print(f"\nForwarding {len(sel)} states (batch={args.batch_size})...",
@@ -165,9 +171,11 @@ def main():
             t_top1_action = int(t_actions[t_top1_idx])
             target_top1_prob[out_idx] = float(t_probs[t_top1_idx])
 
-            # Legal priors from model softmax over 6561
-            priors = _get_legal_priors_flat(boards[i], pol[k],
-                                              args.legal_top_k)
+            if args.legal_top_k > 0:
+                priors = _get_legal_priors_flat(
+                    boards[i], pol[k], args.legal_top_k)
+            else:
+                priors = _get_all_legal_priors_flat(boards[i], pol[k])
             if not priors:
                 continue
             total = sum(priors.values())
@@ -225,7 +233,10 @@ def main():
     # ── Report ──
     valid = target_top1_prob > 0
     n_valid = int(valid.sum())
-    print(f"\n=== Target-set alignment (over {n_valid} states) ===")
+    support = (f'top-{args.legal_top_k} conditional'
+               if args.legal_top_k > 0 else 'exact all-legal')
+    print(f"\n=== Target-set alignment ({support}; "
+          f"over {n_valid} states) ===")
     print(f"  target top1_prob:              "
           f"mean {target_top1_prob[valid].mean():.3f}  "
           f"P50 {np.median(target_top1_prob[valid]):.3f}  "
@@ -267,7 +278,7 @@ def main():
     print(f"  legal entropy:                 "
           f"mean {legal_entropy[valid].mean():.3f}  "
           f"P50 {np.median(legal_entropy[valid]):.3f}  "
-          f"max-uniform-30 {float(np.log(30)):.3f}")
+          f"P90 {np.percentile(legal_entropy[valid], 90):.3f}")
 
     print(f"\nInterpretation:")
     print(f"  model_top1_renorm measures the model's confidence in its")

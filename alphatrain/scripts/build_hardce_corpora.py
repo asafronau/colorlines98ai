@@ -27,7 +27,14 @@ TEMP_MOVES = 30
 ROW_B = {'board': None}  # placeholder
 
 
-def rows_of_game(d, kind, mode='strata'):
+def rows_of_game(d, kind, mode='strata', selfplay_cap=None):
+    """Select usable move rows from one game.
+
+    ``selfplay_cap=None`` preserves the historical default (the SELFPLAY_CAP
+    environment variable, or 10,000).  Pass ``selfplay_cap=0`` explicitly for
+    a genuinely uncapped corpus.  Keeping that choice in the call site avoids
+    silently changing corpus composition when a builder's prose says "all".
+    """
     mv = d['moves']
     if kind == 'crisis':
         if d.get('capped', False):
@@ -41,8 +48,9 @@ def rows_of_game(d, kind, mode='strata'):
             keep = range(0, max(0, min(96, len(mv) - 20)))
     elif kind == 'uncapped':
         idx = np.arange(TEMP_MOVES, len(mv))
-        cap = int(os.environ.get('SELFPLAY_CAP', '10000'))
-        if len(idx) > cap:
+        cap = (int(os.environ.get('SELFPLAY_CAP', '10000'))
+               if selfplay_cap is None else int(selfplay_cap))
+        if cap > 0 and len(idx) > cap:
             idx = np.sort(np.random.default_rng(d['seed']).choice(
                 idx, cap, replace=False))
         keep = idx

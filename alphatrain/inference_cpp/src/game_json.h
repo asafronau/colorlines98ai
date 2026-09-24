@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -20,12 +22,16 @@
 
 namespace clines {
 
-constexpr int kTopKSave = 15;  // selfplay.py / crisis_mining.py top_k_save
+// MCTS defaults to a 30-action root.  Keep that complete searched support for
+// new flywheel labels; the historical 15-action truncation discarded search
+// mass before the corpus builder could measure it.
+constexpr int kTopKSave = 30;
 
 struct MoveRec {
   int8_t board[81];
   std::vector<NextBall> next_balls;
-  int action;
+  int action;          // behavior action actually played
+  int teacher_action;  // argmax of the tree whose candidates are recorded
   std::vector<Candidate> cands;  // top kTopKSave by visits
   double root_value, q_min, q_max;
 };
@@ -38,6 +44,10 @@ inline MoveRec MakeMoveRec(const Game& g, const SearchResult& r) {
   mr.action = r.action;
   int nc = std::min<int>(kTopKSave, static_cast<int>(r.cands.size()));
   mr.cands.assign(r.cands.begin(), r.cands.begin() + nc);
+  // SearchResult::action may be temperature-sampled for exploratory
+  // behavior.  Candidates are visit-count descending, so the retrospective
+  // tree label is candidate 0 even when no independent clean tree is used.
+  mr.teacher_action = nc > 0 ? mr.cands[0].action : r.action;
   mr.root_value = r.root_value;
   mr.q_min = r.q_min;
   mr.q_max = r.q_max;
@@ -86,6 +96,11 @@ inline void AppendMovesArray(std::string& s, const std::vector<MoveRec>& moves,
          ", \"sc\": " + std::to_string(src % 9) +
          ", \"tr\": " + std::to_string(tgt / 9) +
          ", \"tc\": " + std::to_string(tgt % 9) + "}";
+    int tsrc = mr.teacher_action / 81, ttgt = mr.teacher_action % 81;
+    s += ", \"teacher_move\": {\"sr\": " + std::to_string(tsrc / 9) +
+         ", \"sc\": " + std::to_string(tsrc % 9) +
+         ", \"tr\": " + std::to_string(ttgt / 9) +
+         ", \"tc\": " + std::to_string(ttgt % 9) + "}";
     s += ", \"cand_moves\": [";
     for (size_t i = 0; i < mr.cands.size(); ++i) {
       if (i) s += ", ";
@@ -135,6 +150,28 @@ inline void WriteFileOrDie(const std::string& path, const std::string& body) {
     std::fprintf(stderr, "FATAL: cannot rename %s\n", tmp.c_str());
     std::abort();
   }
+}
+
+// A generation directory is resumable only when every invocation uses the
+// same immutable configuration. Callers opt into this guard with --run-id;
+// historical directories without a run id retain their old behavior.
+inline void EnsureRunConfigOrDie(const std::string& out_dir,
+                                 const std::string& body) {
+  const std::string path = out_dir + "/run_config.json";
+  std::ifstream in(path);
+  if (in.good()) {
+    std::ostringstream existing;
+    existing << in.rdbuf();
+    if (existing.str() != body) {
+      std::fprintf(stderr,
+                   "FATAL: %s has a different generation config; use the "
+                   "original command or a new output directory\n",
+                   path.c_str());
+      std::abort();
+    }
+    return;
+  }
+  WriteFileOrDie(path, body);
 }
 
 }  // namespace clines

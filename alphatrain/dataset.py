@@ -17,6 +17,7 @@ from torch.utils.data import Dataset
 
 from alphatrain.observation import build_observation, build_line_potentials_batch, NUM_CHANNELS
 from alphatrain.gumbel import completed_q_target, vetted_override_target
+from alphatrain.scripts.fleet_gpu import gpu_label_components
 
 BOARD_SIZE = 9
 NUM_MOVES = BOARD_SIZE ** 4
@@ -171,7 +172,58 @@ def _build_dihedral_luts():
         pol_luts.append(pol_lut)
     return obs_luts, pol_luts
 
+
+def _build_line_direction_luts():
+    """Return old->new maps for H/V/D1/D2 feature channels.
+
+    Channels 13--16 are directional, so rotating only their 9x9 maps does not
+    produce the observation of the rotated board.  The undirected line axes
+    must be rotated/reflected as well.
+    """
+    directions = ((0, 1), (1, 0), (1, 1), (1, -1))
+    line_luts = []
+    for t in range(8):
+        k = t % 4
+        flip = t >= 4
+        lut = np.empty(4, dtype=np.int32)
+        for old, (dr, dc) in enumerate(directions):
+            if flip:
+                dc = -dc
+            for _ in range(k):
+                dr, dc = dc, -dr
+            if dr == 0:
+                new = 0
+            elif dc == 0:
+                new = 1
+            elif dr * dc > 0:
+                new = 2
+            else:
+                new = 3
+            lut[old] = new
+        line_luts.append(lut)
+    return line_luts
+
+
+def _transform_observation(obs, obs_inv_lut, line_inv_lut):
+    """Apply one exact board symmetry to a batch of observations."""
+    transformed = obs.reshape(-1, NUM_CHANNELS, 81)[
+        :, :, obs_inv_lut].reshape(-1, NUM_CHANNELS, 9, 9)
+    # new_direction[j] = old_direction[inverse[j]].  Clone the source because
+    # the assignment aliases ``transformed``.
+    directed = transformed[:, 13:17].clone()
+    transformed[:, 13:17] = directed[:, line_inv_lut]
+    return transformed
+
+
 _OBS_LUTS, _POL_LUTS = _build_dihedral_luts()
+_LINE_LUTS = _build_line_direction_luts()
+# ``_build_dihedral_luts`` records old_index -> new_index.  Tensor indexing
+# needs the inverse permutation because ``new[j] = old[inverse[j]]``.
+# Keeping both directions also lets scalar actions (behavior_move) use the
+# direct old -> new map without silently disagreeing with the dense policy.
+_OBS_INV_LUTS = [np.argsort(lut) for lut in _OBS_LUTS]
+_POL_INV_LUTS = [np.argsort(lut) for lut in _POL_LUTS]
+_LINE_INV_LUTS = [np.argsort(lut) for lut in _LINE_LUTS]
 
 
 # Shared tensor cache: load same tensor file once, share across train/val
@@ -209,6 +261,13 @@ def _load_backing(tensor_path, device):
         for k in ('cand_idx', 'cand_visit', 'cand_prior', 'cand_q',
                   'cand_nnz', 'root_value'):
             backing[k] = data[k].to(dev)
+    # Flywheel corpus fields.  Only the compact tensors needed by training
+    # move to the device; provenance such as game_id/group_seed remains in the
+    # artifact for audits and reproducible group splits.
+    for k in ('behavior_move', 'teacher_move', 'target_weight', 'source_id',
+              'split'):
+        backing[k] = data[k].to(dev) if k in data else None
+    backing['metadata'] = data.get('metadata', None)
     n = backing['boards'].shape[0]
     print(f"  Loaded {n:,} base states in {time.time()-t0:.1f}s", flush=True)
     _BACKING_CACHE[key] = backing
@@ -258,6 +317,17 @@ class TensorDatasetGPU(Dataset):
         self.obs_precomputed = backing['obs_precomputed']
         self.disagree_mask = backing.get('disagree_mask')
         self.return_disagree = False  # opt-in: collate returns a 3rd element
+        self.behavior_move = backing.get('behavior_move')
+        self.teacher_move = backing.get('teacher_move')
+        self.target_weight = backing.get('target_weight')
+        self.source_id = backing.get('source_id')
+        self.split = backing.get('split')
+        self.metadata = backing.get('metadata')
+        self.return_flywheel = False
+        # Optional full-corpus mask attached by a trainer from an immutable
+        # sidecar. It classifies the original recorded state even when the
+        # sample receives a random spatial transform.
+        self.flywheel_disagree = None
 
         n_total = self.boards.shape[0]
         if base_indices is None:
@@ -269,13 +339,23 @@ class TensorDatasetGPU(Dataset):
 
         self.augment = augment
         self.color_augment = color_augment
-        self.augment_factor = augment_factor if augment else 1
+        # Repeated sample-time views are useful for either exact symmetry.
+        # Historically color-only runs silently collapsed to one view because
+        # this multiplier was gated only on dihedral augmentation.
+        self.augment_factor = (
+            augment_factor if (augment or color_augment) else 1)
 
         # Dihedral LUTs on GPU
         self._obs_luts = torch.tensor(
             np.stack(_OBS_LUTS), dtype=torch.long, device=self.device)
         self._pol_luts = torch.tensor(
             np.stack(_POL_LUTS), dtype=torch.long, device=self.device)
+        self._obs_inv_luts = torch.tensor(
+            np.stack(_OBS_INV_LUTS), dtype=torch.long, device=self.device)
+        self._pol_inv_luts = torch.tensor(
+            np.stack(_POL_INV_LUTS), dtype=torch.long, device=self.device)
+        self._line_inv_luts = torch.tensor(
+            np.stack(_LINE_INV_LUTS), dtype=torch.long, device=self.device)
 
         # Neighbor table for connected components
         neighbors = torch.full((81, 4), -1, dtype=torch.long, device=self.device)
@@ -310,7 +390,7 @@ class TensorDatasetGPU(Dataset):
         index modulo augment_factor is unused. Same base state seen multiple
         times per epoch gets different transforms, which is the point.
         """
-        items = torch.tensor(indices, dtype=torch.long, device=self.device)
+        items = torch.as_tensor(indices, dtype=torch.long, device=self.device)
         B = len(items)
         # Map sample index -> base index via self.base_indices
         base_pos = items // self.augment_factor
@@ -352,9 +432,18 @@ class TensorDatasetGPU(Dataset):
 
         # ── Sparse -> dense policy ──
         policy = torch.zeros(B, NUM_MOVES, device=self.device)
-        pol_idx = self.pol_indices[base_idx]
-        pol_val = self.pol_values[base_idx]
-        policy.scatter_(1, pol_idx, pol_val)
+        pol_idx = self.pol_indices[base_idx].long()
+        # Compact flywheel tensors store sparse probabilities as fp16. The
+        # dense training target is intentionally fp32, so scatter requires an
+        # explicit cast (and losses should not inherit storage precision).
+        pol_val = self.pol_values[base_idx].float()
+        # Padding uses action index 0 with value 0. scatter_add avoids a later
+        # padding slot overwriting a genuine action-0 target.
+        policy.scatter_add_(1, pol_idx, pol_val)
+        behavior = (self.behavior_move[base_idx].clone().long()
+                    if self.behavior_move is not None else None)
+        teacher = (self.teacher_move[base_idx].clone().long()
+                   if self.teacher_move is not None else None)
 
         # ── Dihedral augmentation: per-sample random transform ──
         if self.augment:
@@ -364,10 +453,35 @@ class TensorDatasetGPU(Dataset):
                 mask = transforms == t
                 if not mask.any():
                     continue
-                obs[mask] = obs[mask].reshape(-1, NUM_CHANNELS, 81
-                    )[:, :, self._obs_luts[t]].reshape(-1, NUM_CHANNELS, 9, 9)
-                policy[mask] = policy[mask][:, self._pol_luts[t]]
+                obs[mask] = _transform_observation(
+                    obs[mask], self._obs_inv_luts[t],
+                    self._line_inv_luts[t])
+                policy[mask] = policy[mask][:, self._pol_inv_luts[t]]
+                if behavior is not None:
+                    valid = mask & (behavior >= 0)
+                    behavior[valid] = self._pol_luts[t, behavior[valid]]
+                if teacher is not None:
+                    valid = mask & (teacher >= 0)
+                    teacher[valid] = self._pol_luts[t, teacher[valid]]
 
+        if self.return_flywheel:
+            if (behavior is None or self.target_weight is None
+                    or self.source_id is None):
+                raise ValueError('return_flywheel needs behavior_move, '
+                                 'target_weight, and source_id tensors')
+            # Old flywheel tensors predate teacher_move.  Their behavior move
+            # was also the recorded visit winner, so it is the faithful
+            # backward-compatible hard label.  Anchors deliberately store
+            # teacher=-1 and likewise fall back to their behavior action.
+            hard_target = behavior.clone()
+            if teacher is not None:
+                use_teacher = teacher >= 0
+                hard_target[use_teacher] = teacher[use_teacher]
+            result = (obs, policy, self.target_weight[base_idx].float(),
+                      behavior, hard_target, self.source_id[base_idx].long())
+            if self.flywheel_disagree is not None:
+                result += (self.flywheel_disagree[base_idx].bool(),)
+            return result
         if self.return_disagree and self.disagree_mask is not None:
             return obs, policy, self.disagree_mask[base_idx].float()
         return obs, policy
@@ -426,23 +540,11 @@ class TensorDatasetGPU(Dataset):
                 obs[idx, 8 + i, r, c] = col
                 obs[idx, 11, r, c] = 1.0
 
-        # Channel 12: component area heatmap
-        # Min-label propagation via 4-directional shifts (no gather/scatter)
-        empty = (boards == 0)  # (B, 9, 9) bool
-        # Labels: 1-81 for empty cells, 0 for occupied
-        labels = torch.arange(1, 82, device=self.device, dtype=torch.long
-                               ).reshape(1, 9, 9).expand(B, 9, 9).clone()
-        labels = labels * empty.long()
-
-        for _ in range(20):
-            old = labels
-            # Propagate min label from 4 neighbors via shifts
-            for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                nb = self._shift(labels, dr, dc)
-                both = (labels > 0) & (nb > 0)
-                labels = torch.where(both & (nb < labels), nb, labels)
-            if (labels == old).all():
-                break
+        # Channel 12: exact component area heatmap.  A winding 9x9 corridor
+        # can have graph diameter 80, so the historical 20 one-edge label
+        # relaxations were not exact and disagreed with Python/C++ inference.
+        empty = (boards == 0)
+        labels = gpu_label_components(boards)
 
         # Component sizes via scatter_add
         offsets = torch.arange(B, device=self.device).reshape(B, 1, 1) * 82
@@ -625,11 +727,12 @@ class GumbelDatasetGPU(TensorDatasetGPU):
                 mask = transforms == t
                 if not mask.any():
                     continue
-                obs[mask] = obs[mask].reshape(-1, NUM_CHANNELS, 81
-                    )[:, :, self._obs_luts[t]].reshape(-1, NUM_CHANNELS, 9, 9)
-                target[mask] = target[mask][:, self._pol_luts[t]]
-                prior[mask] = prior[mask][:, self._pol_luts[t]]
-                sup[mask] = sup[mask][:, self._pol_luts[t]]
+                obs[mask] = _transform_observation(
+                    obs[mask], self._obs_inv_luts[t],
+                    self._line_inv_luts[t])
+                target[mask] = target[mask][:, self._pol_inv_luts[t]]
+                prior[mask] = prior[mask][:, self._pol_inv_luts[t]]
+                sup[mask] = sup[mask][:, self._pol_inv_luts[t]]
 
         return obs, target, prior, sup, weight
 

@@ -34,13 +34,21 @@ struct MctsConfig {
   int top_k = 30;
   int batch_size = 8;      // leaves per batched policy forward (virtual loss)
   double q_weight = 1.0;   // PUCT: q_weight*q_norm + U
+  // Experimental controls; defaults reproduce historical search. Virtual
+  // mean reserves a visit at the node's current mean instead of value -1.
+  bool virtual_mean = false;
+  double q_range_floor = 0.0;
+  // Salt mixed into the per-search sim RNG seed (0 = historical seeding).
+  // Lets the same state be searched with independent spawn samples.
+  uint64_t seed_salt = 0;
   bool early_stop = false; // eval-only: stop when the argmax can't change
   // Root exploration noise (selfplay): prior = (1-w)*p + w*Dirichlet(alpha).
   // 0 = off (eval). selfplay.py defaults: alpha 0.3, weight 0.25.
   double dirichlet_alpha = 0.0;
   double dirichlet_weight = 0.0;
-  // Leaf value from the fused NN value head (q=2.0 operating point) instead of
-  // the 27-feature linear evaluator. Gate-validated 2026-07-09.
+  // Leaf value from the fused NN survival head (q=2.0 operating point)
+  // instead of the 27-feature linear evaluator. Terminal survival V is 0.
+  // Gate-validated 2026-07-09.
   bool nn_value = false;
 };
 

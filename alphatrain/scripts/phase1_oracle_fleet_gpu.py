@@ -189,7 +189,8 @@ def main():
             logits = net(x)
             if isinstance(logits, tuple):
                 logits = logits[0]
-            pol_batch = torch.softmax(logits.float(), dim=-1).cpu().numpy()
+            # CPU legal-prior extraction below applies softmax itself.
+            pol_batch = logits.float().cpu().numpy()
         for k, j in enumerate(valid_idx):
             a = sub[j]
             priors = _get_legal_priors_flat(

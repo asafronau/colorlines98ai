@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from alphatrain.scripts.fleet_gpu import (
-    gpu_label_components, gpu_legal_argmax, gpu_clear_lines,
+    gpu_label_components, gpu_legal_argmax, gpu_legal_mask, gpu_clear_lines,
     gpu_sample_k_distinct_empties,
 )
 from game.board import ColorLinesGame, _label_empty_components, _is_reachable
@@ -27,6 +27,27 @@ def _make_test_board(positions):
 
 
 class TestComponentLabeling:
+    def test_on_policy_shortcut_nonconvergence(self):
+        # Mixed flywheel tensor row 344111: the former 16 hook/shortcut rounds
+        # left one real empty component split. Verify the full partition, not
+        # merely the number of labels or one easy synthetic snake.
+        board = np.array([
+            [0, 0, 0, 0, 6, 4, 0, 0, 5],
+            [4, 0, 0, 5, 0, 5, 0, 0, 0],
+            [0, 0, 0, 6, 0, 0, 4, 0, 0],
+            [3, 7, 0, 3, 0, 0, 7, 0, 0],
+            [0, 3, 0, 0, 0, 0, 0, 2, 0],
+            [4, 0, 3, 6, 1, 0, 0, 3, 0],
+            [0, 3, 0, 0, 1, 0, 0, 0, 0],
+            [7, 0, 4, 0, 1, 0, 4, 0, 7],
+            [0, 0, 3, 3, 1, 0, 0, 0, 4],
+        ], dtype=np.int8)
+        expected = _label_empty_components(board).reshape(-1)
+        actual = gpu_label_components(torch.from_numpy(board)[None])[0].numpy().reshape(-1)
+        np.testing.assert_array_equal(actual > 0, expected > 0)
+        np.testing.assert_array_equal(actual[:, None] == actual[None, :],
+                                      expected[:, None] == expected[None, :])
+
     def test_empty_board(self):
         board = np.zeros((9, 9), dtype=np.int8)
         gpu_labels = gpu_label_components(
@@ -51,6 +72,22 @@ class TestComponentLabeling:
         assert top[0, 0] != bot[0, 0]
         # Wall cells have label 0
         assert (gpu_labels[4, :] == 0).all()
+
+    def test_winding_component_longer_than_manhattan_diameter(self):
+        """A snake corridor needs more than 16 one-edge relaxations."""
+        board = np.ones((9, 9), dtype=np.int8)
+        board[0, :] = 0
+        board[1, 8] = 0
+        board[2, :] = 0
+        board[3, 0] = 0
+        board[4, :] = 0
+        board[5, 8] = 0
+        board[6, :] = 0
+        board[7, 0] = 0
+        board[8, :] = 0
+        labels = gpu_label_components(
+            torch.from_numpy(board).unsqueeze(0))[0].numpy()
+        assert len(set(labels[board == 0].tolist())) == 1
 
     def test_matches_cpu_reference_random_boards(self):
         """For random boards, GPU labels and CPU labels should produce the
@@ -154,6 +191,17 @@ class TestLegalArgmax:
                                 best_action = action
             assert gpu_result == best_action, \
                 f"Trial {trial}: gpu={gpu_result}, cpu={best_action}"
+
+    def test_legal_mask_matches_cpu_enumeration(self):
+        game = ColorLinesGame(seed=42)
+        game.reset()
+        board = game.board.astype(np.int8)
+        actual = gpu_legal_mask(
+            torch.from_numpy(board).unsqueeze(0)).squeeze(0).numpy()
+        expected = np.zeros(6561, dtype=bool)
+        for (sr, sc), (tr, tc) in game.get_legal_moves():
+            expected[(sr * 9 + sc) * 81 + tr * 9 + tc] = True
+        np.testing.assert_array_equal(actual, expected)
 
 
 class TestClearLines:

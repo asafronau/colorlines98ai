@@ -111,7 +111,7 @@ SearchResult MCTS::Search(const Game& game, double temperature,
   pool.emplace_back();
   Node* root = &pool.back();
 
-  SimpleRng sim_rng(StateSeed(game));
+  SimpleRng sim_rng(StateSeed(game) ^ (cfg_.seed_salt * 0x9E3779B97F4A7C15ULL));
 
   // --- Root: policy priors + leaf value (NN head or feature evaluator) ---
   std::vector<float> obs(18 * kNN);
@@ -159,6 +159,7 @@ SearchResult MCTS::Search(const Game& game, double temperature,
   std::vector<float> logits_buf(static_cast<size_t>(B) * kActions);
   std::vector<float> values_buf(B);
   std::vector<std::vector<Node*>> paths(B);
+  std::vector<std::vector<double>> pending_values(B);
   std::vector<Node*> leaves(B);
   std::vector<Game> leaf_games;
   leaf_games.reserve(B);
@@ -183,7 +184,7 @@ SearchResult MCTS::Search(const Game& game, double temperature,
 
       while (!node->children.empty() && !sim.over()) {
         double sqrt_parent = std::sqrt(static_cast<double>(node->n));
-        double q_range = max_q - min_q;
+        double q_range = std::max(max_q - min_q, cfg_.q_range_floor);
         const int8_t* board = sim.board().data();
         bool need_filter = depth > 0;  // root children always valid at root
         std::vector<int> banned;
@@ -234,15 +235,24 @@ SearchResult MCTS::Search(const Game& game, double temperature,
         ++depth;
       }
 
-      // Virtual loss on the whole path (canceled at backup).
-      for (Node* pn : path) { pn->n += 1; pn->w -= kVirtualLoss; }
+      // Save each reservation's exact value: another pending visit may
+      // change the node before backup. Counts still discourage collisions.
+      auto& pending = pending_values[b];
+      pending.clear();
+      for (Node* pn : path) {
+        const double v = cfg_.virtual_mean
+            ? (pn->n > 0 ? pn->w / pn->n : root_value) : -kVirtualLoss;
+        pending.push_back(v);
+        pn->n += 1;
+        pn->w += v;
+      }
 
       leaves[b] = node;
       over_flags[b] = sim.over() ? 1 : 0;
-      // With the NN value head, TERMINAL leaves also need an obs slot (their
-      // V comes from the same fused forward; logits unused). Matches Python's
-      // separate terminal head-eval, fused into the batch here.
-      if (!sim.over() || cfg_.nn_value) {
+      // A terminal state has no remaining survival horizon, so the neural
+      // survival value is exactly zero.  Do not let an out-of-distribution
+      // terminal-board head prediction contaminate Q normalization.
+      if (!sim.over()) {
         sim.BuildObs(obs_buf.data() + static_cast<size_t>(obs_count) * 18 * kNN);
         nn_slot[b] = obs_count++;
       } else {
@@ -278,14 +288,21 @@ SearchResult MCTS::Search(const Game& game, double temperature,
           }
         }
       }
-      // Leaf value: NN head (fused forward, terminal included) or the feature
-      // evaluator (matches mcts.py's feature_coefs branch for both cases).
-      double value = cfg_.nn_value
-                         ? static_cast<double>(values_buf[nn_slot[b]])
-                         : fe_->Value(lg.board().data(), lg.next_balls());
+      // The fused NN is a survival-horizon head: terminal V=0.  The feature
+      // evaluator intentionally continues to score terminal geometry, matching
+      // mcts.py's feature_coefs branch.
+      double value;
+      if (cfg_.nn_value) {
+        value = over_flags[b]
+                    ? 0.0
+                    : static_cast<double>(values_buf[nn_slot[b]]);
+      } else {
+        value = fe_->Value(lg.board().data(), lg.next_balls());
+      }
       if (value < min_q) min_q = value;
       if (value > max_q) max_q = value;
-      for (Node* pn : paths[b]) pn->w += kVirtualLoss + value;
+      for (size_t i = 0; i < paths[b].size(); ++i)
+        paths[b][i]->w += value - pending_values[b][i];
     }
     sims_done += bs;
 

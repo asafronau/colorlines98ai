@@ -144,7 +144,8 @@ def main():
         out = model(ob_t)
         if isinstance(out, tuple):
             out = out[0]
-        return torch.softmax(out.float(), dim=-1).cpu().numpy()
+        # Legal-prior extraction below performs its own softmax.
+        return out.float().cpu().numpy()
 
     anchor_specs = []
     for start in range(0, len(idx), args.forward_batch):

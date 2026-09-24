@@ -20,6 +20,7 @@ import torch
 from alphatrain.model import AlphaTrainNet
 from alphatrain.dataset import TensorDatasetGPU
 from alphatrain.mcts import _legal_priors_jit
+from alphatrain.scripts.fleet_gpu import gpu_legal_mask
 
 
 def load_teacher(path, device, num_blocks, channels):
@@ -31,6 +32,31 @@ def load_teacher(path, device, num_blocks, channels):
     m.load_state_dict(st, strict=True)
     m.train(False)   # inference mode (avoids the .eval() substring the linter trips on)
     return m.half() if device.type in ('mps', 'cuda') else m
+
+
+def legal_topk_batch(boards, logits, top_k):
+    """Return exact legal top-K indices/probabilities for a whole batch.
+
+    This is equivalent to ``_legal_priors_jit`` followed by its historical
+    descending-order fix, but avoids one Python/Numba dispatch per state.  On
+    the 13M-row master corpus that dispatch would dominate relabeling time.
+    """
+    legal = gpu_legal_mask(boards)
+    counts = legal.sum(1).clamp(max=top_k).long()
+    masked = logits.float().masked_fill(~legal, float('-inf'))
+    values, indices = masked.topk(top_k, dim=1)
+    valid = (torch.arange(top_k, device=boards.device)[None, :]
+             < counts[:, None])
+    values = values.masked_fill(~valid, float('-inf'))
+    # softmax(all -inf) is NaN for terminal/no-legal rows.  Give those rows a
+    # harmless finite input and zero them again after softmax.
+    no_legal = counts == 0
+    if no_legal.any():
+        values[no_legal] = 0
+    probs = torch.softmax(values, dim=1)
+    probs = probs.masked_fill(~valid, 0)
+    indices = indices.masked_fill(~valid, 0)
+    return indices, probs, counts
 
 
 def main():
@@ -66,17 +92,25 @@ def main():
                                  next_col=ds.next_col[s:e], n_next=ds.n_next[s:e])
         with torch.no_grad():
             out = net(obs.to(dtype))
-            logits = (out[0] if isinstance(out, tuple) else out).float().cpu().numpy()
-        boards_np = ds.boards[s:e].cpu().numpy().astype(np.int8)
-        for i in range(e - s):
-            k, flat_idx, priors = _legal_priors_jit(boards_np[i], logits[i], K)
-            if k == 0:
-                continue
-            kk = int(min(k, K))
-            order = np.argsort(-priors[:kk])
-            pol_idx[s + i, :kk] = flat_idx[:kk][order]
-            pol_val[s + i, :kk] = priors[:kk][order]
-            pol_nnz[s + i] = kk
+            logits = (out[0] if isinstance(out, tuple) else out).float()
+        if dev.type in ('mps', 'cuda'):
+            idx, val, nnz = legal_topk_batch(ds.boards[s:e], logits, K)
+            pol_idx[s:e] = idx.cpu().numpy()
+            pol_val[s:e] = val.cpu().numpy()
+            pol_nnz[s:e] = nnz.cpu().numpy()
+        else:
+            logits_np = logits.cpu().numpy()
+            boards_np = ds.boards[s:e].cpu().numpy().astype(np.int8)
+            for i in range(e - s):
+                k, flat_idx, priors = _legal_priors_jit(
+                    boards_np[i], logits_np[i], K)
+                if k == 0:
+                    continue
+                kk = int(min(k, K))
+                order = np.argsort(-priors[:kk])
+                pol_idx[s + i, :kk] = flat_idx[:kk][order]
+                pol_val[s + i, :kk] = priors[:kk][order]
+                pol_nnz[s + i] = kk
         if (s // a.batch) % 20 == 0:
             done = e
             rate = done / max(time.time() - t0, 1e-6)
@@ -89,6 +123,16 @@ def main():
     backing['pol_values'] = torch.from_numpy(pol_val)
     backing['pol_nnz'] = torch.from_numpy(pol_nnz)
     backing['relabeled_by'] = a.teacher
+    backing['value_mode'] = 'policy_slim'
+    metadata = dict(backing.get('metadata') or {})
+    metadata.update({
+        'policy_status': 'teacher_topk',
+        'policy_teacher': a.teacher,
+        'policy_top_k': K,
+        'policy_precision': ('fp16' if dev.type in ('mps', 'cuda')
+                             else 'fp32'),
+    })
+    backing['metadata'] = metadata
     torch.save(backing, a.output)
     nz = (pol_nnz > 0).mean()
     top = pol_val[pol_nnz > 0].max(1)

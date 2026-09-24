@@ -1,8 +1,8 @@
 """Fully GPU-vectorized game engine for fleet mining.
 
-Every per-step operation is a batched tensor op on (M, 9, 9) boards. Zero
-Python or CPU work per game — the only CPU work is orchestration (refill
-slots, accumulate outcomes) which is O(M) once per step, not per game.
+Per-step game operations are batched tensor ops on (M, 9, 9) boards.
+Component labeling checks batch convergence on the host every 16 rounds;
+there is no per-game CPU pathfinding.
 
 Verified against the CPU game engine via alphatrain/tests/test_fleet_gpu.py.
 
@@ -33,10 +33,9 @@ def gpu_label_components(boards: torch.Tensor) -> torch.Tensor:
     boards: (M, 9, 9) int (board[r, c] == 0 means empty)
     Returns: (M, 9, 9) long — label for each empty cell (1..81), 0 for balls.
 
-    Method: iterative min-label propagation. Each empty cell takes the min
-    label of itself + 4 neighbors. After ~20 iterations on a 9x9, all
-    connected components have a stable label = min cell index in that
-    component.
+    Method: min-label propagation with pointer shortcuts. Check convergence
+    every 16 rounds; at most 80 rounds suffice on an 81-cell graph. Labels
+    are the minimum 1-based cell index in each empty component.
     """
     M = boards.shape[0]
     device = boards.device
@@ -46,14 +45,21 @@ def gpu_label_components(boards: torch.Tensor) -> torch.Tensor:
                               dtype=torch.long).view(1, BOARD_SIZE, BOARD_SIZE)
     labels = (cell_idx * empty.long()).expand(M, -1, -1).clone()
 
-    # 9x9 diameter = 16 → 16 iterations is sufficient. No early-exit check
-    # (torch.equal() launches a kernel; skipping it saves overhead at the
-    # small cost of always doing the full 16 iters).
+    # A 9x9 *empty rectangle* has Manhattan diameter 16, but obstacles can
+    # create a winding component with graph diameter 80.  The old fixed 16
+    # one-edge relaxations therefore split valid paths and occasionally made
+    # recorded MCTS actions look illegal.  Each round below first hooks a cell
+    # to the smallest neighboring label and then pointer-jumps to that label's
+    # current parent. Shortcuts help but 16 rounds do NOT guarantee convergence
+    # (including on ordinary on-policy boards). Each round propagates at least
+    # one edge, so 80 rounds are a conservative upper bound. A fixed point
+    # allows the usual fast exit without assuming a graph diameter of 16.
     # Ball cells stay at +inf throughout to prevent labels leaking through.
     INF = NUM_CELLS + 1
     big = labels.clone()
     big[~empty] = INF
-    for _ in range(16):
+    for iteration in range(NUM_CELLS - 1):
+        previous = big
         shifted_up = torch.roll(big, shifts=1, dims=1).clone()
         shifted_up[:, 0, :] = INF
         shifted_down = torch.roll(big, shifts=-1, dims=1).clone()
@@ -62,39 +68,39 @@ def gpu_label_components(boards: torch.Tensor) -> torch.Tensor:
         shifted_left[:, :, 0] = INF
         shifted_right = torch.roll(big, shifts=-1, dims=2).clone()
         shifted_right[:, :, -1] = INF
-        big = torch.minimum(
+        hooked = torch.minimum(
             torch.minimum(big, shifted_up),
             torch.minimum(torch.minimum(shifted_down, shifted_left),
                           shifted_right))
+        # Labels are 1-based cell ids.  Following the referenced cell's label
+        # compresses paths (roughly doubling propagation distance per round).
+        parent_index = (hooked.clamp(max=NUM_CELLS) - 1).view(M, NUM_CELLS)
+        jumped = torch.gather(
+            hooked.view(M, NUM_CELLS), 1, parent_index).view_as(hooked)
+        big = torch.minimum(hooked, jumped)
         big[~empty] = INF
+        if (iteration + 1) % 16 == 0 and torch.equal(big, previous):
+            break
     labels = torch.where(empty, big, torch.zeros_like(big))
     labels[labels == INF] = 0
     return labels
 
 
-def gpu_legal_argmax(boards: torch.Tensor, pol_logits: torch.Tensor,
-                       labels: torch.Tensor = None) -> torch.Tensor:
-    """Argmax over legal (src, tgt) moves per board.
-
-    boards: (M, 9, 9) int8 or int
-    pol_logits: (M, 6561) float
-    labels: (M, 9, 9) long — pre-computed component labels (optional). If
-        None, computed here. Pre-computing once per step saves duplicate work
-        with gpu_build_obs.
-    Returns: (M,) long — flat action (src*81 + tgt), or -1 if no legal moves.
-    """
+def gpu_legal_mask(boards: torch.Tensor,
+                   labels: torch.Tensor = None) -> torch.Tensor:
+    """Return the exact ``(batch, 6561)`` legal-action mask."""
     M = boards.shape[0]
     device = boards.device
     if labels is None:
         labels = gpu_label_components(boards)
 
-    # For each cell, the labels of its 4 neighbors (0 if neighbor is out-of-bounds
-    # or a ball)
+    # For each cell, the labels of its four neighbors (zero for an invalid
+    # neighbor or a ball).  A source ball can reach an empty component iff one
+    # of its neighbors belongs to that component.
     nb_labels = torch.zeros(M, BOARD_SIZE, BOARD_SIZE, 4, device=device,
-                             dtype=torch.long)
+                            dtype=torch.long)
     for k, (dr, dc) in enumerate(((1, 0), (-1, 0), (0, 1), (0, -1))):
         shifted = torch.roll(labels, shifts=(dr, dc), dims=(1, 2))
-        # Zero out wrap-around
         if dr == 1:
             shifted[:, 0, :] = 0
         elif dr == -1:
@@ -105,36 +111,26 @@ def gpu_legal_argmax(boards: torch.Tensor, pol_logits: torch.Tensor,
             shifted[:, :, -1] = 0
         nb_labels[:, :, :, k] = shifted
 
-    # Per ball cell (src), the set of reachable component labels = its
-    # 4 neighbor labels (where >0). Per empty cell (tgt), its label = labels[tgt].
-    # Legal move: tgt_label is in the set of src's neighbor labels (and src is
-    # a ball, tgt is empty).
+    src_nb = nb_labels.view(M, NUM_CELLS, 4).unsqueeze(2)
+    tgt_lbl = labels.view(M, NUM_CELLS).unsqueeze(1).unsqueeze(-1)
+    legal_mask = ((src_nb == tgt_lbl) & (tgt_lbl > 0)).any(dim=-1)
+    is_ball = (boards != 0).view(M, NUM_CELLS, 1)
+    is_empty = (boards == 0).view(M, 1, NUM_CELLS)
+    return (legal_mask & is_ball & is_empty).view(M, NUM_MOVES)
 
-    # Build "is reachable" mask of shape (M, src, tgt) where src and tgt are
-    # flat 81-cell indices. This is 81*81 = 6561 per board; M = 1024 boards
-    # is 6.7M entries. Memory: 6.7M * 1 byte = 6.7MB; fine.
 
-    # nb_labels: (M, 9, 9, 4) — for each cell, its 4 neighbor labels
-    # Reshape to (M, 81, 4): for each src cell, 4 neighbor labels
-    nb_labels_flat = nb_labels.view(M, NUM_CELLS, 4)  # (M, 81, 4)
-    # Labels: (M, 9, 9) -> (M, 81)
-    tgt_labels_flat = labels.view(M, NUM_CELLS)  # (M, 81)
+def gpu_legal_argmax(boards: torch.Tensor, pol_logits: torch.Tensor,
+                     labels: torch.Tensor = None) -> torch.Tensor:
+    """Argmax over legal (src, tgt) moves per board.
 
-    # legal[m, src, tgt] = any(nb_labels_flat[m, src, k] == tgt_labels_flat[m, tgt])
-    # Use broadcasting: (M, 81, 1, 4) vs (M, 1, 81, 1) -> (M, 81, 81, 4)
-    src_nb = nb_labels_flat.unsqueeze(2)  # (M, 81, 1, 4)
-    tgt_lbl = tgt_labels_flat.unsqueeze(1).unsqueeze(-1)  # (M, 1, 81, 1)
-    # Match: (M, 81, 81, 4) — element is True if neighbor label matches tgt label
-    match = (src_nb == tgt_lbl) & (tgt_lbl > 0)
-    legal_mask = match.any(dim=-1)  # (M, 81, 81)
-
-    # Source must be a ball, target must be empty (label > 0)
-    is_ball = (boards != 0).view(M, NUM_CELLS, 1)  # (M, 81, 1)
-    is_empty = (boards == 0).view(M, 1, NUM_CELLS)  # (M, 1, 81)
-    legal_mask = legal_mask & is_ball & is_empty  # (M, 81, 81)
-
-    # Apply mask to pol_logits, then argmax over 6561
-    legal_flat = legal_mask.view(M, NUM_MOVES)
+    boards: (M, 9, 9) int8 or int
+    pol_logits: (M, 6561) float
+    labels: (M, 9, 9) long — pre-computed component labels (optional). If
+        None, computed here. Pre-computing once per step saves duplicate work
+        with gpu_build_obs.
+    Returns: (M,) long — flat action (src*81 + tgt), or -1 if no legal moves.
+    """
+    legal_flat = gpu_legal_mask(boards, labels)
     # Set illegal scores to -inf so argmax picks legal
     masked_logits = torch.where(
         legal_flat, pol_logits, torch.full_like(pol_logits, float('-inf')))

@@ -49,7 +49,12 @@ def load(dirs, kind, mode='all'):
                     rows += [(m, 'ff_' + g.get('label', '?'))
                              for m in g['moves'][:end]]
             else:
-                rows += [(m, 'b_' + kind) for m in rows_of_game(g, kind)]
+                # Round-2 bulk promises every old uncapped self-play row.
+                # rows_of_game's historical default is a 10k/game cap, so
+                # disable it explicitly here rather than relying on env state.
+                cap = 0 if kind == 'uncapped' else None
+                rows += [(m, 'b_' + kind) for m in rows_of_game(
+                    g, kind, selfplay_cap=cap)]
     return rows
 
 

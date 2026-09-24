@@ -71,6 +71,11 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--seed-offset") a.seed_offset = std::stoull(argv[++i]);
     else if (k == "--batch") a.batch = std::stoi(argv[++i]);
   }
+  if (a.device != "mps" && a.device != "cpu") {
+    std::fprintf(stderr, "FATAL: unsupported device %s (expected mps or cpu)\n",
+                 a.device.c_str());
+    std::exit(2);
+  }
   return a;
 }
 
@@ -110,7 +115,12 @@ std::vector<JudgeState> LoadStates(const char* path) {
 int main(int argc, char** argv) {
   Args args = ParseArgs(argc, argv);
   torch::Device dev(args.device == "mps" ? torch::kMPS : torch::kCPU);
-  if (dev.is_mps() && !torch::mps::is_available()) dev = torch::Device(torch::kCPU);
+  if (dev.is_mps() && !torch::mps::is_available()) {
+    std::fprintf(stderr,
+                 "FATAL: --device mps was requested, but MPS is unavailable; "
+                 "refusing to fall back to CPU\n");
+    return 2;
+  }
   const bool fp16 = dev.is_mps() && !args.fp32;
 
   std::vector<JudgeState> states = LoadStates(args.states.c_str());

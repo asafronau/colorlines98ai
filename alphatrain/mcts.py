@@ -325,6 +325,18 @@ def _legal_priors_jit(board, pol_logits, top_k):
     return actual_k, topk_idx[:actual_k], priors
 
 
+@njit(cache=True)
+def _legal_argmax_batch(boards, pol_logits):
+    """Return legal-logit argmaxes without per-state Python dispatch."""
+    n = boards.shape[0]
+    out = np.full(n, -1, dtype=np.int64)
+    for i in range(n):
+        k, actions, _ = _legal_priors_jit(boards[i], pol_logits[i], 1)
+        if k:
+            out[i] = actions[0]
+    return out
+
+
 def _flat_to_action(flat_idx):
     """Decode flat index to ((sr, sc), (tr, tc)) action tuple."""
     src_flat = flat_idx // 81
@@ -419,6 +431,35 @@ def _get_legal_priors_flat(board, pol_logits_np, top_k):
         return {}
     # Direct int keys — no numpy decomposition needed
     return {int(flat_idx[i]): float(priors[i]) for i in range(k)}
+
+
+_ZERO_POLICY_LOGITS = np.zeros(NUM_MOVES, dtype=np.float32)
+
+
+def _get_all_legal_priors_flat(board, pol_logits_np):
+    """Return the exact softmax over *all* legal moves.
+
+    ``_legal_priors_jit`` deliberately keeps only the requested top-K before
+    normalizing.  That is the right, fast operation for MCTS, but it means a
+    call with ``top_k=30`` or ``60`` is a conditional distribution over that
+    shortlist, not the model's full legal distribution.  Diagnostics which
+    report confidence, entropy, or probability mass need the latter.
+
+    We enumerate every legal action by passing equal dummy logits: the inline
+    top-K buffer then appends in O(number of legal moves), without its usual
+    sorted-insertion work.  The real logits are normalized here in float64 for
+    stable diagnostic probabilities.
+    """
+    k, flat_idx, _ = _legal_priors_jit(
+        board, _ZERO_POLICY_LOGITS, NUM_MOVES)
+    if k == 0:
+        return {}
+    idx = flat_idx[:k].astype(np.int64)
+    legal_logits = np.asarray(pol_logits_np)[idx].astype(np.float64)
+    legal_logits -= legal_logits.max()
+    probs = np.exp(legal_logits)
+    probs /= probs.sum()
+    return {int(idx[i]): float(probs[i]) for i in range(k)}
 
 
 class MCTS:

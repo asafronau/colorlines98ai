@@ -89,6 +89,7 @@ def cross_entropy_soft(logits, targets):
 
 def distillation_loss(logits, soft_targets, blend_alpha=1.0,
                       target_temperature=1.0, decisiveness_power=0.0,
+                      set_rows=None, set_tau=0.5,
                       state_weights=None):
     """Cross-entropy on a visit-distribution target.
 
@@ -122,13 +123,33 @@ def distillation_loss(logits, soft_targets, blend_alpha=1.0,
         soft_targets = sharp
     log_probs = F.log_softmax(logits, dim=-1)
     per = -(soft_targets * log_probs).sum(dim=-1)                   # (B,)
-    soft = (w * per).mean() if w is not None else per.mean()
-    if blend_alpha >= 1.0:
-        return soft
-    argmax_idx = soft_targets.argmax(dim=-1)
-    hard_per = F.cross_entropy(logits, argmax_idx, reduction='none')
-    hard = (w * hard_per).mean() if w is not None else hard_per.mean()
-    return blend_alpha * soft + (1.0 - blend_alpha) * hard
+    if blend_alpha < 1.0:
+        argmax_idx = soft_targets.argmax(dim=-1)
+        hard_per = F.cross_entropy(logits, argmax_idx, reduction='none')
+        per = blend_alpha * per + (1.0 - blend_alpha) * hard_per
+    if set_rows is not None and bool(set_rows.any()):
+        # Set-valued target for the selected rows: the teacher's candidates with
+        # target mass >= set_tau * max form an ACCEPTABLE SET; the row's loss is
+        # -log P(set).  A near-tie (several acceptable moves) costs nothing if the
+        # student's move is among them; a decisive correction (singleton set) is
+        # ordinary hard CE.  Avoids forcing one coin-flip argmax per tie state.
+        tmax = soft_targets.max(dim=-1, keepdim=True).values
+        in_set = soft_targets >= set_tau * tmax.clamp(min=1e-12)
+        set_lp = torch.logsumexp(log_probs.masked_fill(~in_set, float('-inf')), dim=-1)
+        per = torch.where(set_rows, -set_lp, per)
+    return (w * per).mean() if w is not None else per.mean()
+
+
+def legal_mask_from_obs(obs, pol_tgt=None):
+    """Exact legal-move mask (B, 6561) rebuilt from the observation's colour planes (channels 0-6), so it is
+    valid for any augmented view. Target support is OR-ed in so a hard/soft target is never masked out."""
+    from alphatrain.scripts.fleet_gpu import gpu_legal_mask
+    planes = obs[:, :7].float()
+    boards = (planes * torch.arange(1, 8, device=obs.device, dtype=planes.dtype).view(1, 7, 1, 1)).sum(1)
+    legal = gpu_legal_mask(boards.round().to(torch.int8))
+    if pol_tgt is not None:
+        legal = legal | (pol_tgt > 0)
+    return legal
 
 
 def _aux_lambda_schedule(step_in_epoch, steps_per_epoch, epoch,
@@ -148,7 +169,8 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                  log_interval=100, blend_alpha=1.0, target_temperature=1.0,
                  aux=None, epoch=0, grad_audit=0, decisiveness_power=0.0,
                  disagree_gamma=0.0, save_every_steps=0, save_hook=None,
-                 anchor=None, freeze_bn=False):
+                 anchor=None, freeze_bn=False, set_loss_on_mask=False,
+                 set_tau=0.5, legal_mask_loss=False):
     """One epoch. Optionally adds the listwise margin aux loss.
 
     `aux`, when not None, is a dict with:
@@ -172,9 +194,13 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
     steps_per_epoch = len(loader)
 
     for bi, batch in enumerate(loader):
+        set_rows = None
         if len(batch) == 3:
             obs, pol_tgt, dmask = batch
-            state_w = 1.0 + disagree_gamma * dmask.to(device, non_blocking=True)
+            dmask = dmask.to(device, non_blocking=True)
+            state_w = 1.0 + disagree_gamma * dmask
+            if set_loss_on_mask:
+                set_rows = dmask > 0
         else:
             obs, pol_tgt = batch
             state_w = None
@@ -190,12 +216,14 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
             else:
                 out = model(obs)
             logits = out[0] if isinstance(out, tuple) else out
+            if legal_mask_loss:
+                logits = logits.float().masked_fill(~legal_mask_from_obs(obs, pol_tgt), -1e4)
             main_loss = distillation_loss(
                 logits, pol_tgt,
                 blend_alpha=blend_alpha,
                 target_temperature=target_temperature,
                 decisiveness_power=decisiveness_power,
-                state_weights=state_w)
+                state_weights=state_w, set_rows=set_rows, set_tau=set_tau)
 
             if aux is not None:
                 lam = _aux_lambda_schedule(
@@ -447,7 +475,7 @@ def _run_soft_preflight(model, aux, device, amp_dtype, epoch, step_in_epoch,
 
 
 @torch.no_grad()
-def validate(model, loader, device, amp_dtype=torch.float32):
+def validate(model, loader, device, amp_dtype=torch.float32, legal_mask_loss=False):
     """Validation on un-sharpened targets (faithful CE to V12)."""
     model.train(False)
     use_amp = amp_dtype != torch.float32
@@ -459,6 +487,8 @@ def validate(model, loader, device, amp_dtype=torch.float32):
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(obs)
             logits = out[0] if isinstance(out, tuple) else out
+            if legal_mask_loss:
+                logits = logits.float().masked_fill(~legal_mask_from_obs(obs, pol_tgt), -1e4)
             loss = cross_entropy_soft(logits, pol_tgt)
         total += loss.item()
         n += 1
@@ -494,6 +524,18 @@ def main():
                         '1 + gamma*disagree_mask (tensor must contain '
                         'disagree_mask; reviewers\' fix for correction '
                         'starvation). 0 = off.')
+    p.add_argument('--set-loss-on-mask', action='store_true',
+                   help='Rows with disagree_mask>0 use the SET-VALUED loss '
+                        '-log P(acceptable set), set = target mass >= '
+                        'set_tau*max (ties cost nothing; decisive rows = hard '
+                        'CE). Other rows keep the normal loss. Needs '
+                        'disagree_mask in the tensor.')
+    p.add_argument('--set-tau', type=float, default=0.5)
+    p.add_argument('--policy-head', choices=['abs', 'pair', 'pair2'], default='abs',
+                   help='abs = historical absolute-source 1x1 readout; pair = cell-pair bilinear head (permutation-equivariant)')
+    p.add_argument('--pair-dim', type=int, default=64)
+    p.add_argument('--legal-mask-loss', action='store_true',
+                   help='softmax over LEGAL moves only (mask rebuilt from the obs colour planes); the net no longer has to learn reachability')
     p.add_argument('--seed', type=int, default=None,
                    help='Seed torch/numpy/random for reproducible runs '
                         '(unseeded near-replicates differ by ~1k median).')
@@ -658,6 +700,12 @@ def main():
         train_set.base_indices = train_set.base_indices[:args.max_train_states]
         print(f"  SUBSAMPLE: train base states capped to "
               f"{len(train_set.base_indices):,} (local smoke)", flush=True)
+    if args.set_loss_on_mask:
+        if train_set.disagree_mask is None:
+            raise SystemExit("--set-loss-on-mask needs a 'disagree_mask' in the tensor.")
+        train_set.return_disagree = True
+        n_set = int((train_set.disagree_mask > 0).sum())
+        print(f"set-valued loss on {n_set:,} masked rows (tau={args.set_tau})", flush=True)
     if args.disagree_gamma > 0.0:
         if train_set.disagree_mask is None:
             raise SystemExit("--disagree-gamma needs a 'disagree_mask' in the "
@@ -676,7 +724,8 @@ def main():
 
     # Model
     model = AlphaTrainNet(num_blocks=args.num_blocks,
-                          channels=args.channels).to(device)
+                          channels=args.channels, head=args.policy_head,
+                          pair_dim=args.pair_dim).to(device)
     n_params = count_parameters(model)
     if device.type == 'cuda':
         model = model.to(memory_format=torch.channels_last)
@@ -722,11 +771,16 @@ def main():
     train_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(train_params, lr=args.lr,
                                    weight_decay=args.weight_decay)
-    warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, end_factor=1.0,
-        total_iters=args.warmup_epochs)
-    scheds = [warmup]
-    milestones = [args.warmup_epochs]
+    # LinearLR multiplies the LR by start_factor at construction; with
+    # warmup_epochs=0 inside SequentialLR that factor was never undone and the
+    # whole run trained at 10% of --lr (found 2026-09-22). Only add a warmup
+    # scheduler when a warmup is actually requested.
+    scheds, milestones = [], []
+    if args.warmup_epochs > 0:
+        scheds.append(torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0,
+            total_iters=args.warmup_epochs))
+        milestones.append(args.warmup_epochs)
     if args.flat_epochs > 0:
         # Hold LR flat at peak after warmup, before cosine (Gemini: for a
         # from-scratch student still climbing, decaying early starves it).
@@ -738,8 +792,8 @@ def main():
         T_max=max(1, args.epochs - args.warmup_epochs - args.flat_epochs),
         eta_min=args.lr * 0.01)
     scheds.append(cosine)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, scheds, milestones=milestones)
+    scheduler = (torch.optim.lr_scheduler.SequentialLR(
+        optimizer, scheds, milestones=milestones) if len(scheds) > 1 else cosine)
 
     if (args.resume and not args.warm_start and ckpt is not None
             and 'optimizer' in ckpt):
@@ -1036,8 +1090,10 @@ def main():
                                   save_hook=_step_hook,
                                   aux=aux, epoch=epoch, grad_audit=args.grad_audit,
                                   decisiveness_power=args.decisiveness_power,
-                                  anchor=anchor_data, freeze_bn=args.freeze_bn)
-        vl = validate(model, val_loader, device, amp_dtype=amp_dtype)
+                                  anchor=anchor_data, freeze_bn=args.freeze_bn,
+                                  set_loss_on_mask=args.set_loss_on_mask,
+                                  set_tau=args.set_tau, legal_mask_loss=args.legal_mask_loss)
+        vl = validate(model, val_loader, device, amp_dtype=amp_dtype, legal_mask_loss=args.legal_mask_loss)
         scheduler.step()
 
         print(f"  Train: loss={tl:.4f}"

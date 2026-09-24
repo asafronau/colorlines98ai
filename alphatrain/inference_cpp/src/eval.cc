@@ -22,6 +22,7 @@
 
 #include "game.h"
 #include "game_json.h"
+#include "canonical.h"
 
 using clines::Game;
 using Clock = std::chrono::high_resolution_clock;
@@ -34,7 +35,11 @@ struct Args {
   int batch = 256;
   long max_turns = 1000000;
   bool fp32 = false;  // default: fp16 on MPS (like eval_policy.py)
-  std::string scores_out;  // optional CSV: seed,score (paired-seed bootstraps)
+  int tta = 1;  // 1 = plain greedy; 8 = average logits over the 8 exact board symmetries (D4)
+  bool canon = false;  // feed the net the canonical form (D4 x color relabel), map logits back
+  bool verbose_games = false;  // opt-in per-game + every-500-turn traces
+  int progress_every = 100;    // compact aggregate progress by default
+  std::string scores_out;  // optional streamed CSV for distribution statistics
   // On-policy trajectory recording (DAgger harvest + value-head fuel):
   // keep the FULL last `record_tail` turns (death band) + every
   // `record_every`-th turn before that (broad coverage). Empty dir = off.
@@ -120,22 +125,48 @@ void WriteGameRecord(const Args& args, uint64_t seed, int score, long turns,
       args.record_dir + "/game_seed" + std::to_string(seed) + ".json", s);
 }
 
+using clines::D4Maps;
+
+// Observation of view v of `g`, built from the transformed board + preview so
+// every derived channel (components, line potentials) is computed natively.
+void BuildViewObs(const Game& g, const D4Maps& d4, int v, float* out) {
+  int8_t b[81];
+  for (int i = 0; i < 81; ++i) b[d4.cell[v][i]] = g.board()[i];
+  std::vector<clines::NextBall> nb;
+  for (const auto& x : g.next_balls()) {
+    const int t = d4.cell[v][x.r * 9 + x.c];
+    nb.push_back({t / 9, t % 9, x.color});
+  }
+  Game tmp(0);
+  tmp.SetState(b, nb, g.score(), g.turns());
+  tmp.BuildObs(out);
+}
+
 Args ParseArgs(int argc, char** argv) {
   Args a;
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k == "--fp32") { a.fp32 = true; continue; }
+    if (k == "--verbose-games") { a.verbose_games = true; continue; }
+    if (k == "--canon") { a.canon = true; continue; }
     if (i + 1 >= argc) break;  // remaining flags take a value
     if (k == "--model") a.model = argv[++i];
+    else if (k == "--tta") a.tta = std::stoi(argv[++i]);
     else if (k == "--device") a.device = argv[++i];
     else if (k == "--seed-start") a.seed_start = std::stoull(argv[++i]);
     else if (k == "--seed-end") a.seed_end = std::stoull(argv[++i]);
     else if (k == "--batch") a.batch = std::stoi(argv[++i]);
     else if (k == "--max-turns") a.max_turns = std::stol(argv[++i]);
+    else if (k == "--progress-every") a.progress_every = std::stoi(argv[++i]);
     else if (k == "--scores-out") a.scores_out = argv[++i];
     else if (k == "--record-dir") a.record_dir = argv[++i];
     else if (k == "--record-every") a.record_every = std::stoi(argv[++i]);
     else if (k == "--record-tail") a.record_tail = std::stoi(argv[++i]);
+  }
+  if (a.device != "mps" && a.device != "cpu") {
+    std::fprintf(stderr, "FATAL: unsupported device %s (expected mps or cpu)\n",
+                 a.device.c_str());
+    std::exit(2);
   }
   return a;
 }
@@ -160,8 +191,10 @@ int main(int argc, char** argv) {
   Args args = ParseArgs(argc, argv);
   torch::Device dev(args.device == "mps" ? torch::kMPS : torch::kCPU);
   if (dev.is_mps() && !torch::mps::is_available()) {
-    std::printf("MPS requested but unavailable; using CPU\n");
-    dev = torch::Device(torch::kCPU);
+    std::fprintf(stderr,
+                 "FATAL: --device mps was requested, but MPS is unavailable; "
+                 "refusing to fall back to CPU\n");
+    return 2;
   }
 
   // fp16 only on the GPU (CPU fp16 ops are slow/unsupported); fp32 on CPU.
@@ -176,6 +209,21 @@ int main(int argc, char** argv) {
   net.to(dev);
   if (use_half) net.to(torch::kHalf);  // convert weights + BN buffers to fp16
 
+  if (args.tta != 1 && args.tta != 8) {
+    std::printf("--tta must be 1 or 8\n");
+    return 2;
+  }
+  const D4Maps d4;
+  torch::Tensor act_idx = torch::from_blob(const_cast<int64_t*>(d4.act.data()),
+                                           {8, clines::kActions}, torch::kLong)
+                              .slice(0, 0, args.tta).clone().to(dev);
+  if (args.tta > 1) std::printf("TTA: averaging logits over %d board symmetries\n", args.tta);
+  if (args.canon && args.tta != 1) { std::printf("--canon and --tta are exclusive\n"); return 2; }
+  if (args.canon) std::printf("CANON: net sees the canonical form (D4 x color relabel) of every position\n");
+  torch::Tensor act_all = torch::from_blob(const_cast<int64_t*>(d4.act.data()),
+                                           {8, clines::kActions}, torch::kLong).clone().to(dev);
+  std::vector<int64_t> canon_view;
+
   // Seed queue.
   std::vector<uint64_t> todo;
   for (uint64_t s = args.seed_start; s < args.seed_end; ++s) todo.push_back(s);
@@ -186,6 +234,7 @@ int main(int argc, char** argv) {
     uint64_t seed; Game game;
     std::vector<TurnRec> broad, ring;  // recording only
     size_t ring_head = 0;
+    long next_progress_turn = 500;
   };
   const bool recording = !args.record_dir.empty();
   std::vector<Slot> slots;
@@ -197,6 +246,7 @@ int main(int argc, char** argv) {
     dst.broad.clear();
     dst.ring.clear();
     dst.ring_head = 0;
+    dst.next_progress_turn = 500;
     return true;
   };
   slots.reserve(B);
@@ -207,29 +257,59 @@ int main(int argc, char** argv) {
 
   std::vector<int> scores;
   scores.reserve(todo.size());
-  std::vector<std::pair<uint64_t, int>> seed_scores;
-  if (!args.scores_out.empty()) seed_scores.reserve(todo.size());
+  size_t capped_games = 0;
+  long double turn_sum = 0.0;
+  // Stream score rows as games finish.  Besides making a long evaluation
+  // observable/recoverable, this preserves all completed work if the process
+  // or machine is interrupted before the final summary.
+  FILE* scores_file = nullptr;
+  if (!args.scores_out.empty()) {
+    scores_file = std::fopen(args.scores_out.c_str(), "w");
+    if (!scores_file) {
+      std::printf("could not open scores output: %s\n", args.scores_out.c_str());
+      return 1;
+    }
+    std::fprintf(scores_file, "seed,score,turns,capped\n");
+    std::fflush(scores_file);
+  }
   std::vector<float> obs_buf, legal_buf;
   long fwd = 0;
   auto t0 = Clock::now();
-  size_t done = 0, log_next = 5000;
+  size_t done = 0;
+  size_t log_next = std::max(1, args.progress_every);
+  double score_sum = 0.0;
 
   while (!slots.empty()) {
     int n = (int)slots.size();
-    obs_buf.resize((size_t)n * 18 * clines::kNN);
+    const int V = args.tta;
+    canon_view.assign(n, 0);
+    obs_buf.resize((size_t)n * V * 18 * clines::kNN);
     legal_buf.resize((size_t)n * clines::kActions);
     // Build each game's obs+legal. Single-threaded on purpose: profiling showed
     // this eval is forward-bound (the heavy-tail long games run solo at tiny
     // batch and dominate wall-clock), so parallelizing this loop gave ~0 gain.
     for (int i = 0; i < n; ++i) {
-      slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
+      if (V == 1 && args.canon) {
+        const clines::Canonical cf = clines::Canonicalize(slots[i].game.board().data(),
+                                                          slots[i].game.next_balls(), d4);
+        canon_view[i] = cf.view;
+        Game tmp(0);
+        tmp.SetState(cf.board, cf.next, slots[i].game.score(), slots[i].game.turns());
+        tmp.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
+      } else if (V == 1) {
+        slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
+      } else {
+        for (int v = 0; v < V; ++v)
+          BuildViewObs(slots[i].game, d4, v,
+                       obs_buf.data() + ((size_t)i * V + v) * 18 * clines::kNN);
+      }
       slots[i].game.LegalMask(legal_buf.data() + (size_t)i * clines::kActions);
     }
     // --- Shrink the CPU->GPU transfer (the profiled copy_and_sync bottleneck) ---
     // Obs: convert fp32->fp16 on the CPU *before* uploading, so we ship half the
     // bytes. (Uploading fp32 then .to(kHalf) on the GPU pays the full fp32
     // transfer plus an extra GPU kernel.)
-    torch::Tensor obs = torch::from_blob(obs_buf.data(), {n, 18, 9, 9});
+    torch::Tensor obs = torch::from_blob(obs_buf.data(), {(int64_t)n * V, 18, 9, 9});
     if (use_half) obs = obs.to(torch::kHalf);
     obs = obs.to(dev);
     // Legal mask: it's just 0/1, so upload it as uint8 (1 byte) instead of fp32
@@ -240,6 +320,18 @@ int main(int argc, char** argv) {
                               .to(torch::kByte)
                               .to(dev);
     torch::Tensor logits = net.forward({obs}).toTensor();
+    if (V == 1 && args.canon) {
+      // logits are in each game's canonical frame; bring them back to the original frame.
+      torch::Tensor views = torch::from_blob(canon_view.data(), {n}, torch::kLong).to(dev);
+      logits = torch::gather(logits.to(torch::kFloat), 1, act_all.index_select(0, views));
+    }
+    if (V > 1) {
+      // (n*V, 6561) -> (n, V, 6561); gather each view's logit for every ORIGINAL
+      // action, average over views in fp32 (== geometric mean of legal probs).
+      logits = logits.to(torch::kFloat).view({n, V, clines::kActions});
+      logits = torch::gather(logits, 2, act_idx.unsqueeze(0).expand({n, V, clines::kActions}))
+                   .mean(1);
+    }
     float ninf = -std::numeric_limits<float>::infinity();
     torch::Tensor moves = logits.masked_fill(legal == 0, ninf).argmax(1).to(torch::kCPU);
     auto mv = moves.accessor<int64_t, 1>();
@@ -268,16 +360,46 @@ int main(int argc, char** argv) {
         int s = (int)(m / 81), t = (int)(m % 81);
         bool ok = slots[i].game.Move(s / 9, s % 9, t / 9, t % 9);
         dead = !ok || slots[i].game.over() || slots[i].game.turns() >= args.max_turns;
+        if (args.verbose_games && !dead &&
+            slots[i].game.turns() >= slots[i].next_progress_turn) {
+          double el = std::chrono::duration<double>(Clock::now() - t0).count();
+          std::printf("    seed=%llu turn=%d score=%d elapsed=%.0fs\n",
+                      (unsigned long long)slots[i].seed,
+                      slots[i].game.turns(), slots[i].game.score(), el);
+          std::fflush(stdout);
+          while (slots[i].next_progress_turn <= slots[i].game.turns())
+            slots[i].next_progress_turn += 500;
+        }
       }
       if (dead) {
+        const bool capped = (!slots[i].game.over()
+                             && slots[i].game.turns() >= args.max_turns);
         if (recording)
           WriteGameRecord(args, slots[i].seed, slots[i].game.score(),
                           slots[i].game.turns(), slots[i].game.over(),
                           slots[i].broad, slots[i].ring, slots[i].ring_head);
         scores.push_back(slots[i].game.score());
-        if (!args.scores_out.empty())
-          seed_scores.push_back({slots[i].seed, slots[i].game.score()});
+        score_sum += slots[i].game.score();
+        turn_sum += slots[i].game.turns();
+        capped_games += capped;
         ++done;
+        if (scores_file) {
+          std::fprintf(scores_file, "%llu,%d,%d,%d\n",
+                       (unsigned long long)slots[i].seed,
+                       slots[i].game.score(), slots[i].game.turns(),
+                       capped ? 1 : 0);
+          std::fflush(scores_file);
+        }
+        if (args.verbose_games) {
+          double el = std::chrono::duration<double>(Clock::now() - t0).count();
+          double rate = done / std::max(el, 1e-9);
+          double eta = (todo.size() - done) / std::max(rate, 1e-9);
+          std::printf("  game %zu/%zu seed=%llu score=%d turns=%d "
+                      "elapsed=%.0fs ETA=%.0fs\n",
+                      done, todo.size(), (unsigned long long)slots[i].seed,
+                      slots[i].game.score(), slots[i].game.turns(), el, eta);
+          std::fflush(stdout);
+        }
         Slot repl{0, Game(0)};
         if (make_slot(repl)) survivors.push_back(std::move(repl));
       } else {
@@ -288,11 +410,18 @@ int main(int argc, char** argv) {
 
     if (done >= log_next) {
       double el = std::chrono::duration<double>(Clock::now() - t0).count();
-      std::printf("  %zu/%zu games  %ld fwd  %.0f games/s  %.0f fwd/s\n",
-                  done, todo.size(), fwd, done / el, fwd / el);
+      double rate = done / std::max(el, 1e-9);
+      double eta = (todo.size() - done) / std::max(rate, 1e-9);
+      // Completion order is length-biased while a batched run is in flight;
+      // this is an observability number, not an interim policy estimate.
+      std::printf("  %zu/%zu games  completed_mean=%.0f  elapsed=%.0fs "
+                  "ETA=%.0fs  %ld forwards\n",
+                  done, todo.size(), score_sum / done, el, eta, fwd);
       std::fflush(stdout);
-      log_next += 5000;
+      while (log_next <= done)
+        log_next += std::max(1, args.progress_every);
     }
+
   }
 
   double el = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -303,13 +432,13 @@ int main(int argc, char** argv) {
   std::snprintf(tag, sizeof(tag), "scores [%llu,%llu):",
                 (unsigned long long)args.seed_start, (unsigned long long)args.seed_end);
   Percentile(scores, tag);
-  if (!args.scores_out.empty()) {
-    FILE* f = std::fopen(args.scores_out.c_str(), "w");
-    std::fprintf(f, "seed,score\n");
-    for (auto& p : seed_scores)
-      std::fprintf(f, "%llu,%d\n", (unsigned long long)p.first, p.second);
-    std::fclose(f);
-    std::printf("per-seed scores: %s\n", args.scores_out.c_str());
+  std::printf("  mean turns=%.1Lf  capped@%ld: %zu (%.3f%%)\n",
+              turn_sum / std::max<size_t>(scores.size(), 1), args.max_turns,
+              capped_games, 100.0 * capped_games
+              / std::max<size_t>(scores.size(), 1));
+  if (scores_file) {
+    std::fclose(scores_file);
+    std::printf("score-distribution CSV: %s\n", args.scores_out.c_str());
   }
   return 0;
 }

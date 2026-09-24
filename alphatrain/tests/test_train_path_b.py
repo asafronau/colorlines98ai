@@ -141,3 +141,67 @@ def test_smoke_one_training_step():
         for p in net.parameters() if p.requires_grad)
     assert any_grad, "no gradient flowed during backward"
     opt.step()
+
+
+# ── distillation_loss set-valued rows ─────────────────────────────────
+
+def test_set_loss_tie_row_costs_nothing_when_student_in_set():
+    """Two acceptable moves (visits 0.5/0.5): a student fully on either pays ~0;
+    a student on a third move pays -log P(set)."""
+    tgt = torch.zeros(3, 10); tgt[:, 1] = 0.5; tgt[:, 2] = 0.5
+    logits = torch.full((3, 10), -20.0)
+    logits[0, 1] = 20.0            # student on move 1 (in set)
+    logits[1, 2] = 20.0            # student on move 2 (in set)
+    logits[2, 5] = 20.0            # student on move 5 (outside set)
+    rows = torch.tensor([True, True, True])
+    per = torch.stack([distillation_loss(logits[i:i+1], tgt[i:i+1], blend_alpha=0.0,
+                                         set_rows=rows[i:i+1], set_tau=0.5) for i in range(3)])
+    assert per[0] < 1e-3 and per[1] < 1e-3
+    assert per[2] > 10.0
+    # hard CE on the forced argmax would have punished row 1 (student on move 2)
+    assert distillation_loss(logits[1:2], tgt[1:2], blend_alpha=0.0) > 10.0
+
+
+def test_set_loss_singleton_equals_hard_ce_and_unmasked_rows_unchanged():
+    torch.manual_seed(0)
+    logits = torch.randn(4, 10)
+    tgt = torch.zeros(4, 10); tgt[torch.arange(4), torch.tensor([3, 1, 7, 0])] = 1.0
+    rows = torch.tensor([True, False, True, False])
+    a = distillation_loss(logits, tgt, blend_alpha=0.0, set_rows=rows, set_tau=0.5)
+    b = distillation_loss(logits, tgt, blend_alpha=0.0)
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+# ── LR schedule: warmup 0 must train at the requested LR ──────────────
+
+def test_warmup_zero_schedule_starts_at_requested_lr():
+    import subprocess, sys, re
+    import os
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'train_path_b.py')).read()
+    assert 'if args.warmup_epochs > 0:' in src
+    # emulate the scheduler block for warmup 0 and 1
+    import torch
+    for warm, first in ((0, 1e-4), (1, 1e-5)):
+        p = torch.nn.Parameter(torch.zeros(1)); opt = torch.optim.AdamW([p], lr=1e-4)
+        scheds, ms = [], []
+        if warm > 0:
+            scheds.append(torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, end_factor=1.0, total_iters=warm)); ms.append(warm)
+        cos = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, 6 - warm), eta_min=1e-6); scheds.append(cos)
+        sch = torch.optim.lr_scheduler.SequentialLR(opt, scheds, milestones=ms) if len(scheds) > 1 else cos
+        assert abs(opt.param_groups[0]['lr'] - first) < 1e-9, (warm, opt.param_groups[0]['lr'])
+
+
+def test_legal_mask_from_obs_matches_reference_legality():
+    import numpy as np, torch
+    from alphatrain.train_path_b import legal_mask_from_obs
+    from alphatrain.observation import build_observation
+    from alphatrain.mcts import _legal_priors_jit
+    rng = np.random.default_rng(0)
+    for _ in range(30):
+        b = np.zeros(81, np.int8); occ = rng.choice(81, rng.integers(10, 70), replace=False); b[occ] = rng.integers(1, 8, len(occ))
+        b = b.reshape(9, 9); empty = np.flatnonzero(b.reshape(81) == 0)[:3]
+        obs = build_observation(b, empty // 9, empty % 9, np.ones(len(empty), np.int64), len(empty))
+        got = legal_mask_from_obs(torch.from_numpy(obs[None]))[0].numpy()
+        c, idx, _ = _legal_priors_jit(b, np.zeros(6561, np.float32), 6561)
+        ref = np.zeros(6561, bool); ref[idx[:c]] = True
+        assert np.array_equal(got, ref)

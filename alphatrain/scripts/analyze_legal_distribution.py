@@ -1,11 +1,11 @@
-"""Analyze a checkpoint's legal-renormalized policy distribution.
+"""Analyze a checkpoint's policy distribution over legal moves.
 
 For a given checkpoint and a set of states, computes per-state:
-  - top1_legal_prob_renorm:  max(prior) / sum(top-30 legal priors)
+  - top1_legal_prob_renorm:  max probability over all legal moves
   - top2_legal_prob_renorm:  same for rank 2
   - top1_top2_gap:           top1 - top2 (decisiveness)
-  - legal_entropy:           -Σ p_renorm log p_renorm over legal top-30
-  - n_legal:                 number of legal moves found in top-30
+  - legal_entropy:           -Σ p_legal log p_legal over all legal moves
+  - n_legal:                 exact number of legal moves
 
 The script accepts states from either:
   - phase1_oracle_path_b.pt (oracle anchors)
@@ -33,7 +33,10 @@ import time
 import numpy as np
 import torch
 
-from alphatrain.mcts import _get_legal_priors_flat
+from alphatrain.mcts import (
+    _get_all_legal_priors_flat,
+    _get_legal_priors_flat,
+)
 from alphatrain.model import AlphaTrainNet
 from alphatrain.observation import build_observation
 
@@ -154,7 +157,9 @@ def main():
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
     p.add_argument('--device', default=None)
-    p.add_argument('--legal-top-k', type=int, default=30)
+    p.add_argument('--legal-top-k', type=int, default=0,
+                   help='0 (default) is exact all-legal; positive K reports '
+                        'a top-K-conditional approximation.')
     p.add_argument('--batch-size', type=int, default=256)
     p.add_argument('--rng-seed', type=int, default=2026)
     args = p.parse_args()
@@ -194,7 +199,9 @@ def main():
         out = model(ob)
         if isinstance(out, tuple):
             out = out[0]
-        return torch.softmax(out.float(), dim=-1).cpu().numpy()
+        # _get_legal_priors_flat accepts logits and applies softmax after
+        # legal filtering.  Do not softmax here as well.
+        return out.float().cpu().numpy()
 
     print(f"\nForwarding (batch={args.batch_size})...", flush=True)
     t0 = time.time()
@@ -224,8 +231,11 @@ def main():
         ])
         pol = _forward(obs_batch)
         for k, rec in enumerate(sub):
-            priors = _get_legal_priors_flat(rec['board'], pol[k],
-                                              args.legal_top_k)
+            if args.legal_top_k > 0:
+                priors = _get_legal_priors_flat(
+                    rec['board'], pol[k], args.legal_top_k)
+            else:
+                priors = _get_all_legal_priors_flat(rec['board'], pol[k])
             i = start + k
             if not priors:
                 n_legal[i] = 0
@@ -247,7 +257,9 @@ def main():
     print(f"  done in {time.time()-t0:.0f}s", flush=True)
 
     # ── Aggregate ──
-    print(f"\n=== Legal-renormalized policy distribution stats ===")
+    support = (f'top-{args.legal_top_k} conditional'
+               if args.legal_top_k > 0 else 'exact all-legal')
+    print(f"\n=== Legal policy distribution stats ({support}) ===")
     print(f"({len(states)} states sampled from {args.state_source})", flush=True)
     print()
     print(f"  n_legal:   "
@@ -289,9 +301,8 @@ def main():
         print(f"    [{lo:.2f}, {hi:.2f}): {n} "
               f"({100*n/len(top1_renorm):.1f}%)", flush=True)
 
-    # Uniform-over-K reference
-    print(f"\n  Reference: uniform-over-30 = 0.033, "
-          f"uniform-over-{int(n_legal.mean())} = "
+    # Uniform-over-legal reference
+    print(f"\n  Reference: uniform-over-{int(n_legal.mean())} = "
           f"{1/max(n_legal.mean(),1):.3f}", flush=True)
     if top1_renorm.mean() < 0.10:
         print(f"\n  ⚠  Policy is barely above uniform on top-K — "

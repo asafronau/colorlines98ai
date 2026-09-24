@@ -13,9 +13,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -34,12 +36,15 @@ struct Args {
   std::string model = "data/policy_ts.pt";
   std::string device = "mps";
   std::string value_module;  // fused policy+value TS -> NN leaf value
+  std::string csv;
   uint64_t seed_start = 775000, seed_end = 775048;  // [start, end)
   int sims = 100;
   int batch_size = 8;
   int top_k = 30;
   double c_puct = 2.5;
   double q_weight = 1.0;
+  bool virtual_mean = false;
+  double q_range_floor = 0.0;
   long max_turns = 12000;
   int threads = 14;
   bool early_stop = false;
@@ -52,8 +57,10 @@ Args ParseArgs(int argc, char** argv) {
     std::string k = argv[i];
     if (k == "--early-stop") { a.early_stop = true; continue; }
     if (k == "--fp32") { a.fp32 = true; continue; }
+    if (k == "--virtual-mean") { a.virtual_mean = true; continue; }
     if (i + 1 >= argc) break;
     if (k == "--model") a.model = argv[++i];
+    else if (k == "--csv") a.csv = argv[++i];
     else if (k == "--value-module") a.value_module = argv[++i];
     else if (k == "--device") a.device = argv[++i];
     else if (k == "--seed-start") a.seed_start = std::stoull(argv[++i]);
@@ -63,8 +70,20 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--top-k") a.top_k = std::stoi(argv[++i]);
     else if (k == "--c-puct") a.c_puct = std::stod(argv[++i]);
     else if (k == "--q-weight") a.q_weight = std::stod(argv[++i]);
+    else if (k == "--q-range-floor") a.q_range_floor = std::stod(argv[++i]);
     else if (k == "--max-turns") a.max_turns = std::stol(argv[++i]);
     else if (k == "--threads") a.threads = std::stoi(argv[++i]);
+  }
+  if (!std::isfinite(a.q_range_floor) || a.q_range_floor < 0 ||
+      a.batch_size <= 0 || a.sims <= 0 || a.top_k <= 0 ||
+      a.threads <= 0 || a.seed_end <= a.seed_start) {
+    std::fprintf(stderr, "FATAL: invalid search budget, seed range, or Q floor\n");
+    std::exit(2);
+  }
+  if (a.device != "mps" && a.device != "cpu") {
+    std::fprintf(stderr, "FATAL: unsupported device %s (expected mps or cpu)\n",
+                 a.device.c_str());
+    std::exit(2);
   }
   return a;
 }
@@ -94,8 +113,10 @@ int main(int argc, char** argv) {
   Args args = ParseArgs(argc, argv);
   torch::Device dev(args.device == "mps" ? torch::kMPS : torch::kCPU);
   if (dev.is_mps() && !torch::mps::is_available()) {
-    std::printf("MPS unavailable; using CPU\n");
-    dev = torch::Device(torch::kCPU);
+    std::fprintf(stderr,
+                 "FATAL: --device mps was requested, but MPS is unavailable; "
+                 "refusing to fall back to CPU\n");
+    return 2;
   }
   const bool fp16 = dev.is_mps() && !args.fp32;
 
@@ -113,6 +134,7 @@ int main(int argc, char** argv) {
   for (uint64_t s = args.seed_start; s < args.seed_end; ++s) seeds.push_back(s);
   std::vector<int> scores(seeds.size(), 0);
   std::vector<int> turns_out(seeds.size(), 0);
+  std::vector<int> capped_out(seeds.size(), 0);
   std::atomic<size_t> next_idx{0};
   std::atomic<int> done{0};
   std::mutex print_mu;
@@ -124,8 +146,12 @@ int main(int argc, char** argv) {
   cfg.top_k = args.top_k;
   cfg.batch_size = args.batch_size;
   cfg.q_weight = args.q_weight;
+  cfg.virtual_mean = args.virtual_mean;
+  cfg.q_range_floor = args.q_range_floor;
   cfg.early_stop = args.early_stop;
   cfg.nn_value = nn_value;
+  std::printf("search controls: virtual_mean=%d q_range_floor=%.9g c_puct=%.9g\n",
+              cfg.virtual_mean, cfg.q_range_floor, cfg.c_puct);
 
   std::printf("mcts_eval: %zu seeds [%llu,%llu)  sims=%d q=%.2f batch=%d "
               "top_k=%d early_stop=%d  %s %s  threads=%d\n",
@@ -166,6 +192,8 @@ int main(int argc, char** argv) {
       }
       scores[i] = g.score();
       turns_out[i] = g.turns();
+      capped_out[i] = !g.over() && args.max_turns > 0 &&
+                      g.turns() >= args.max_turns;
       int d = done.fetch_add(1) + 1;
       double el = std::chrono::duration<double>(Clock::now() - t0).count();
       std::lock_guard<std::mutex> l(print_mu);
@@ -194,5 +222,28 @@ int main(int argc, char** argv) {
                 (unsigned long long)args.seed_start,
                 (unsigned long long)args.seed_end);
   Percentile(scores, tag);
+  if (!args.csv.empty()) {
+    std::ofstream out(args.csv);
+    if (!out) {
+      std::fprintf(stderr, "FATAL: cannot write %s\n", args.csv.c_str());
+      return 2;
+    }
+    out.precision(17);
+    out << "seed,score,turns,capped,sims,batch_size,top_k,c_puct,q_weight,"
+           "virtual_mean,q_range_floor,nn_value,early_stop,max_turns,fp16,device\n";
+    for (size_t i = 0; i < seeds.size(); ++i)
+      out << seeds[i] << ',' << scores[i] << ',' << turns_out[i] << ','
+          << capped_out[i] << ',' << args.sims << ',' << args.batch_size << ','
+          << args.top_k << ',' << args.c_puct << ',' << args.q_weight << ','
+          << args.virtual_mean << ',' << args.q_range_floor << ','
+          << nn_value << ',' << args.early_stop << ',' << args.max_turns << ','
+          << fp16 << ',' << args.device << '\n';
+    out.close();
+    if (!out) {
+      std::fprintf(stderr, "FATAL: failed writing %s\n", args.csv.c_str());
+      return 2;
+    }
+    std::printf("Saved %s\n", args.csv.c_str());
+  }
   return 0;
 }

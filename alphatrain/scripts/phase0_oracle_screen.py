@@ -102,8 +102,7 @@ def main():
             logits = net(x)
             if isinstance(logits, tuple):
                 logits = logits[0]
-            pol = torch.softmax(logits.float()[0], dim=-1).cpu().numpy()
-        return pol
+            return logits.float()[0].cpu().numpy()
 
     def apply_move(board, next_balls_list, move_action):
         game = ColorLinesGame(seed=0)

@@ -58,10 +58,25 @@ class PolicyNet(nn.Module):
     """
 
     def __init__(self, in_channels=18, num_blocks=10, channels=256,
-                 policy_channels=128):
+                 policy_channels=128, head='abs', pair_dim=64):
         super().__init__()
         self.in_channels = in_channels
         self.channels = channels
+        # head='abs' (historical): logits for all 81 ABSOLUTE source cells are
+        #   read out of the destination cell's features by one 1x1 conv, so the
+        #   "which ball" axis shares nothing across positions or rotations.
+        # head='pair': every cell gets a source embedding u and a destination
+        #   embedding w (shared 1x1 convs); logit(s, d) = u(s).w(d)/sqrt(k)
+        #   + a(s) + b(d). The head is exactly equivariant to any permutation
+        #   of cells, so symmetry only has to be learned by the backbone.
+        # head='pair2': 'pair' + two geometry-gated bilinear terms, one active only
+        #   for (s, d) on a common row/column/diagonal within 4 cells (the line
+        #   geometry of the game), one only for orthogonal neighbours. The gates
+        #   are D4-invariant, so the head is exactly D4-equivariant but, unlike
+        #   'pair', can tell where s sits relative to d.
+        if head not in ('abs', 'pair', 'pair2'):
+            raise ValueError(f'unknown policy head {head!r}')
+        self.head = head
 
         # Stem
         self.stem = nn.Sequential(
@@ -79,7 +94,30 @@ class PolicyNet(nn.Module):
         self.policy_conv1 = nn.Conv2d(
             channels, policy_channels, 1, bias=False)
         self.policy_bn = nn.BatchNorm2d(policy_channels)
-        self.policy_conv2 = nn.Conv2d(policy_channels, 81, 1)
+        if head == 'abs':
+            self.policy_conv2 = nn.Conv2d(policy_channels, 81, 1)
+        else:
+            if head == 'pair2':
+                self.line_src = nn.Conv2d(policy_channels, pair_dim, 1)
+                self.line_dst = nn.Conv2d(policy_channels, pair_dim, 1)
+                self.adj_src = nn.Conv2d(policy_channels, pair_dim, 1)
+                self.adj_dst = nn.Conv2d(policy_channels, pair_dim, 1)
+                line = torch.zeros(81, 81); adj = torch.zeros(81, 81)
+                for s_ in range(81):
+                    for d_ in range(81):
+                        dr, dc = s_ // 9 - d_ // 9, s_ % 9 - d_ % 9
+                        dist = max(abs(dr), abs(dc))
+                        if 1 <= dist <= 4 and (dr == 0 or dc == 0 or abs(dr) == abs(dc)):
+                            line[s_, d_] = 1.0
+                        if abs(dr) + abs(dc) == 1:
+                            adj[s_, d_] = 1.0
+                self.register_buffer('line_gate', line, persistent=False)
+                self.register_buffer('adj_gate', adj, persistent=False)
+            self.pair_dim = pair_dim
+            self.pair_src = nn.Conv2d(policy_channels, pair_dim, 1)
+            self.pair_dst = nn.Conv2d(policy_channels, pair_dim, 1)
+            self.pair_sbias = nn.Conv2d(policy_channels, 1, 1)
+            self.pair_dbias = nn.Conv2d(policy_channels, 1, 1)
 
     def forward(self, x):
         """Returns policy_logits of shape (batch, 6561)."""
@@ -100,8 +138,20 @@ class PolicyNet(nn.Module):
         """Apply the policy head to backbone features. Public via
         forward_with_features() for callers that want both."""
         p = F.relu(self.policy_bn(self.policy_conv1(feats)))
-        p = self.policy_conv2(p)
-        return p.reshape(p.size(0), -1)
+        if self.head == 'abs':
+            p = self.policy_conv2(p)
+            return p.reshape(p.size(0), -1)
+        b = p.size(0)
+        u = self.pair_src(p).reshape(b, self.pair_dim, 81)          # (B, k, source cells)
+        w = self.pair_dst(p).reshape(b, self.pair_dim, 81)          # (B, k, destination cells)
+        logits = torch.bmm(u.transpose(1, 2), w) * (self.pair_dim ** -0.5)   # (B, s, d)
+        logits = logits + self.pair_sbias(p).reshape(b, 81, 1) + self.pair_dbias(p).reshape(b, 1, 81)
+        if self.head == 'pair2':
+            sc = self.pair_dim ** -0.5
+            for src, dst, gate in ((self.line_src, self.line_dst, self.line_gate), (self.adj_src, self.adj_dst, self.adj_gate)):
+                g = torch.bmm(src(p).reshape(b, self.pair_dim, 81).transpose(1, 2), dst(p).reshape(b, self.pair_dim, 81))
+                logits = logits + g * sc * gate
+        return logits.reshape(b, 81 * 81)                           # index = s*81 + d
 
     def forward_with_features(self, x):
         """Returns (policy_logits, backbone_features).
@@ -120,6 +170,16 @@ class PolicyNet(nn.Module):
 # into PolicyNet without erroring. Once V10+ pillar2x/2y/etc. are the
 # only checkpoints we read, this alias can be deleted.
 AlphaTrainNet = PolicyNet
+
+
+def head_kwargs_from_state(state):
+    """Infer policy-head constructor kwargs from a state_dict."""
+    if any(k.endswith('pair_src.weight') for k in state):
+        w = next(v for k, v in state.items() if k.endswith('pair_src.weight'))
+        head = 'pair2' if any(k.endswith('line_src.weight') for k in state) else 'pair'
+        return {'head': head, 'pair_dim': int(w.shape[0]), 'policy_channels': int(w.shape[1])}
+    w = next((v for k, v in state.items() if k.endswith('policy_conv1.weight')), None)
+    return {'head': 'abs', 'policy_channels': int(w.shape[0])} if w is not None else {}
 
 
 def count_parameters(model):

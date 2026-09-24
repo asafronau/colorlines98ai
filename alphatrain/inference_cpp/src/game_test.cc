@@ -3,6 +3,7 @@
 // (export_game_golden.py). These kernels are RNG-free, so they must match
 // Python bit-for-bit. Run from inference_cpp/ so it finds data/.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "game.h"
+#include "game_json.h"
 #include "mcts.h"  // LegalPriors cross-check
 
 namespace {
@@ -25,6 +27,47 @@ float MaxDiff(const float* a, const float* b, int n) {
   float m = 0;
   for (int i = 0; i < n; ++i) m = std::max(m, std::fabs(a[i] - b[i]));
   return m;
+}
+
+bool NeuralTerminalValueIsZero() {
+  using namespace clines;
+
+  // One empty target with three adjacent sources.  Every legal move fills the
+  // target, then the fixed preview ball fills the vacated source: game over.
+  // The 7-color affine pattern has no five-ball lines, so no move can escape
+  // terminality by clearing.
+  int8_t board[kNN];
+  for (int r = 0; r < kN; ++r)
+    for (int c = 0; c < kN; ++c)
+      board[r * kN + c] = static_cast<int8_t>((3 * r + 5 * c) % 7 + 1);
+  board[1] = 0;
+  Game g(7);
+  g.SetState(board, {{0, 0, 7}});
+
+  int evaluated_states = 0;
+  PolicyFn constant_head = [&evaluated_states](const float*, int n, float* logits,
+                                                float* values) {
+    evaluated_states += n;
+    std::fill(logits, logits + static_cast<size_t>(n) * kActions, 0.0f);
+    for (int i = 0; i < n; ++i) values[i] = 7.0f;
+  };
+  MctsConfig cfg;
+  cfg.num_simulations = 4;
+  cfg.batch_size = 4;
+  cfg.top_k = 3;
+  cfg.nn_value = true;
+  MCTS search(constant_head, nullptr, cfg);
+  SimpleRng move_rng(11);
+  SearchResult out = search.Search(g, 0.0, move_rng);
+
+  // Only the nonterminal root is sent to the head.  Terminal simulations must
+  // lower q_min to zero and must never inherit the head's synthetic 7.0.
+  if (evaluated_states != 1 || std::fabs(out.root_value - 7.0) > 1e-9 ||
+      std::fabs(out.q_min) > 1e-9 || std::fabs(out.q_max - 7.0) > 1e-9)
+    return false;
+  for (const Candidate& cand : out.cands)
+    if (cand.visits > 0 && std::fabs(cand.q) > 1e-9) return false;
+  return true;
 }
 }  // namespace
 
@@ -102,8 +145,23 @@ int main() {
               (clear_mismatch == 0 && board_mismatch == 0) ? "PASS" : "FAIL");
   std::printf("LegalPriors vs golden mask: %d/%d mismatch  -> %s\n",
               lp_mismatch, K, lp_mismatch == 0 ? "PASS" : "FAIL");
+  // A temperature-sampled behavior action must remain distinct from the
+  // visit-winner teacher stored in the moves schema.
+  SearchResult sampled;
+  sampled.action = 81;
+  sampled.cands = {{162, 9, 0.6, 0.2}, {81, 3, 0.4, 0.1}};
+  Game label_game(1);
+  label_game.Reset();
+  MoveRec rec = MakeMoveRec(label_game, sampled);
+  bool teacher_ok = rec.action == 81 && rec.teacher_action == 162;
+  std::printf("behavior/teacher schema split -> %s\n",
+              teacher_ok ? "PASS" : "FAIL");
+  bool terminal_value_ok = NeuralTerminalValueIsZero();
+  std::printf("NN terminal survival value = 0 -> %s\n",
+              terminal_value_ok ? "PASS" : "FAIL");
   bool pass = obs_diff < 1e-5 && legal_diff < 1e-6 && clear_mismatch == 0 &&
-              board_mismatch == 0 && lp_mismatch == 0;
+              board_mismatch == 0 && lp_mismatch == 0 && teacher_ok &&
+              terminal_value_ok;
   std::printf("%s\n", pass ? "ALL PASS \xE2\x9C\x85" : "FAIL \xE2\x9D\x8C");
   return pass ? 0 : 1;
 }

@@ -15,7 +15,8 @@ BN_KEYS = ('running_mean', 'running_var', 'num_batches_tracked')
 
 def sd_of(p):
     ck = torch.load(p, map_location='cpu', weights_only=False)
-    return ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
+    sd = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
+    return {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
 
 
 def mix(weights_from, bn_from, out):

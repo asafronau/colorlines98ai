@@ -6,7 +6,8 @@ import pytest
 from game.board import ColorLinesGame
 from alphatrain.mcts import (
     Node, MCTS, _build_obs_for_game, _get_legal_priors,
-    _get_legal_priors_flat, _legal_priors_jit, VIRTUAL_LOSS,
+    _get_legal_priors_flat, _legal_argmax_batch, _legal_priors_jit,
+    VIRTUAL_LOSS,
 )
 
 
@@ -197,6 +198,43 @@ class TestLegalPriors:
         for key in priors:
             assert isinstance(key, int)
             assert 0 <= key < 6561
+
+    def test_all_legal_priors_are_exact(self):
+        """Exact diagnostic helper includes every legal move and softmaxes once."""
+        from alphatrain.mcts import _get_all_legal_priors_flat
+
+        game = ColorLinesGame(seed=42)
+        game.reset()
+        logits = np.random.default_rng(7).standard_normal(6561).astype(np.float32)
+        priors = _get_all_legal_priors_flat(game.board, logits)
+
+        legal_flat = {
+            (sr * 9 + sc) * 81 + tr * 9 + tc
+            for ((sr, sc), (tr, tc)) in game.get_legal_moves()
+        }
+        assert set(priors) == legal_flat
+        assert abs(sum(priors.values()) - 1.0) < 1e-10
+
+        idx = np.array(sorted(legal_flat), dtype=np.int64)
+        expected = np.exp(logits[idx].astype(np.float64) - logits[idx].max())
+        expected /= expected.sum()
+        actual = np.array([priors[int(i)] for i in idx])
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+    def test_batched_legal_argmax_matches_scalar(self):
+        games = [ColorLinesGame(seed=s) for s in (3, 17, 42, 91)]
+        for game in games:
+            game.reset()
+        boards = np.stack([game.board for game in games]).astype(np.int8)
+        logits = np.random.default_rng(19).standard_normal(
+            (len(games), 6561)).astype(np.float32)
+
+        actual = _legal_argmax_batch(boards, logits)
+        expected = []
+        for board, row in zip(boards, logits):
+            k, actions, _ = _legal_priors_jit(board, row, 1)
+            expected.append(int(actions[0]) if k else -1)
+        np.testing.assert_array_equal(actual, expected)
 
     def test_priors_positive(self):
         """All prior probabilities must be positive."""

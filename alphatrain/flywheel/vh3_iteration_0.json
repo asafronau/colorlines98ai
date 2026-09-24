@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "iteration": "vh3_iteration_0",
+  "lineage": "small128",
+  "base_checkpoint": "alphatrain/data/small128_vh3.pt",
+  "base_policy_ts": "alphatrain/inference_cpp/data/vh3_policy_ts.pt",
+  "label_protocol": "existing noisy-root MCTS visits; retrospective mixture test only",
+  "target_output": "alphatrain/data/flywheel_vh3_targets.pt",
+  "anchor_output": "alphatrain/data/flywheel_vh3_anchors.pt",
+  "target_sources": [
+    {
+      "name": "vh3_crisis_600",
+      "path": "data/crisis_vh3",
+      "format": "moves",
+      "role": "target",
+      "generator": "small128_vh3",
+      "search_sims": 600,
+      "failed_tail_weight": 0.25
+    },
+    {
+      "name": "vh3_crisis_deep",
+      "path": "data/crisis_vh3_deep",
+      "format": "moves",
+      "role": "target",
+      "generator": "small128_vh3",
+      "search_sims": 2400,
+      "failed_tail_weight": 0.25
+    },
+    {
+      "name": "vh3_selfplay_400",
+      "path": "data/selfplay_vh3",
+      "format": "moves",
+      "role": "target",
+      "generator": "small128_vh3",
+      "search_sims": 400,
+      "temperature_moves": 15
+    }
+  ],
+  "anchor_sources": [
+    {
+      "name": "vh3_greedy_recorded",
+      "path": "data/vh3_games",
+      "format": "states",
+      "role": "anchor",
+      "generator": "small128_vh3"
+    }
+  ],
+  "excluded_by_default": [
+    "all 256-channel/big-model game and tensor banks",
+    "vh2 and older small-model search banks"
+  ],
+  "notes": [
+    "All recorded current-lineage rows are retained.",
+    "Low-confidence rows receive lower or zero improvement weight but remain preservation anchors.",
+    "Big-model data may only enter a separately named controlled arm."
+  ]
+}

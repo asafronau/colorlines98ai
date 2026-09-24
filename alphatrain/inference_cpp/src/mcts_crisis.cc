@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <deque>
 #include <dirent.h>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -34,6 +35,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "feature_value.h"
@@ -47,6 +49,7 @@ using Clock = std::chrono::high_resolution_clock;
 namespace {
 
 struct Args {
+  std::string run_id;  // enables immutable run_config.json resume guard
   std::string model = "data/policy_ts.pt";
   std::string device = "mps";
   std::string out_dir = "crisis_out";
@@ -54,6 +57,9 @@ struct Args {
   uint64_t seed_start = 940100, seed_end = 940400;  // [start, end)
   int recovery_turns = 15, recovery_sims = 1600;
   int prevention_turns = 75, prevention_sims = 2400;
+  // Optional independent noise-free label tree.  Zero preserves the
+  // historical behavior-tree labels; positive uses this fixed label budget.
+  int clean_label_sims = 0;
   int continue_turns = 500;
   long policy_max_turns = 40000;
   int probe_batch = 256;  // games in flight during the bulk probe phase
@@ -73,8 +79,12 @@ Args ParseArgs(int argc, char** argv) {
     std::string k = argv[i];
     if (k == "--fp32") { a.fp32 = true; continue; }
     if (k == "--full-record") { a.full_record = true; continue; }
-    if (i + 1 >= argc) break;
-    if (k == "--model") a.model = argv[++i];
+    if (i + 1 >= argc) {
+      std::fprintf(stderr, "FATAL: missing value for %s\n", k.c_str());
+      std::exit(2);
+    }
+    if (k == "--run-id") a.run_id = argv[++i];
+    else if (k == "--model") a.model = argv[++i];
     else if (k == "--value-module") a.value_module = argv[++i];
     else if (k == "--device") a.device = argv[++i];
     else if (k == "--out-dir") a.out_dir = argv[++i];
@@ -84,6 +94,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--recovery-sims") a.recovery_sims = std::stoi(argv[++i]);
     else if (k == "--prevention-turns") a.prevention_turns = std::stoi(argv[++i]);
     else if (k == "--prevention-sims") a.prevention_sims = std::stoi(argv[++i]);
+    else if (k == "--clean-label-sims") a.clean_label_sims = std::stoi(argv[++i]);
     else if (k == "--continue-turns") a.continue_turns = std::stoi(argv[++i]);
     else if (k == "--policy-max-turns") a.policy_max_turns = std::stol(argv[++i]);
     else if (k == "--probe-batch") a.probe_batch = std::stoi(argv[++i]);
@@ -94,6 +105,22 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--dirichlet-alpha") a.dirichlet_alpha = std::stod(argv[++i]);
     else if (k == "--dirichlet-weight") a.dirichlet_weight = std::stod(argv[++i]);
     else if (k == "--threads") a.threads = std::stoi(argv[++i]);
+    else {
+      std::fprintf(stderr, "FATAL: unknown argument %s\n", k.c_str());
+      std::exit(2);
+    }
+  }
+  if (a.seed_end <= a.seed_start || a.recovery_sims <= 0 ||
+      a.prevention_sims <= 0 || a.continue_turns <= 0 ||
+      a.policy_max_turns <= 0 || a.probe_batch <= 0 ||
+      a.batch_size <= 0 || a.top_k <= 0 || a.threads <= 0) {
+    std::fprintf(stderr, "FATAL: invalid seed/search/batch/turn arguments\n");
+    std::exit(2);
+  }
+  if (a.device != "mps" && a.device != "cpu") {
+    std::fprintf(stderr, "FATAL: unsupported device %s (expected mps or cpu)\n",
+                 a.device.c_str());
+    std::exit(2);
   }
   return a;
 }
@@ -157,8 +184,10 @@ int main(int argc, char** argv) {
   Args args = ParseArgs(argc, argv);
   torch::Device dev(args.device == "mps" ? torch::kMPS : torch::kCPU);
   if (dev.is_mps() && !torch::mps::is_available()) {
-    std::printf("MPS unavailable; using CPU\n");
-    dev = torch::Device(torch::kCPU);
+    std::fprintf(stderr,
+                 "FATAL: --device mps was requested, but MPS is unavailable; "
+                 "refusing to fall back to CPU\n");
+    return 2;
   }
   const bool fp16 = dev.is_mps() && !args.fp32;
 
@@ -167,7 +196,50 @@ int main(int argc, char** argv) {
     std::printf("cannot load data/feature_value.bin (run export_feature_weights.py)\n");
     return 1;
   }
-  ::mkdir(args.out_dir.c_str(), 0755);
+  std::error_code mkdir_error;
+  std::filesystem::create_directories(args.out_dir, mkdir_error);
+  if (mkdir_error) {
+    std::fprintf(stderr, "FATAL: cannot create %s: %s\n",
+                 args.out_dir.c_str(), mkdir_error.message().c_str());
+    return 1;
+  }
+  if (!args.run_id.empty()) {
+    std::string config =
+        "{\"schema_version\": 1, \"generator\": \"mcts_crisis\", "
+        "\"run_id\": \"" + args.run_id + "\", \"model\": \"" +
+        args.model + "\", \"value_module\": \"" + args.value_module +
+        "\", \"device\": \"" + args.device + "\", \"precision\": \"" +
+        (fp16 ? std::string("fp16") : std::string("fp32")) +
+        "\", \"seed_start\": " + std::to_string(args.seed_start) +
+        ", \"seed_end\": " + std::to_string(args.seed_end) +
+        ", \"recovery_turns\": " + std::to_string(args.recovery_turns) +
+        ", \"recovery_sims\": " + std::to_string(args.recovery_sims) +
+        ", \"prevention_turns\": " +
+        std::to_string(args.prevention_turns) +
+        ", \"prevention_sims\": " +
+        std::to_string(args.prevention_sims) +
+        ", \"clean_label_sims\": " +
+        std::to_string(args.clean_label_sims) +
+        ", \"continue_turns\": " + std::to_string(args.continue_turns) +
+        ", \"policy_max_turns\": " +
+        std::to_string(args.policy_max_turns) +
+        ", \"probe_batch\": " + std::to_string(args.probe_batch) +
+        ", \"batch_size\": " + std::to_string(args.batch_size) +
+        ", \"top_k\": " + std::to_string(args.top_k) +
+        ", \"c_puct\": ";
+    clines::AppendD(config, args.c_puct);
+    config += ", \"q_weight\": ";
+    clines::AppendD(config, args.q_weight);
+    config += ", \"dirichlet_alpha\": ";
+    clines::AppendD(config, args.dirichlet_alpha);
+    config += ", \"dirichlet_weight\": ";
+    clines::AppendD(config, args.dirichlet_weight);
+    config += ", \"threads\": " + std::to_string(args.threads) +
+              ", \"full_record\": " +
+              (args.full_record ? std::string("true") : std::string("false")) +
+              "}\n";
+    clines::EnsureRunConfigOrDie(args.out_dir, config);
+  }
   const bool nn_value = !args.value_module.empty();
   clines::InferenceServer server(nn_value ? args.value_module : args.model,
                                  dev, fp16, 10000, nn_value);
@@ -178,12 +250,14 @@ int main(int argc, char** argv) {
   auto t0 = Clock::now();
 
   std::printf("mcts_crisis: %zu probe seeds [%llu,%llu)  recovery=%d@%d "
-              "prevention=%d@%d continue=%d probe_cap=%ld probe_batch=%d  "
+              "prevention=%d@%d clean_label_sims=%d continue=%d "
+              "probe_cap=%ld probe_batch=%d  "
               "q=%.2f mcts_batch=%d %s %s threads=%d\nout: %s\n",
               seeds.size(), (unsigned long long)args.seed_start,
               (unsigned long long)args.seed_end, args.recovery_turns,
               args.recovery_sims, args.prevention_turns, args.prevention_sims,
-              args.continue_turns, args.policy_max_turns, args.probe_batch,
+              args.clean_label_sims, args.continue_turns,
+              args.policy_max_turns, args.probe_batch,
               args.q_weight, args.batch_size, args.device.c_str(),
               fp16 ? "fp16" : "fp32", args.threads, args.out_dir.c_str());
   std::fflush(stdout);
@@ -355,6 +429,13 @@ int main(int argc, char** argv) {
       clines::MCTS mcts(
           [&server](const float* o, int n, float* out, float* out_v) { server.Eval(o, n, out, out_v); },
           &fe, cfg);
+      clines::MctsConfig clean_cfg = cfg;
+      clean_cfg.num_simulations = std::max(1, args.clean_label_sims);
+      clean_cfg.dirichlet_alpha = 0.0;
+      clean_cfg.dirichlet_weight = 0.0;
+      clines::MCTS clean_mcts(
+          [&server](const float* o, int n, float* out, float* out_v) { server.Eval(o, n, out, out_v); },
+          &fe, clean_cfg);
       clines::SimpleRng move_rng(replay_seed * 2654435761ULL + 1);
 
       std::vector<clines::MoveRec> recs;
@@ -362,7 +443,21 @@ int main(int argc, char** argv) {
       while (!rg.over() && replayed < args.continue_turns) {
         clines::SearchResult r = mcts.Search(rg, /*temperature=*/0.0, move_rng);
         if (r.action < 0) break;
-        recs.push_back(clines::MakeMoveRec(rg, r));
+        if (args.clean_label_sims > 0) {
+          clines::SearchResult label = clean_mcts.Search(
+              rg, /*temperature=*/0.0, move_rng);
+          if (label.action < 0) {
+            std::fprintf(stderr,
+                         "FATAL: clean crisis label has no move (seed=%llu)\n",
+                         (unsigned long long)replay_seed);
+            std::abort();
+          }
+          clines::MoveRec rec = clines::MakeMoveRec(rg, label);
+          rec.action = r.action;
+          recs.push_back(std::move(rec));
+        } else {
+          recs.push_back(clines::MakeMoveRec(rg, r));
+        }
         int src = r.action / 81, tgt = r.action % 81;
         if (!rg.Move(src / 9, src % 9, tgt / 9, tgt % 9)) {
           std::fprintf(stderr, "FATAL: illegal replay move (seed=%llu)\n",
@@ -376,12 +471,38 @@ int main(int argc, char** argv) {
 
       std::string json;
       json.reserve(recs.size() * 700 + 512);
-      json += "{\"seed\": " + std::to_string(replay_seed) +
+      json += "{\"generator_schema_version\": 4" +
+              (args.run_id.empty()
+                   ? std::string("")
+                   : ", \"run_id\": \"" + args.run_id + "\"") +
+              ", \"policy_model\": \"" + args.model + "\"" +
+              ", \"value_module\": \"" + args.value_module + "\"" +
+              ", \"precision\": \"" +
+                  (fp16 ? std::string("fp16") : std::string("fp32")) + "\"" +
+              ", \"full_record\": " +
+                  (args.full_record ? std::string("true") : std::string("false")) +
+              ", \"seed\": " + std::to_string(replay_seed) +
               ", \"original_seed\": " + std::to_string(task.original_seed) +
               ", \"score\": " + std::to_string(rg.score()) +
               ", \"turns\": " + std::to_string(rg.turns()) +
               ", \"replay_from_turn\": " + std::to_string(task.anchor.turn) +
               ", \"replay_sims\": " + std::to_string(task.sims) +
+              ", \"behavior_sims\": " + std::to_string(task.sims) +
+              ", \"clean_label_sims\": " +
+                  std::to_string(args.clean_label_sims) +
+              ", \"q_weight\": " + std::to_string(args.q_weight) +
+              ", \"c_puct\": " + std::to_string(args.c_puct) +
+              ", \"top_k\": " + std::to_string(args.top_k) +
+              ", \"mcts_batch_size\": " +
+                  std::to_string(args.batch_size) +
+              ", \"value_kind\": \"" +
+                  (nn_value ? std::string("neural") : std::string("feature")) +
+                  "\"" +
+              ", \"behavior_dirichlet_alpha\": " +
+                  std::to_string(args.dirichlet_alpha) +
+              ", \"behavior_dirichlet_weight\": " +
+                  std::to_string(args.dirichlet_weight) +
+              ", \"label_dirichlet_weight\": 0.0" +
               ", \"capped\": " + (capped ? std::string("true") : std::string("false")) +
               ", \"bootstrap_value\": 0.0" +
               ", \"time\": ";
@@ -422,5 +543,15 @@ int main(int argc, char** argv) {
               probes_done, probe_deaths, games_written.load(), el,
               (long long)server.forwards(), (long long)server.evals(),
               server.evals() / el);
+  if (!args.run_id.empty()) {
+    std::string complete =
+        "{\"schema_version\": 1, \"run_id\": \"" + args.run_id +
+        "\", \"seed_start\": " + std::to_string(args.seed_start) +
+        ", \"seed_end\": " + std::to_string(args.seed_end) +
+        ", \"probe_seeds\": " +
+        std::to_string(args.seed_end - args.seed_start) + "}\n";
+    clines::WriteFileOrDie(args.out_dir + "/generation_complete.json",
+                           complete);
+  }
   return 0;
 }

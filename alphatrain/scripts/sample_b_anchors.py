@@ -234,7 +234,9 @@ def main():
             out = model(ob)
             if isinstance(out, tuple):
                 out = out[0]
-            return torch.softmax(out.float(), dim=-1).cpu().numpy()
+            # _get_legal_priors_flat below expects logits and applies the
+            # legal-set softmax.  Softmaxing here would flatten them twice.
+            return out.float().cpu().numpy()
 
         # Subsample to keep forward cost bounded. We don't need to
         # screen all 2M states — 50K random samples give us plenty of

@@ -180,7 +180,8 @@ def main():
         out = model(ob_t)
         if isinstance(out, tuple):
             out = out[0]
-        return torch.softmax(out.float(), dim=-1).cpu().numpy()
+        # Legal-prior extraction below performs the softmax.
+        return out.float().cpu().numpy()
 
     def _build_obs_for_anchor(a):
         return build_observation(

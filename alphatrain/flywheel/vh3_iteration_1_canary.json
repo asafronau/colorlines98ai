@@ -1,0 +1,110 @@
+{
+  "schema_version": 2,
+  "iteration": "vh3_iteration_1_canary",
+  "lineage": "small128",
+  "base_checkpoint": "alphatrain/data/small128_vh3.pt",
+  "base_policy_ts": "alphatrain/inference_cpp/data/vh3_policy_ts.pt",
+  "feature_value": "alphatrain/inference_cpp/data/feature_value.bin",
+  "label_protocol": "non-training end-to-end canary for native feature-value clean exploit, separated exploratory behavior/teacher recording, and crisis replay",
+  "target_output": "alphatrain/data/flywheel_vh3_i1_canary_targets.pt",
+  "anchor_output": "alphatrain/data/flywheel_vh3_i1_canary_targets.pt",
+  "generation_provenance": {
+    "policy_checkpoint_sha256": "db2567e1c1f7fc5fb42a98ac03fc09b3c05c2e46ce23954c64ada552128265ad",
+    "policy_ts_sha256": "a24316f6525a509631f00ecf500c13eb04faab7d323720e67ca0ded52d2d5794",
+    "feature_value_sha256": "dba601a781b2a95f6a35788e5b8d5108b4a332d8f57602af13b0da2635951889",
+    "reserved_final_seed_range": [1100000, 1120000]
+  },
+  "target_sources": [
+    {
+      "name": "canary_exploit_400",
+      "path": "alphatrain/data/flywheel_vh3_i1_canary/exploit",
+      "format": "moves",
+      "role": "target",
+      "generator": "small128_vh3_native_terminal_fixed",
+      "seed_start": 2099900,
+      "seed_end": 2099904,
+      "expected_files": 4,
+      "require_complete_marker": true,
+      "require_full_record": true,
+      "expected_game_fields": {
+        "generator_schema_version": 4,
+        "run_id": "vh3_i1_canary_exploit_s400_v1",
+        "precision": "fp16",
+        "full_record": true,
+        "behavior_sims": 400,
+        "clean_label_sims": 0,
+        "temperature_moves": 0,
+        "behavior_dirichlet_weight": 0.0
+      }
+    },
+    {
+      "name": "canary_explore_200x400",
+      "path": "alphatrain/data/flywheel_vh3_i1_canary/explore",
+      "format": "moves",
+      "role": "target",
+      "generator": "small128_vh3_native_terminal_fixed",
+      "seed_start": 2099910,
+      "seed_end": 2099914,
+      "expected_files": 4,
+      "require_complete_marker": true,
+      "require_full_record": true,
+      "expected_game_fields": {
+        "generator_schema_version": 4,
+        "run_id": "vh3_i1_canary_explore_b200_l400_v1",
+        "precision": "fp16",
+        "full_record": true,
+        "behavior_sims": 200,
+        "clean_label_sims": 400,
+        "temperature_moves": 15,
+        "behavior_dirichlet_weight": 0.25
+      }
+    },
+    {
+      "name": "canary_crisis_600_1600",
+      "path": "alphatrain/data/flywheel_vh3_i1_canary/crisis",
+      "format": "moves",
+      "role": "target",
+      "generator": "small128_vh3_native_feature_value",
+      "seed_start": 2099920,
+      "seed_end": 2099928,
+      "require_complete_marker": true,
+      "require_full_record": true,
+      "failed_tail_weight": 0.25,
+      "native_command": [
+        "./build/mcts_crisis",
+        "--run-id", "vh3_i1_canary_crisis_r600_p1600_v1",
+        "--model", "data/vh3_policy_ts.pt",
+        "--device", "mps",
+        "--out-dir", "../data/flywheel_vh3_i1_canary/crisis",
+        "--seed-start", "2099920", "--seed-end", "2099928",
+        "--recovery-turns", "15", "--recovery-sims", "600",
+        "--prevention-turns", "75", "--prevention-sims", "1600",
+        "--clean-label-sims", "0", "--continue-turns", "500",
+        "--policy-max-turns", "10000", "--probe-batch", "256",
+        "--batch-size", "8", "--top-k", "30",
+        "--c-puct", "2.5", "--q-weight", "1.0",
+        "--dirichlet-alpha", "0.3", "--dirichlet-weight", "0.0",
+        "--threads", "14", "--full-record"
+      ],
+      "expected_game_fields": {
+        "generator_schema_version": 4,
+        "run_id": "vh3_i1_canary_crisis_r600_p1600_v1",
+        "policy_model": "data/vh3_policy_ts.pt",
+        "value_module": "",
+        "precision": "fp16",
+        "full_record": true,
+        "clean_label_sims": 0,
+        "q_weight": 1.0,
+        "c_puct": 2.5,
+        "top_k": 30,
+        "mcts_batch_size": 8,
+        "value_kind": "feature",
+        "behavior_dirichlet_weight": 0.0,
+        "label_dirichlet_weight": 0.0,
+        "continue_turns": 500,
+        "policy_max_turns": 10000
+      }
+    }
+  ],
+  "anchor_sources": []
+}

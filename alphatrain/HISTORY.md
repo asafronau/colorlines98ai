@@ -4395,3 +4395,1247 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      cos 0.976. The 12.5M corpus keeps prescribing the medicine vh3
      already half-dosed. Merge screen (8 candidates, merge_vectors.py)
      running on dev slice 775000-775999 (vh3 same-slice bar 14,429).
+
+212. **Corrected-recipe scratch curves substantially retract the early 128ch
+     capacity story: update-rich/high-LR 128 keeps climbing, a strong-corpus
+     128 matches the old 192 distribution, and endpoint-only reads hid both
+     runs' best region.** (2026-08-09)
+
+     All downloaded checkpoints were exported to TorchScript with exact eager
+     agreement and the legal-move golden probe: `small128_strong` epochs 1--39,
+     `scratch128_lr3e3` all 37 available epochs (1--4, 6, 8, 10--40), and
+     `scratch128_bs2048` epochs 1, 6--16.  Export now accepts an explicit
+     `--output`, so batch conversion no longer races through a shared
+     `policy_ts.pt`.  Gameplay remained FP16 MPS, aggregate-only, and all
+     distribution comparisons used independent bootstrap resampling; matching
+     numeric seeds were deliberately not paired.  Reserved seeds
+     1,100,000--1,119,999 remain untouched.
+
+     **Update-rich bs2048 (lr=3e-4):** the 999-game curve kept improving after
+     its epoch-6 parity point: means ep7--16 = 4,376, 4,866, 5,336, 6,116,
+     7,045, 7,007, 7,526, 7,537, 7,883, 7,846.  Epoch 15 at 5k is mean 7,946 /
+     median 5,712 / P10 1,248 / <1000 7.00% / >10k 28.16%.  Versus epoch 6
+     at 5k it gained mean +3,752 [3,518,3,982], median +2,664
+     [2,410,2,882], P10 +446 [351,519], and cut <1000 by 7.28pp
+     [6.08,8.48].  It had 696,525 Adam updates by epoch 15; the small-batch
+     effect is therefore batch noise plus vastly more updates, not an isolated
+     capacity result.
+
+     **Uniform Pillar3k-relabeled strong corpus:** sparse 999 screens rose from
+     mean 1,202 (ep3) to 7,404 (ep18), 8,280 (ep27), and a real ep30--32 peak
+     of 8,966 / 9,411 / 9,339 before collapsing to 6,874 at ep33 and recovering
+     only to 7,897 at ep39.  Thus the supplied ep29/ep39 endpoints had hidden
+     the best checkpoint.  Epoch 32 at 5k is mean 9,430 / median 6,524 / P10
+     1,409 / <1000 5.72% / >10k 34.88%.  It is distributionally
+     indistinguishable from old scratch192 epoch 19 (mean 9,457 / median 6,588)
+     on every reported metric.  Strong data therefore DID teach transferable
+     policy structure to 128ch; its final-checkpoint regression is an
+     optimization/gating problem, not evidence that expert trajectories are
+     unusable or that the student lacks capacity.
+
+     **R2 scratch128, bs32768/lr3e-3:** the late envelope continued upward:
+     999-game means ep12/15/18/21/24/27/30/33 = 4,702 / 5,680 / 6,308 /
+     6,666 / 7,589 / 9,132 / 8,458 / 9,143, followed by a broad ep35--36
+     peak (10,490 / 10,428), ep37--39 noise/regression, and ep40 10,523.
+     At 5k, ep36 = mean 9,942 / median 6,978 / P10 1,482 / <1000 5.24% /
+     >10k 36.94%; ep40 = 10,136 / 6,950 / 1,455 / 5.32% / 36.62%.
+     Ep40 minus ep36 is a wash: mean +194 [-187,575], median -27
+     [-420,362], P10 -27 [-166,100], <1000 +0.08pp [-0.80,0.96].  The final
+     checkpoint is therefore valid, but not demonstrably better than the
+     balanced late plateau.
+
+     High-LR ep40 beats strong32 by mean +706 [334,1,079] and median +427
+     [59,784], while its P10/failure deltas are unresolved.  It still trails
+     vh3 at 5k: mean -3,722 [-4,187,-3,261], median -2,664
+     [-3,085,-2,224], P10 -513 [-663,-365], <1000 +1.66pp
+     [+0.84,+2.46], >10k -11.84pp [-13.78,-9.92].  So 128ch has NOT caught
+     vh3 and infinite play is not established, but there is no observed
+     scratch-128 plateau: the old low-LR result was a recipe/pipeline failure
+     with optimization clearly a major factor, and scratch128 high-LR now
+     exceeds old scratch192 ep19 despite the width difference.  Exact credit
+     between LR/batch geometry and corrected D4 still requires the corrected
+     bs32768/lr3e-4 control.
+
+     Fixed turn-survival rates make the remaining indefinite-play gap clearer.
+     High-LR ep40 reaches turns 1k / 2k / 5k / 10k / 20k in 85.16% / 68.70% /
+     35.98% / 12.92% / 1.96% of games; vh3 reaches them in 89.88% / 76.70% /
+     47.66% / 22.06% / 5.26%.  The scratch recipe has learned meaningful
+     long-horizon reliability, but neither finite distribution supports an
+     "infinite" claim.  Future gates should report this survival curve in
+     addition to heavy-tailed score summaries.
+
+     Width remains scientifically open because the old scratch192 run used
+     lr=3e-4 AND the corrupt directional D4 views, whereas all three new 128
+     recipe arms use corrected D4.  Added `train_scratch192_lr3e3_colab.ipynb`:
+     identical R2 corpus/seed/batch/40-epoch lr=3e-3 schedule/objective and
+     corrected D4, only width changed, with wall-clock logging.  Compare it to
+     scratch128 both at equal optimizer steps/examples and equal wall time;
+     capacity evidence requires a tuned 128 envelope to flatten while 192
+     continues improving broadly, especially P5/P10/crisis failure.
+
+     **Operational verdict:** retain `small128_vh3` as the lineage champion;
+     the late high-LR scratch checkpoints are recipe/capacity references, not
+     promotions.  The next primary experiment is the lineage-pure capped play
+     + clean reanalyse + weighted all-data replay loop in `FLYWHEEL_PLAN.md`:
+     many independent
+     ~1k-turn games, broad anchors retained, explicit crisis/deep quotas and
+     per-game caps, all 30 clean search candidates, behavior/teacher actions
+     separated, corrected D4, update-rich training, frequent step checkpoints,
+     and floor-aware 5k promotion.  Old big-model data may be tested only as a
+     separately declared rehearsal arm.  The 43k disagreement slice remains a
+     diagnostic/judge set, never the training corpus.
+
+213. **Corrected high-LR 192 absorbs labels faster per update, but its early
+     advantage disappears at the owner's measured 2x wall-clock/inference
+     ratio; keep 128 as the flywheel actor pending the decisive e20/e40
+     comparison.** (2026-08-09)
+
+     `scratch192_lr3e3` epochs 1--5 are the intended control: 10b x 192ch,
+     bs32768, lr3e-3, corrected D4, 2,903 Adam steps/epoch.  Their 999-game
+     means are 248 / 1,631 / 2,798 / 4,133 / 5,097.  Epoch 5 distribution:
+     median 3,691 / P10 843 / P90 11,160 / P95 14,837 / <1000 12.5%.
+
+     Equal-update fixed-state audit at epoch 4 (50k R2 states, exact legal,
+     FP16): 192 clearly learns faster than 128 — target match 72.89% vs 69.79%,
+     legal NLL 0.797 vs 0.943; on danger>=.60, match 72.60% vs 67.72% and legal
+     NLL 0.857 vs 1.066.  This is width-dependent sample efficiency, not yet a
+     ceiling.
+
+     At approximately equal training time, 192e5 and 128e10 are functionally
+     identical: target match 73.69% vs 73.61%, legal NLL 0.762 vs 0.768, and
+     on their 11,351 action disagreements the recorded target favors 192 in
+     39.52% versus 128 in 39.15%.  Gameplay is also a screen-level wash:
+     192e5 minus 128e10 mean +359 [-43,+753], median +314 [-77,+710], P10 +7
+     [-110,+149], <1000 -0.10pp [-3.00,+2.80].
+
+     Inference throughput is the binding system cost because training is rare
+     and the flywheel spends most compute on selfplay/crisis/search.  Therefore
+     width/depth changes must be judged on a strength-versus-production-FP16
+     inference frontier, not equal epochs or parameter count.  The decisive
+     existing-run ladder is 192 epochs 10/15/20 versus 128 epochs 20/30/40.
+     If 192e20 does not beat 128e40 materially and broadly, stop widening the
+     actor.  Do not add residual blocks speculatively: first exhaust same-cost
+     levers (current-policy flywheel, clean/full-support targets, legal-support
+     training, and symmetry canonicalization).  A larger model may remain a
+     selective reanalysis/crisis teacher without paying its cost on every bulk
+     selfplay forward.
+
+214. **Started the first clean, current-lineage 128ch policy-iteration pilot;
+     the 8k-state end-to-end canary validated label separation and exact
+     mid-epoch resume, while exposing and fixing three latent integration
+     bugs before the multi-million-state run.** (2026-08-09)
+
+     The frozen pilot is declared in
+     `flywheel/vh3_iteration_1_pilot.json`: 3,000 noise-free MCTS@400 exploit
+     games, 750 exploratory MCTS@200 games with a separate noise-free
+     MCTS@400 label tree, and 500 greedy probes feeding noise-free crisis
+     replays (recovery@600/prevention@1600). Games remain independently capped
+     at 1,000 turns; expected fresh search data is 3.5--4.5M states, combined
+     during training with a deterministic 1M sample of the existing 19.6M
+     current-vh3 anchors. All generation is FP16, terminal-fixed, top-30,
+     full-root-record, and excludes big-model targets and reserved seeds.
+
+     Native generation now writes immutable `run_config.json` and
+     `generation_complete.json`, creates nested output directories, stores the
+     run ID/model/value/precision/full-record fields in every game, rejects
+     unknown CLI arguments, and remains atomic per game. Corpus construction
+     validates every file against the manifest and uses flushed disk-backed
+     arrays plus `progress.json`, so interruption resumes at the next file.
+     Base-policy annotation likewise resumes by inference batch and records
+     checkpoint/corpus identities. Training now has exact mid-epoch resume:
+     optimizer, scheduler, CPU/device RNG, deterministic epoch permutation,
+     next batch, and partial scalar/source diagnostics are atomically stored in
+     `latest.pt`.
+
+     Canary: four exploit plus four explore games all reached the 1,000-turn
+     cap, yielding 8,000/8,000 clean full-record rows and zero invalid targets.
+     Exploit behavior equaled its teacher on 100%; explore behavior/teacher
+     agreement was 21.7% in the first 15 temperature turns and 95.7%
+     thereafter, proving behavior and labels are genuinely separated. Root
+     top-share P10/P50/P90 was roughly .25/.39/.60 with all 30 candidates
+     retained. Exact FP16 all-legal annotation found 333/8,000 (4.16%) clean
+     teacher disagreements: 4.10% exploit and 4.23% explore. Only 98 rows
+     combined both disagreement and visit top-share >=.30, so the correction
+     signal is rare and often visit-close rather than a huge high-confidence
+     class.
+
+     This measurement explains the weak old warm starts quantitatively. With a
+     4:1 fresh-target/anchor mix and anchor weight .1, the plastic aggregate
+     arms use 16x original-view disagreement weight, putting edits near 40% of
+     effective loss while retaining every agreement/anchor row. Critically,
+     edit membership comes from the immutable original-view sidecar: online
+     disagreement rose to ~17% under D4 because vh3 is not equivariant, and
+     must remain a separate symmetry diagnostic rather than receiving the edit
+     dose.
+
+     Added the missing plastic objective: unconstrained hard/soft search CE on
+     rolling-search target trajectories plus full-distribution base KL only on
+     replay anchors. It supports both warm and same-architecture scratch init;
+     the matched basin test is bounded warm versus aggregate warm versus
+     aggregate scratch. Two tensor bugs found by the real smoke were fixed:
+     fp16 sparse probabilities are explicitly reconstructed into fp32 dense
+     targets, and `scatter_add_` prevents zero-valued padding at action 0 from
+     overwriting a genuine action-0 label. A deliberately interrupted MPS
+     scratch smoke resumed epoch 1 at batch 6 and reproduced batches 7--8's
+     loss/KL/gradient/NLL exactly before completing both epochs (RNG tensors
+     are now restored to CPU before PyTorch RNG setters).
+
+     The full exploit stream is now running under `caffeinate`. At 14
+     concurrent games it measured effective inference batch 55 and about
+     20.5k leaf evaluations/s, implying roughly 17 hours for its 3M states.
+     The exact restart/build/annotate/train/audit commands and gates are in
+     `flywheel/VH3_ITERATION_1_PILOT.md`.
+
+215. **High-LR 192 has pulled ahead at equal training wall-clock by epoch 12;
+     launch a clean 10b x 96ch third scaling point, while keeping parameter-
+     matched depth/width reshaping as a separate diagnostic.** (2026-08-09)
+
+     Owner's aggregate epoch-12 screen for `scratch192_lr3e3` reports
+     P1/P5/P10/P25/P50/P75/P90/P95 = 478/940/1453/3256/7253/14511/24372/31245.
+     At the measured 2x training-time ratio, the relevant 128ch comparator is
+     epoch 24: 443/898/1287/2534/5644/10301/16887/21210. Thus the 192ch model
+     is only modestly separated at the lower floor but about 29% ahead at the
+     median and 44--47% ahead at P90/P95. It already broadly matches the late
+     128ch epoch-40 screen (531/923/1530/3315/6785/14370/23371/30832). This
+     overturns the early equal-wall-clock wash, but remains a 999-game screen;
+     confirm epoch 12 at 5k and continue the 192 trajectory before declaring
+     a higher asymptote. Its 2x production-inference cost still controls actor
+     selection.
+
+     Added `train_scratch96_lr3e3_colab.ipynb`: 10 blocks x 96 channels,
+     unchanged 128ch policy head, 1.702M parameters, same corrected-D4 R2
+     corpus/seed/batch/lr/schedule/objective as the 128/192 high-LR controls.
+     It resumes from the last completed Drive epoch. The notebook's gate is
+     aggregate-only FP16: sparse epoch screens, then 5k only for the best
+     apparent plateau. The generator now accepts selected arm names and makes
+     block count explicit, avoiding rewrites of unrelated notebooks.
+
+     A parameter-matched 96ch model would be 18b x 96ch (3.032M params) versus
+     10b x 128ch (3.003M). This is scientifically useful only as a second
+     question: if 10b x 96 loses, does restoring parameter count via depth
+     restore strength? Equal parameters do not mean equal production cost:
+     18b x 96 has 39 convolution stages versus 23 for 10b x 128, narrower
+     kernels, and substantially more sequential BN/ReLU barriers. Measure
+     native FP16 latency at the effective MCTS batch rather than assuming it
+     is equal. Other near-parameter-matched shapes are 13b x 112ch (2.985M)
+     and 8b x 144ch (3.044M). Do not launch the shape sweep until the pure
+     10b x 96 width point shows which ambiguity is worth resolving.
+
+216. **Owner elected to run the exact parameter-matched deep/narrow control in
+     parallel: 18b x 96ch versus 10b x 96ch and 10b x 128ch.** (2026-08-09)
+
+     Added `train_scratch18b96_lr3e3_colab.ipynb`: 18 residual blocks, 96
+     channels, 3.032M parameters, otherwise exactly the corrected-D4 high-LR
+     scratch recipe (R2, seed 42, bs32768, lr3e-3, 40-epoch schedule, unchanged
+     policy head/objective). It has its own Drive lineage and completed-epoch
+     resume. This intentionally overrides entry 215's conservative sequencing
+     because independent Colab capacity is available and the result closes a
+     useful ambiguity while the 10b x 96 control runs.
+
+     Predeclared readout: 18b96 versus 10b96 isolates the effect of adding
+     sequential nonlinear computation at fixed width; 18b96 versus 10b128 is
+     nearly parameter-matched and tests depth/width substitution. If 18b96
+     restores 128-level broad performance, total representational computation
+     matters and depth can substitute for width. If it especially improves
+     P5/P10, crisis-stratum target fit, and long-turn survival, that supports
+     the owner's deeper-clearance hypothesis. If it remains near 10b96 while
+     10b128 wins, width/parallel feature rank is the likely bottleneck. If
+     training optimization is unstable or still rising at epoch 40, do not
+     mislabel that as a capacity ceiling; inspect fixed-state loss/gradient and
+     consider a depth-specific LR/schedule control. Gameplay comparisons remain
+     independent aggregate distributions, with 5k reserved for the best
+     apparent envelopes.
+
+     Even a gameplay win is not automatically an actor win: 18b96 has 39
+     sequential convolution stages versus 23 for 10b128. Measure native FP16
+     throughput at the flywheel's effective inference batch before promotion.
+
+217. **Epoch-5 architecture screen: parameter-matched 18b x 96ch already
+     beats 10b x 128ch broadly, while 10b x 192ch remains far ahead.**
+     (2026-08-09)
+
+     Owner's common aggregate screen, reported as
+     P1/P5/P10/P25/P50/P75/P90/P95:
+
+     - 10b96 (1.702M): 199/290/365/540/862/1366/2002/2547
+     - 10b128 (3.003M): 243/414/534/911/1721/3144/4965/5952
+     - 18b96 (3.032M): 269/459/644/1130/2150/3653/5967/7470
+     - 10b192 (6.710M): 336/601/843/1761/3691/7120/11160/14837
+
+     At identical data/steps/recipe, 18b96 beats parameter-matched 10b128 at
+     every percentile: about +11% at P1/P5, +21% at P10, +25% at the median,
+     and +20--26% at P90/P95. Against equal-width 10b96, adding eight blocks
+     gives +35% P1, +76% P10, +149% median, and roughly +193% P95. Architecture
+     shape therefore materially changes early absorption; parameter count
+     alone does not explain learning efficiency. Width still matters: 10b192
+     remains +31% at P10, +72% median, and roughly +99% P95 over 18b96.
+
+     This is not yet evidence specifically for deeper clearance reasoning. The
+     18b96 advantage is broad and relatively smaller at P1/P5 than at the
+     center/upper tail, consistent with generally faster policy learning. Raw
+     full-softmax validation loss is actively non-diagnostic here: e5 18b96
+     and 10b128 are nearly equal (4.491 vs 4.495), while much weaker 10b96 is
+     lower at 4.340. Use legal fixed-state match/NLL stratified by danger and
+     later survival/crisis distributions instead.
+
+     Do not spend a 5k gate on these still-moving epoch-5 models. Continue the
+     trajectories and screen sparse later epochs (roughly 8/12/18/24/30/36/40),
+     compare best envelopes, then run 5k on the credible finalists. Record
+     per-epoch wall time and benchmark native FP16 at effective MCTS batch ~55:
+     the deeper shape is an actor candidate only if its strength gain survives
+     its additional sequential-kernel latency.
+
+218. **The corrected 192ch curve continues beyond the tuned 128ch plateau:
+     epoch 17 is clearly stronger than the equal-wall-clock and late-128
+     envelopes, and is approaching vh3.** (2026-08-09)
+
+     Owner's aggregate `scratch192_lr3e3` epoch-17 screen reports
+     P1/P5/P10/P25/P50/P75/P90/P95 =
+     528/1132/1568/3962/8676/15960/26294/35211. Versus its own epoch 12 this
+     is broad continued improvement: +10% P1, +20% P5, +8% P10, +22% P25,
+     +20% median, +10% P75, +8% P90, and +13% P95. It has not merely reached
+     the 128 result in fewer epochs and stopped.
+
+     With 192 training measured at 2x the 128 wall time, epoch 17 corresponds
+     approximately to 128 epoch 34. Against the neighboring strong 128 epoch
+     35 screen, 192e17 is +17% median, +10--13% P90/P95, +5% P5, and -4% P10;
+     against final 128e40 it is +28% median, +11--14% P75/P90/P95, +23% P5,
+     and essentially tied at P1/P10. Thus the early equal-wall-clock wash has
+     decisively broken in 192's favor over most of the distribution. This is
+     the strongest width/capacity evidence so far for the fixed 10-block
+     scratch recipe.
+
+     It remains below the 5k vh3 reference by roughly 10% median, 15--16%
+     upper tail, and 20% P10, while P1/P5 are already close; this cross-sample-
+     size comparison is only directional. Screen epoch 20 as predeclared, then
+     take the better e17/e20 envelope to a 5k independent-distribution gate.
+     Do not infer a paired result from common numeric seeds. Raw validation
+     loss again moves the wrong way (4.526 at e12 to 4.576 at e17) while
+     gameplay improves, so it remains unsuitable for checkpoint selection.
+
+     Production conclusion is separate: 192 still costs 2x inference and is
+     not automatically the flywheel actor. It is now a credible stronger
+     teacher/reference. Whether a ~3M-parameter actor can recover the useful
+     depth through architecture rather than width is the purpose of the
+     running 18b x 96 control.
+
+219. **Queued the corrected high-LR 10b x 256ch upper scaling control; define
+     what would and would not constitute a capacity proof.** (2026-08-09)
+
+     Added `train_scratch256_lr3e3_colab.ipynb`: 10 blocks x 256 channels,
+     11.893M parameters, otherwise exactly the scratch96/128/192 R2 control
+     (seed 42, corrected D4, bs32768, lr3e-3, 40 epochs, unweighted objective,
+     unchanged 128ch policy head). It has a separate Drive lineage, completed-
+     epoch resume, sparse aggregate-only FP16 screens, and 5k finalist gates.
+     This is also exactly pillar3k's backbone architecture, so comparison to
+     scratch192 isolates upper-width scaling while comparison to pillar3k
+     exposes how much strength comes from data/iteration rather than nominal
+     architecture.
+
+     Expected readout: if 256 beats 192 at the same epochs, it demonstrates
+     continuing width-dependent sample efficiency. If its best late envelope
+     also beats a converged 192 envelope broadly, while the smaller envelopes
+     remain flat under adequate updates, that is strong capacity evidence for
+     the fixed 10-block representation. If 256 and 192 converge together,
+     corpus/target or recipe saturation is more likely. A weak/divergent 256
+     at lr3e-3 is not evidence against width until a width-appropriate LR
+     control is checked; the identical LR arm is deliberately first because it
+     is the clean comparison and already works for 128/192.
+
+     One R2 ladder cannot prove that a 128-class actor is intrinsically unable
+     to reach the goal. R2 contains mixed historical target eras, and the
+     running 18b96 result already shows that parameter arrangement changes
+     absorption at fixed size. The stronger closure standard is: (1) tuned
+     small-model envelopes demonstrably flatten; (2) larger widths continue to
+     lower exact legal training/heldout NLL and improve 5k gameplay broadly,
+     especially crisis/survival strata; (3) the ordering persists on a clean,
+     single-lineage, consistently reanalysed 3--6M-state corpus; and (4) close
+     architecture differences survive another training realization. Until
+     then call the result a capacity signal, not a definite impossibility
+     proof.
+
+     Actor selection remains a strength/FP16-production frontier. A 256 model
+     is expected to cost roughly 3--4x 128 inference and is primarily an upper
+     bound/teacher candidate unless its strength gain is exceptional.
+
+220. **The tuned 10b128 run has plateaued under its completed cosine, but
+     10b192 epoch 20 now exceeds vh3 and 18b96 remains a credible near-128-
+     latency actor; static scratch scaling still cannot answer whether either
+     small model can self-improve.** (2026-08-09)
+
+     The 128 plateau statement is deliberately narrow. On 5,000 games,
+     `scratch128_lr3e3` epoch 36 versus epoch 40 is a distributional wash:
+     mean 9,942 versus 10,136, median 6,978 versus 6,950, P10 1,482 versus
+     1,455, and `<1000` 5.24% versus 5.32%. Their fixed-state actions agree on
+     97.22% of rows and legal NLL only changes 0.635 to 0.632 while the
+     schedule reaches lr=3e-5. More tail epochs on the same decayed schedule
+     and R2 corpus are therefore low value. This is an optimization/data-run
+     plateau, not proof that 10b128 cannot move after a learning-rate restart
+     or fresh on-policy search targets.
+
+     `scratch192_lr3e3` epoch 20 completed a 5,000-game FP16 MPS gate:
+     mean 15,012 / median 10,578 / P5 1,239 / P10 2,059 / P90 33,550 /
+     P95 43,341 / `<1000` 3.52% / `>10000` 52.24%. Independent bootstrap
+     against `small128_vh3` gives mean +1,154 [+587,+1,706], median +962
+     [+482,+1,510], P90 +2,238 [+373,+4,056], and `>10000` +3.78pp
+     [+1.86,+5.66]. P10 +90 [-78,+279], `<1000` -0.14pp [-0.88,+0.58],
+     and turn-survival at 1k +0.70pp [-0.50,+1.88] remain unresolved; 2k/5k/
+     10k survival improves significantly by +2.02/+3.78/+3.38pp. Against
+     192e18 it improves mean +2,234 [+1,721,+2,754], median +1,604
+     [+1,072,+2,162], and P10 +382 [+200,+550]. Thus 192 is still learning
+     at e20 and establishes a higher fixed-10-block envelope than 128, although
+     its approximately 2x production inference cost keeps it a reference or
+     teacher rather than the default actor.
+
+     Fixed-state R2 fit is not a sufficient strength objective. From 192e18
+     to e20, all-state legal NLL improves 0.619 to 0.607 and match 77.80% to
+     78.02%, but the `danger>=.60` match is flat at 77.85% and NLL is
+     effectively flat/slightly worse (0.648 to 0.650). More strikingly, vh3
+     still matches 88.61% of the historical R2 labels with NLL 0.550 while
+     losing to 192e20 in gameplay. The old mixed-era labels reward imitation
+     of vh3's lineage, not every transferable ingredient of policy quality.
+     Do not select checkpoints or declare capacity solely from this loss.
+
+     `scratch18b96_lr3e3` is still moving at epoch 10: mean 6,295 / median
+     4,409 / P10 957 on the 999-game screen. Its turn survival at 1k/2k/5k
+     rises from 71.37%/43.24%/10.31% at e7 to 74.27%/52.95%/18.32% at e10;
+     it already resembles 10b128 epoch 18 rather than equal-epoch 128. On the
+     50k fixed audit it beats 128e10 (match 74.63% vs 73.97%, legal NLL 0.733
+     vs 0.753; danger NLL 0.808 vs 0.846), and on their 11,110 disagreements
+     the label favors 18b96 40.83% versus 128 37.87%. Its worst-score P10,
+     however, barely moves from 933 to 957. Continue sparse e15/e20/e30/e40
+     gates and take only its apparent late envelope to 5k; the present curve
+     makes a higher landing than 10b128 plausible, not proven. Native FP16
+     latency at effective MCTS batch 55 is 2.648ms versus 2.513ms for 10b128,
+     so a sustained strength win would improve the production frontier.
+
+     The decisive capacity question now moves to closed-loop attribution.
+     Scratch training only asks whether a model can absorb frozen historical
+     targets. A candidate proves self-improvement only if: its own frozen
+     search produces causally better actions under fixed-state common-random-
+     number rollouts; the same architecture absorbs those edits without broad
+     regression; a 5k independent gameplay distribution improves; and the
+     promoted model repeats the cycle. Search-win/student-fail implicates
+     capacity/objective/optimization; search-fail implicates the teacher/value
+     operator, not student width. The running vh3 iteration-1 clean pilot is
+     the first direct 128ch test. Use many independent ~1k-turn capped games
+     and staged 1k/2k/5k survival gates rather than uncapped play. Updated
+     `compare_score_distributions.py` to report independent-bootstrap turn-
+     survival deltas; its focused tests pass.
+
+221. **New architecture checkpoints strengthen 18b96 as the small-actor
+     candidate, expose a depth/width distribution-shape tradeoff, and show
+     192e22 improving old-target fit while gameplay regresses.** (2026-08-09)
+
+     Newly landed 18b96 epochs 11--14, 10b96 epochs 18--23, and 192 epochs
+     21--22 were exported to TorchScript with exact eager/trace agreement and
+     the legal golden probe. Gameplay remained aggregate-only FP16 MPS. Sparse
+     endpoint screens were used first; the only backfilled intermediate was
+     192e21, justified by the e22 endpoint regression. All statistical
+     comparisons independently resampled whole-game distributions and did not
+     pair matching numeric seed IDs.
+
+     **18b96 remains clearly unconverged.** Epoch 14 over 999 games reaches
+     mean 7,619 / median 5,260 / P10 1,072 / P90 16,838 / `<1000` 9.31% /
+     `>10000` 25.63%. Versus e10, independent bootstrap gives mean +1,324
+     [+692,+1,943], median +851 [+115,+1,544], P90 +2,151
+     [+538,+4,395], and `>10000` +7.11pp [+3.40,+10.71]. P10 +113
+     [-61,+267] and `<1000` -1.50pp [-4.10,+1.00] are directionally better
+     but unresolved. Fixed-state legal NLL improves 0.733 to 0.709 and
+     `danger>=.60` NLL 0.808 to 0.767; on e10/e14 disagreements the recorded
+     label favors e14 41.26% versus e10 37.36%. The earlier P10 stall was not
+     a plateau.
+
+     At roughly strength-matched endpoints, 18b96e14 and 10b128e24 have tied
+     mean score/lifetime (7,619/3,749 turns versus 7,589/3,735), but different
+     shapes. The deep/narrow model is worse at P10 and early survival (turn
+     >=1k 77.88% versus 81.58%; >=2k 57.26% versus 62.06%), while it is better
+     at very long survival (>=10k 7.01% versus 5.31%; >=20k 0.70% versus
+     0.10%). The 128 endpoint also fits old R2 labels better (legal NLL 0.671 /
+     danger NLL 0.737 versus 18b96's 0.709 / 0.767), despite tied gameplay
+     means. Treat this as a hypothesis, not an architectural proof: depth may
+     learn more transferable sustainable-play structure while width supplies
+     robust crisis feature rank and/or historical-label imitation. If the
+     crossing persists at late 5k gates, targeted crisis replay is the natural
+     complement to the low-latency 18b96 shape.
+
+     **10b96 is also still learning but remains far behind.** Epochs 17/20/23
+     means are 2,377/2,835/3,181 and medians 1,812/2,169/2,408. E17 to e23 is
+     broad: mean +804 [+597,+1,012], median +596 [+357,+806], P10 +89
+     [+23,+152], and `<1000` -6.71pp [-10.31,-3.20]. Fixed legal NLL improves
+     0.823 to 0.788 and danger NLL 0.929 to 0.894. Thus 96ch has not supplied a
+     capacity-ceiling point yet, but the enormous gap to same-width 18b96
+     confirms that sequential depth changes usable representation, not merely
+     parameter count.
+
+     **192 has a local gameplay peak/tradeoff around e20--21, not a declared
+     asymptote.** Epoch 21's 999 screen is mean 14,937 / median 9,830 / P10
+     2,046 / P90 35,662; every reported e20/e21 delta is unresolved. Epoch 22
+     is mean 13,557 / median 9,503 / P10 2,183 / P90 30,204. Versus e21 its
+     mean falls -1,381 [-2,614,-150], P90 -5,508 [-10,091,-1,000], and mean
+     lifetime -662 [-1,271,-74], while the lower floor remains unresolved.
+     Nevertheless e20 to e22 fixed-state legal NLL improves 0.607 to 0.596,
+     danger NLL 0.650 to 0.630, and on their disagreements the old target
+     favors e22 42.00% versus e20 39.37%. This is direct evidence that further
+     optimizing historical R2 targets can hurt gameplay. Retain e20 as the
+     5k-validated reference, skip an e22 5k gate, and continue sparse later
+     screens to detect recovery or a genuinely new envelope.
+
+     Operationally, continue 18b96 at approximately e18/e22/e28/e34/e40 and
+     use a 5k gate only near its apparent envelope, with floor and staged turn
+     survival primary. Continue 192 sparsely rather than chasing every local
+     epoch. None of these frozen-corpus curves answers self-improvement; the
+     clean vh3 play/reanalyse/train pilot remains the decisive closed-loop
+     experiment.
+
+222. **Completed scratch architecture envelopes: 18b96 surpasses vh3 at
+     near-128 inference cost, while 192e39 establishes a materially higher
+     crisis and long-play ceiling; the smallest model still needs a closed-
+     loop test.** (2026-08-10)
+
+     All remaining checkpoints landed: 10b96 and 18b96 through epoch 40,
+     10b192 through epoch 39 (no e40 supplied), and no 256 checkpoints. Sparse
+     late candidates were exported with exact eager/trace and legal-golden
+     agreement. To avoid spending almost all evaluation time extending games
+     which were already sustainable, the late sweep used a predeclared staged
+     gate: 5,000 independent games capped at 1,000 turns for early catastrophe
+     reliability, followed by ordinary full-length 999 screens and 5,000-game
+     gates only for apparent envelopes. All inference was FP16 MPS under
+     caffeinate; comparisons independently resampled complete game
+     distributions and never paired matching numeric seed IDs.
+
+     **The cap-1k trajectories cleanly separate the architectures:**
+
+     - 10b96 e28/e34/e40: 57.84% / 62.98% / 65.58% capped;
+     - 18b96 e18/e22/e26/e30/e34/e37/e40: 84.24% / 86.78% / 88.06% /
+       89.72% / 89.10% / 89.54% / 89.26%;
+     - 10b192 e25/e28/e31/e34/e37/e39: 90.74% / 90.42% / 91.64% /
+       91.48% / 91.96% / 92.72%.
+
+     Thus 10b96 was still improving at its endpoint, 18b96 reached a broad
+     early-hazard plateau around e30, and 192 continued improving to the last
+     available checkpoint. E39 minus e25 cap rate is +1.98pp
+     [+0.90,+3.08]; e39 minus the best-point 18b96e30 is +3.00pp
+     [+1.90,+4.10]. Width therefore buys real crisis reliability under this
+     frozen-corpus recipe, not merely a heavier upper tail.
+
+     **Full-length finalist distributions (5,000 games):**
+
+     - 18b96e30: mean 13,917 / median 9,926 / P5 1,172 / P10 1,927 /
+       P90 31,125 / `<1000` 3.90% / `>10000` 49.56%;
+     - 18b96e40: 14,766 / 10,384 / 1,099 / 1,873 / 33,982 / 4.16% / 51.52%;
+     - 192e39: 18,500 / 13,040 / 1,458 / 2,532 / 41,478 / 2.72% / 59.34%.
+
+     E30 is distributionally identical to vh3 on every reported metric:
+     mean +58 [-474,+575], median +310 [-155,+748], P10 -42
+     [-208,+156], 1k survival -0.16pp [-1.38,+1.02]. This is a from-scratch
+     model trained only on R2, not a warm-start promotion. E40 trades a tied
+     early floor for significantly more sustainable-play strength. Versus
+     vh3 it gains mean +907 [+363,+1,450], median +766 [+264,+1,257], P90
+     +2,669 [+563,+4,424], `>10000` +3.06pp [+1.10,+5.00], 5k survival
+     +2.90pp [+0.92,+4.88], and 10k survival +2.94pp [+1.32,+4.62]; P10 -97
+     [-279,+84] and 1k survival -0.52pp [-1.72,+0.68] are unresolved. From
+     e30 to e40, mean and 10k/20k survival improve significantly while the
+     early floor remains tied. The 18b96 architecture therefore had not
+     globally plateaued—only its historical-data early-hazard channel had.
+
+     E40 is broadly tied with the old 192e20 envelope despite near-128
+     inference cost. The exceptions favor 192e20 at the crisis floor: P10
+     -188 [-394,-2] and 1k survival -1.22pp [-2.38,-0.08] for 18b96e40;
+     means, medians, upper tails, and longer survival are unresolved. This is
+     the key parameter-shape result: 18b96 (3.032M parameters, measured only
+     ~5% slower than 10b128 at MCTS batch 55) recovers nearly all of a 6.71M-
+     parameter 10b192e20 policy and decisively exceeds parameter-matched
+     10b128e40.
+
+     192 nevertheless keeps scaling. E39 versus e20 improves mean +3,488
+     [+2,836,+4,096], median +2,462 [+1,848,+3,179], P10 +474
+     [+245,+674], `<1000` -0.80pp [-1.52,-0.16], and turn survival at
+     1k/2k/5k/10k/20k by +2.14/+4.20/+7.24/+8.26/+4.32pp, all significant.
+     Against 18b96e40, e39 gains mean +3,734 [+3,098,+4,403], median +2,658
+     [+2,083,+3,390], P10 +661 [+418,+875], `<1000` -1.44pp
+     [-2.14,-0.70], and 1k/2k/5k/10k/20k survival by
+     +3.36/+5.78/+8.12/+8.70/+4.20pp. The user's production measurement of
+     roughly 2x inference remains decisive: 192 is the stronger reference and
+     potential selective teacher, not automatically the bulk actor.
+
+     Fixed-state audits agree on continued absorption but also delimit what
+     old-target fit means. From 18b96e30 to e40, legal NLL improves 0.618 to
+     0.605 and danger NLL 0.670 to 0.657 while cap-1k reliability is flat;
+     actions already agree 94.72%. From 192e31 to e39, legal NLL improves
+     0.568 to 0.555 and danger NLL 0.602 to 0.583 while both reliability and
+     full gameplay improve. Thus 18b96's remaining early hazard may be either
+     representational capacity or a missing crisis-target recipe; the frozen
+     R2 run cannot distinguish them.
+
+     **Capacity verdict:** a roughly 3M-parameter/128-cost model is plainly
+     sufficient to catch and exceed the previous vh3 champion. The old
+     10b128 stall was substantially architecture/recipe dependent, not proof
+     that the client budget was too small. The evidence does not yet show that
+     18b96 can drive catastrophe hazard toward zero: about 10.6% of games still
+     fail before 1,000 turns, versus 7.3% for 192e39. The smallest credible
+     actor is now 18b96; 192 is the positive capacity control. Test 18b96 with
+     clean on-policy crisis corrections before adding an intermediate model or
+     declaring its floor plateau intrinsic.
+
+     The clean vh3 exploit stream completed all 3,000 capped games. Started
+     the separately declared 750-game explore-200/clean-label-400 stream under
+     caffeinate after the evaluation sweep; it remains lineage-pure and does
+     not mix 18b96/192/big-model games into the vh3 pilot. Crisis generation
+     follows only after explore completes.
+
+223. **The canonical exploit bank passes its generation audit and shows a
+     significant search-policy reliability gain; exact actor-root edits are
+     now preserved instead of being reconstructed at another batch shape.**
+     (2026-08-10)
+
+     The completed vh3 exploit stream contains 3,000/3,000 independent games
+     and 2,928,729 states. Streaming validation found 100% clean-label and
+     full-search-record coverage, no malformed targets, all 30 root candidates
+     on essentially every row, and broad turn coverage: 282,760 states remain
+     in turns 900--999. The 400-simulation search policy capped 2,816/3,000
+     games at 1,000 turns (93.87%). Against the independent 5,000-game greedy
+     vh3 distribution's 4,494/5,000 turn-1k survival (89.88%), the difference
+     is +3.99pp with independent Bernoulli-bootstrap 95% interval
+     [+2.79,+5.17]. This does not pair numeric seeds or claim every recorded
+     edit is causal; it establishes that the declared search policy is a
+     stronger aggregate actor, consistent with the earlier fixed-state
+     common-random-number crisis result.
+
+     Search edits are sparse but no longer tiny. Because native `LegalPriors`
+     selects the top 30 from the complete legal support before PUCT, the
+     maximum recorded clean prior is the actor's exact legal greedy action at
+     that root. The clean visit winner differs on 118,031/2,928,729 rows
+     (4.03%). The rate is 4.02% in capped-game rows, 4.33% across failed-game
+     rows, and 6.98% in the final 20 turns of failed games. Thus failure tails
+     are enriched, but contain only 257 such edits in this broad exploit bank;
+     dedicated crisis mining remains necessary. Only 6.06% of visit winners
+     are also maximum-Q among visited candidates (16.14% in failed tails), so
+     raw root Q argmax is not promoted as a target without calibration.
+
+     The corpus previously retained `cand_prior` but omitted its exact argmax,
+     then `add_fulllegal_mask` recomputed the base action with a different MPS
+     batch shape. Added `base_move` to schema 4 tensors, stored both recorded-
+     root and deployment-recomputed disagreement masks in the sidecar, and
+     made training/checkpoint audits select `recorded_disagree` explicitly.
+     The original recomputation remains an inference-parity diagnostic. The
+     focused data/trainer suite passes 47 tests (4 device-specific skips). A
+     restart-safe continuation now waits for explore completion, audits it
+     alone, runs and validates a separate eight-probe crisis canary, and only
+     on success starts full crisis generation, the full audit, corpus build,
+     FP16 annotation, and target audit; it does not start training
+     automatically. Corrected the manifest's leaf-value provenance as well:
+     this iteration uses the historically successful 27-feature geometry
+     evaluator, including its naturally low terminal-board value; the neural
+     terminal-survival-zero path is not active, and the teacher recipe was not
+     changed after exploit generation.
+
+224. **The explore stream and an independent crisis canary pass; native MPS
+     requests now fail closed, and the full crisis mine is underway.**
+     (2026-08-11)
+
+     The 750-game explore-200/clean-label-400 stream completed with 724,807
+     valid full-record rows, for 3,653,536 accepted fresh rows together with
+     exploit. It capped 697/750 games at 1,000 turns (92.93%), covered every
+     100-turn band broadly, and had zero malformed targets. The clean teacher
+     differed from the actor-root prior argmax on 28,007 rows (3.86%); failed
+     final-20 rows were enriched to 5.94%, while remaining a small stratum.
+
+     The first eight-probe crisis canary exposed an operational safety bug:
+     LibTorch reported MPS unavailable in the restricted process and all five
+     native inference/search tools silently converted an explicit `mps`
+     request to CPU. The generated game records correctly said fp32, so the
+     manifest audit rejected every file before corpus assembly. Preserved
+     those non-training artifacts under
+     `crisis_cpu_fp32_rejected_20260811`; none entered the pilot. Explicit MPS
+     requests now terminate before model loading or output creation when MPS
+     is unavailable, unsupported device names are rejected, and run-config
+     precision is derived from the actual execution device rather than only
+     the fp32 flag.
+
+     The same PyTorch build sees one available MPS device outside sandbox
+     isolation. A fresh canary therefore ran under caffeinate as verified MPS
+     fp16: eight probes produced seven deaths, one 10k-turn capped probe, 14
+     recovery/prevention games, and 5,662 full clean rows in 468 seconds. Its
+     strict audit found zero errors or invalid targets. This opened the gate
+     for the resumable 500-probe production mine. Probe phase produced 402
+     deaths and 98 capped probes, hence 804 deep replay tasks. A separate
+     fail-fast continuation waits for the completion marker, then performs the
+     full generation audit, resumable corpus build, corpus audit, MPS-fp16
+     base-policy annotation, and 50k-row target audit. It intentionally does
+     not start training.
+
+225. **The vh3 bounded-target branch is closed; 18b96e40 becomes the first
+     fully on-policy compact flywheel actor, and its iteration-1 pilot passes
+     the end-to-end gate.** (2026-08-14)
+
+     Exact dense-target diagnostics separated optimization failure from target
+     failure. Low-dose hard vh3 edits did not approach their bounded optimum;
+     16x exposure repaired much of that absorption problem but gameplay was a
+     wash. The strongest mixed arm (`alpha=0.5`, `eta=0.1`, 8x whole-row edit
+     exposure) reduced exact all/edit/high-confidence/crisis target residuals
+     by roughly 8--10% and retained 98.61% of anchor actions. Its independent
+     5k cap-1k result still failed promotion: cap-rate delta -0.70pp
+     [-1.90,+0.50], mean -5 [-16,+7], and P10 -79 [-169,+42]. Thus a student
+     can measurably fit this intended vh3 target without improving the game;
+     more optimizer tuning on the same stale labels is not the next step.
+
+     The compact actor handoff uses `scratch18b96_lr3e3` epoch 40. Against vh3
+     its independent 5k cap-1k distribution is unresolved (cap -0.58pp
+     [-1.78,+0.60], mean -7 [-19,+4]), while full play is significantly
+     stronger: mean +907 [+358,+1,456], median +766 [+275,+1,246], P90 +2,669
+     [+522,+4,423], and `>10000` +3.06pp [+1.12,+4.98]. This preserves the
+     near-128 inference cost while moving the actor to the strongest available
+     small-model basin.
+
+     The disjoint e40 canary generated four exploit games, four explore games,
+     and eight crisis probes. Strict audit accepted all 20 files and 11,219
+     rows with zero invalid actions and 100% clean/full root records. Six
+     probes died and two reached 10,000 turns. Search recovery survived 500
+     turns in only 1/6 deaths, but prevention survived in 5/6; failed tails had
+     about 6.45% actor/search corrections. This is the first direct on-policy
+     reason to prioritize a correction class for this actor.
+
+     Generated a separate actor-native preservation bank from 5,000 fresh
+     greedy games capped at 1,000 turns, under MPS FP16 and caffeinate. The
+     distribution capped 4,464/5,000 (89.28%) with mean score 1,934. Sparse
+     broad plus dense tail recording produced 1,798,692 states; the built
+     tensor has exactly 5,000 source-game groups and 4.99% validation rows.
+     Extended the corpus provenance gate from a hard-coded `small128` string to
+     an explicit `small_policy` family plus an enforced generator prefix and
+     base-checkpoint SHA-256. Foreign-model sources remain rejected. Native
+     `final_score/final_turns/died` anchor metadata now maps to the same tensor
+     diagnostics as MCTS `score/turns/capped`; the focused builder suite passes
+     7/7 tests.
+
+     Full target generation is now active from the immutable
+     `18b96e40_iteration_1_pilot.json`: 3,000 exploit games, 750
+     behavior/clean-label-separated explore games, and 500 crisis probes, all
+     on disjoint non-reserved seeds. The exploit stream started at about 20.2k
+     leaf evaluations/s with effective batch 55 and writes one atomic game per
+     completion, so it is safe to interrupt and rerun. No vh3, 192/256-channel,
+     or Pillar game labels enter this lineage. After audit/build/annotation,
+     the two live hypotheses are a crisis-focused bounded update and aggregate
+     rolling-search distillation; only independent 5k distributions can
+     promote either branch.
+
+     The 3,000-game exploit tranche subsequently completed and passed strict
+     standalone audit: 2,945,600 clean/full-record states, 3,000 unique seeds,
+     and zero errors or invalid actions. Search capped 2,851/3,000 games
+     (95.03%), versus 4,464/5,000 (89.28%) for the independent greedy anchor
+     distribution: +5.75pp with independent Bernoulli-bootstrap 95% interval
+     [+4.59,+6.91]. Exact actor-root edits were 2.32% overall and 6.04% in
+     failed final-20 states. The rolling search operator therefore works
+     aggregate-wise on the new actor even though broad single-edit utility is
+     not assumed. The sequential launcher handed off to the explore stream as
+     intended; crisis remains queued behind it on the same single MPS job.
+
+226. **The first fully on-policy 18b96 student improves the development floor;
+     the complete 3.9M-state corpus is now being replicated at a matched update
+     dose.** (2026-08-16)
+
+     Iteration-1 generation finished cleanly. Strict combined audit accepted
+     all 4,528 files and 3,903,888 full-root rows: 2,945,600 exploit, 723,704
+     behavior/teacher-separated explore, and 234,584 crisis. There were no
+     invalid targets, incomplete records, mixed run settings, or provenance
+     failures. The resumable tensor build retained a 5.03% group-held-out
+     split. Exact MPS-fp16 base annotation found 94,491 recorded actor-root
+     edits (2.42%) and agreed with those recorded base actions on 99.88% of
+     rows. The separate actor-native anchor tensor contains 1,798,692 states
+     from exactly 5,000 games.
+
+     Search itself supplies a real improvement operator. The 3,000 exploit
+     games capped at 95.03%, versus 89.28% for an independent 5,000-game
+     greedy actor distribution: +5.75pp [+4.59,+6.91]. The 500 crisis probes
+     produced 389 deaths and 111 10k caps. Their distinct-state replays
+     survived 500 turns in 335/389 prevention trajectories versus 104/389
+     recovery trajectories; this prioritizes the prevention class without
+     misreporting it as a paired single-action estimate.
+
+     Four 200k-target/50k-anchor smokes separated objective mechanics. The
+     bounded crisis update remained safe but adopted only about 5% of exact
+     edits where its analytic target implied roughly 53%, so it was underfit.
+     Removing color permutation increased drift for both bounded and aggregate
+     objectives. Aggregate hard-teacher epoch 1 with color augmentation was
+     the safest meaningful candidate: target/anchor retention 96.32%/96.25%,
+     target legal KL 0.0259, and 32.3% true-edit adoption.
+
+     On the standard 5,000-game cap-1k development distribution, this student
+     improved mean +14 [+2,+25], `<1000` -0.86pp [-1.60,-0.12], mean turns
+     +7 [+1,+12], and cap rate +1.22pp [+0.04,+2.40]. A matching 100k-turn
+     evaluation retained the floor gain without a detected long-tail cost:
+     P10 +209 [+7,+384], mean +297 [-260,+854], median +244 [-274,+784], and
+     survival to 2,000 turns +1.70pp [+0.08,+3.32]. A previously unused
+     non-reserved cap-1k bank was neutral but directionally consistent: mean
+     +7 [-4,+18], `<1000` -0.58pp [-1.30,+0.12], and no significant regression.
+     All comparisons independently resample the two distributions; matching
+     numeric seeds are never treated as paired games.
+
+     This is evidence against an already-reached 18b96 capacity ceiling, but
+     the selected 200k smoke is not the iteration-2 actor. A one-pass
+     replication is active on all 3,903,888 targets plus a deterministic 1M
+     anchor sample. Batch 8,192 and LR 2.14e-6 produce 575 steps, matching the
+     integrated update dose of the successful 123-step, LR-1e-5 smoke while
+     greatly increasing state coverage. It is MPS-fp16, caffeinated,
+     color-augmented, frozen-BN, deployment-legal, and resumable every 25
+     steps. The reserved 1,100,000--1,119,999 final bank remains untouched.
+
+227. **The apparent iteration-1 student win does not replicate; causal mining
+     isolates crisis edits, whose current corpus is too correlated to test
+     capacity.** (2026-08-16)
+
+     Entry 226 recorded the then-current development result and active
+     replication. That replication is now complete, and it retracts the
+     promotion interpretation. The full 3.9M-target/1M-anchor dose-matched run,
+     a lower-dose intermediate checkpoint, and an exact smoke replica on a
+     second deterministic data sample were all neutral on previously unused
+     5,000-game distributions. An edit-only bounded arm independently repeated
+     the pattern: mean +15 [+3,+26] on the development bank, then mean -3
+     [-14,+8] and cap -0.74pp [-1.88,+0.42] on a fresh bank. These are
+     checkpoint-selection effects, not reproducible policy improvement. No
+     student is promoted and the final seed bank remains untouched.
+
+     Common-random-number fixed-state judging then separated target classes.
+     Broad exploit edits were neutral, and an explore pilot did not repeat on
+     fresh rollout RNG. A fresh 64-repetition rejudge of 353 crisis edits did
+     repeat: death-within-200 uplift +1.24pp [+0.68,+1.84] and teacher-turn
+     delta +2.18 [+1.25,+3.21]. Recovery edits were strongest locally at
+     +2.02pp [+1.06,+3.04] and +3.81 turns [+2.07,+5.74]. This is valid paired
+     evidence because the state, first-action alternatives, and rollout random
+     numbers are held fixed; whole-game evals remain independent-distribution
+     comparisons even when numeric seeds match.
+
+     The exact crisis mask contains 9,603 edits, only 9,094 in the training
+     split. A stratified low-LR 18b96 update includes every training edit and
+     reduces its exact target residual from 0.01264 to 0.01119, but held-out
+     residual is unchanged/slightly worse (0.01169 to 0.01175). High LR
+     oversteps even in-sample. Therefore the immediate result is neither
+     "18b96 has enough capacity" nor "18b96 lacks capacity": it can absorb
+     some seen corrections, while 500 source probes provide too little
+     independent crisis diversity to generalize. The next experiment expands
+     same-actor crisis mining on disjoint seeds to tens of thousands of edits,
+     repeats the exact train/held-out audit, and only then uses a larger model
+     as a positive-control student on the identical target if the gap remains.
+
+228. **Fivefold crisis-edit expansion replicates causal search advantage, but
+     neither 18b96 nor a 192ch positive control generalizes sparse one-hot
+     corrections.** (2026-08-17)
+
+     Ran 2,000 new scratch18b96-e40 probes on disjoint seeds
+     2,210,000--2,211,999. The caffeinated native MPS-fp16 job finished 1,478
+     deaths and 2,956 recovery/prevention replays in 16.46 hours at about
+     20.5k leaf evaluations/s. Strict audit accepted 905,645 clean full-record
+     states and rejected nothing. The expansion contains 36,717 actor/search
+     edits (28,282 prevention, 8,435 recovery); combined with the pilot this is
+     1,140,229 states, 46,320 edits, and 1,867 independent death seeds. The
+     group split keeps recovery/prevention siblings together and reserves
+     57,161 rows from 95 source seeds with no leakage.
+
+     The new labels independently pass the causal gate. On 600 held-out edits
+     with 64 common-random-number repetitions per arm and horizon 200, the
+     search action improves death rate by +1.31pp [+0.82,+1.81] and lifetime by
+     +2.26 turns [+1.46,+3.12]. Prevention is +0.84pp [+0.35,+1.36]; recovery
+     is +1.77pp [+0.94,+2.64]. This nearly reproduces the prior 353-state
+     fresh-RNG result. The class is real, but individual labels are noisy:
+     89.3% are ties under the predeclared 8pp verdict threshold, 8.5% genuine,
+     and 2.2% phantom.
+
+     A full 18b96 bounded pass used every 1.14M crisis state and every 1.80M
+     anchor, `eta=.05`, hard teacher, 8x edit exposure, LR 1e-5, frozen BN,
+     legal-support loss, and no D4. The endpoint is functionally safe (about
+     99.2--99.3% retention and legal KL 3.4--3.6e-4). It reduces exact
+     training-edit target KL only 0.00399 -> 0.00392, while every held-out
+     checkpoint is worse than base: best step 500 is 0.00420 and endpoint
+     0.00430 versus base 0.00381. It was correctly stopped before gameplay.
+
+     The promised width control used scratch192-e39 as its own frozen base on
+     the identical immutable edit mask. Because 192 and 18b96 differ on 15.6%
+     of these states, this is an absorption control, not a direct lineage
+     comparison. It fits training edits more readily (0.00921 -> 0.00875) but
+     likewise worsens every held-out dose (best 0.00869, endpoint 0.00915,
+     base 0.00841). Width buys plasticity but does not solve generalization;
+     this result rejects a simple 18b96-capacity diagnosis for the current
+     target.
+
+     NEXT: replace equal one-hot labels with causal magnitude. Judge several
+     thousand edits at cheaper R16/R32, validate any confidence/recovery
+     routing on a fresh fixed-state set, and train teacher-vs-base pairwise
+     margins or an advantage/value head weighted by rollout uplift, while
+     retaining broad frozen-base KL anchors. Do not evaluate gameplay until a
+     held-out source-seed target/ranking gate passes. The final 20k evaluation
+     seeds remain untouched.
+
+229. **Course correction: the sparse-edit branch was a diagnostic, not the
+     promised aggregate selfplay+crisis Colab run.** (2026-08-17)
+
+     The crisis expansion and width control answered a narrow question: equal
+     one-hot isolated edits do not generalize, even when the student is wider.
+     They did not execute the other live flywheel hypothesis—coordinated
+     distillation of complete rolling-search trajectories. Treating the local
+     proxy gate as the main path was therefore a planning drift.
+
+     Built the non-overlapping current-lineage aggregate tensor from all four
+     intended sources: 2,945,600 exploit states, 723,704 explore states,
+     234,584 pilot-crisis states, and 905,645 expansion-crisis states. The
+     resulting `flywheel_18b96e40_i1_mixed_targets.pt` has exactly 4,809,533
+     rows, 5,617 source-seed groups, 239,905 group-held-out validation rows,
+     and zero duplicate crisis tranche. All 4,809,533 roots retain clean
+     top-30 visits/priors/Qs; all labels and generators are scratch18b96-e40.
+     The separate preservation tensor contributes 1,798,692 states from 5,000
+     actor-native games.
+
+     The primary notebook is now
+     `train_flywheel_18b96e40_i1_colab.ipynb`. It warm-starts 18b96 epoch 40,
+     pools every target and anchor within batches, uses hard clean-search CE
+     plus frozen-base KL, weights exploit/explore/pilot-crisis/new-crisis
+     `1/1/2/2`, keeps exact legal support, FP16 forward/FP32 loss, frozen BN,
+     color augmentation, and no D4 in the first arm. Batch 4,096 for 12 epochs
+     supplies about 18k updates, with exact mid-epoch resume and per-epoch
+     model/functional diagnostics. Promotion still requires independent
+     5,000-game distributions; matching numeric seeds are never paired game
+     evidence, and the reserved final 20k seeds remain untouched.
+
+230. **The first full mixed selfplay+crisis epoch is a clean gameplay wash;
+     checkpoint granularity, not the KL guard, was wrong.** (2026-08-17)
+
+     Colab completed 1,533 updates over all training-split mixed targets and
+     anchors. The epoch-1 student retained 96.3%/96.2% of target/anchor
+     actions, reached target/anchor legal KL 0.0676/0.0680, adopted 28.8% of
+     audited target edits, and introduced no new deployment BN nonfinites. It
+     stopped solely because the predeclared maximum legal KL was 0.05. The
+     checkpoint is a valid high-dose model, not a failed job.
+
+     Exact MPS-fp16 export passed with zero traced/eager difference. On fresh
+     seeds 1,000,000--1,004,999 at a 1,000-turn cap, the untouched e40 base was
+     mean 1,940, median 2,015, P10 1,938, `<1000` 3.78%, and cap rate 90.14%;
+     epoch 1 was mean 1,943, median 2,017, P10 1,943, `<1000` 3.48%, and cap
+     rate 90.16%. Independent 10k-bootstrap differences were mean +3
+     [-9,+14], median +2 [+0,+4], P10 +5 [-59,+50], `<1000` -0.30pp
+     [-1.04,+0.44], and cap +0.02pp [-1.16,+1.20]. This is a wash, not a
+     promotion or regression.
+
+     The notebook's mistake was `SAVE_STEPS=0`: the earliest dose after base
+     was a complete 1,533-step epoch. Resumed epochs now save model-only
+     checkpoints every 250 global steps. Keep the existing exact-resume state;
+     use intermediate dose screens before deciding whether another endpoint
+     deserves a 5k distribution.
+
+231. **Label-level teacher measurement + corpus r3_tail: the student is saturated
+     on teacher-trajectory imitation; the 10x teacher (vh2 + pv_vh2 value head,
+     corrected PUCT) relabels the student's OWN death windows with 3-4x the
+     judge-confirmed corrections of any prior teacher. From-scratch retrain
+     queued.** (2026-09-15/16)
+
+     New tooling: `inference_cpp/src/mcts_relabel.cc` (re-search STORED states
+     under any search controls -> CSV; 0.022 s/state @400 sims, 14 thr, MPS),
+     `--virtual-mean`/`--q-range-floor` added to `mcts_selfplay`, scripts
+     `export_relabel_states.py`, `relabel_compare.py`, `relabel_judge_summary.py`,
+     `audit_student_match.py`, `export_disagreement_judge.py`,
+     `export_greedy_tail_states.py`, `export_relabel_flips_judge.py`,
+     `build_r3_tail_corpus.py`, `compare_uncapped_csv.py`, `selfplay_dir_stats.py`.
+
+     Facts read from data/code (not from earlier entries):
+     - r2_bulk composition (`r2_bulk_strata.npz`): 56.3% crisis-replay rows,
+       37.8% capped-1k selfplay, 5.9% of the 80 uncapped vh2+MCTS games
+       (`rows_of_game` applied its 10k/game cap; 84% of those moves unused).
+     - `data/selfplay_iter5` (vh2 + pv_vh2, q2.0, 400 sims, UNCAPPED, n=80):
+       median score 99,144 / P25 37,786 / P75 158,790 / max 486,992 vs vh2
+       greedy P50 9,475 -> the search teacher is ~10x the greedy student.
+     - 18b96e40 argmax-match vs its own r2_bulk targets (200k rows, MPS):
+       99.6% (top-share>=.8), 98.5% (.6-.8), 93-95% (.4-.6), 85.8% (.3-.4),
+       68.2% (<.3, = 48% of rows). Disagreements on the 10x teacher's own
+       trajectories judged (student continuation, R64 H200): 4 genuine / 2
+       phantom of 700 flat rows = noise. => saturated; no LR/batch/epoch fix.
+     - Teachers relabelling 5,980 stored 18b96e40 roots (2,980 final-20 of
+       dying cap-1k games + 3,000 broad), judged R64/H200 student continuation,
+       excess = genuine - phantom per 1k tail roots: own FV search VL-1 c2.5
+       q1 @400 = 3.7; virtual-mean = 5.4; vm c1.5 q1 = 14.1; vm c1.5 q2 =
+       18.5; @800 sims VL-1 = 8.1; pillar3k greedy = 22.5 (62 phantoms of
+       2,033 flips); **vh2+pv_vh2 vm c1.5 q2 @400 = 55.0** (201 genuine / 31
+       phantom of 2,141 flips). Broad states: noise for every teacher at H200.
+     - Throughput: greedy eval 30 games/s; MCTS 19.6k leaf evals/s (18b96) /
+       11.4k (pillar3k 256ch) -> 5k MCTS games @400 sims cap-1k ~= 27 h.
+
+     Corpus r3_tail (`data/r3_tail.pt`, 12,712,930 rows, gz 741,873,349 B):
+       eval --model scratch18b96_lr3e3_ckpts_epoch_40_ts.pt --seed-start 2600000
+         --seed-end 2601000 --record-dir data/greedy_18b96e40_uncapped_2600k
+         --record-every 1 --record-tail 200   (uncapped greedy; mean 15,164 /
+         P50 10,683 / P10 1,961 / <1000 3.6%; 6 min)
+       export_greedy_tail_states.py --tail 200 -> 199,935 states
+       mcts_relabel --model vh2_policy_ts.pt --value-module pv_vh2_ts.pt
+         --sims 400 --c-puct 1.5 --q-weight 2.0 --virtual-mean --keep 15
+         (70 min) -> 64,483 flips (32.3%; 40.9% in the last 20 turns)
+       judge of 1,200 stratified flips (R64 H200): excess 13.7% (<20 turns to
+         death), 18.0% (20-60), 6.0% (60-120), 0.7% (120-200).
+       build_r3_tail_corpus.py: r2_bulk (mask 0) + relabelled rows, pack()
+         semantics (top-5 by visits, teacher argmax forced), mask = (1 flip /
+         .25 agree) x (1.0 <60, 0.5 <120, 0.25 <200 turns-to-end); mask sum 54,330.
+     Run: `train_scratch18b96_r3tail_colab.ipynb` = scratch18b96_lr3e3 recipe
+     exactly (18b96, bs32768, lr3e-3, 40 ep, T1, dw0, blend0 = hard CE) with
+     --disagree-gamma 20 (new rows ~8.5% of gradient mass). From scratch, not
+     warm-start: every corrections-only warm start of the small model collapsed.
+     GATE (policy-only, uncapped): greedy 1k on seeds 2,600,000-2,600,999 vs
+     18b96e40's 15,164 / 10,683 on the same bank, +20% mean AND P50 with
+     independent-bootstrap CI clear; 5k only to confirm a pass.
+
+232. **r3_tail (hard CE, gamma 20) REGRESSES the from-scratch curve by a constant
+     ~30% at ep4 and ep6; diagnosis = 80% of the weighted flip rows are ties
+     forced into single argmax labels. Fix = set-valued loss on relabelled rows;
+     run scratch18b96_r3tail_set queued.** (2026-09-16)
+
+     Gate bank 2,600,000-2,600,999, uncapped greedy (EVAL.md):
+       baseline ep4 2,368 / P50 1,816 / <1k 26.1%   r3tail ep4 1,684 / 1,254 / 39.2%  (-28.9% [-35,-22])
+       baseline ep6 4,058 / P50 3,000 / <1k 15.7%   r3tail ep6 2,818 / 2,104 / 23.0%  (-30.6% [-37,-24])
+     Absorption audit (scripts/audit_match_by_mask.py, ep4): bulk rows 71.5% vs
+     72.8% (baseline); relabelled flips <60t: 34.7% vs 23.1% (chance) -> the
+     weighting installs the labels at ~no bulk cost, and play still drops.
+     Judge on 1,200 stratified flips (R64 H200, student continuation): excess
+     13.7% (<20 turns to death) / 18.0% (20-60) / 6.0% (60-120) / 0.7% (120-200),
+     i.e. ~80% of weighted flips are ties. Hard CE at 21x weight forces a
+     coin-flip argmax on each tie against the student's consistent policy.
+     Run stopped by owner after ep6.
+
+     Fix (train_path_b.py, tests added): `--set-loss-on-mask --set-tau T`: rows
+     with disagree_mask>0 use -log P(set), set = teacher candidates with target
+     mass >= T*max; other rows unchanged. On r3_tail's relabelled rows at T=0.5:
+     set size mean 2.11, 40% singletons; true contradictions (student move
+     outside set) 12.3% of rows vs 32.3% hard-CE flips. M5 smoke (60k rows,
+     2 epochs) passes end to end. Code tarball colorlines_pillar3d_v6.tar.gz
+     (same file set as v5 + patched train_path_b). Notebook
+     `train_scratch18b96_r3tail_set_colab.ipynb` = r3tail recipe + set loss.
+     Same gate: +20% mean and P50 vs 15,164 / 10,683 on the 2.6M bank.
+
+233. **Smoking gun: per-move judging is blind to what decides game length; the
+     search's advantage is non-decomposable per move; hard-argmax targets on
+     near-ties are noise and concentration amplifies it. Self-search with the
+     linear leaf is only ~1.7x; survival head for 18b96 being trained.** (2026-09-17)
+
+     - r3tail_set (set-valued loss, gamma 20) ep3: 1,440 / P50 1,075 vs baseline
+       ep3 1,936 / 1,483 (-25.6%) on the gate bank (EVAL.md). Hazard by turn
+       bucket (scripts/hazard_curve.py): 1.4-1.6x in EVERY bucket for all three
+       r3tail pairs -> global damage.
+     - set-ep3 vs base-ep3 moves on 2,208 held-out disagreements (pilot roots):
+       H200 base-cont 99 vs 106; set-cont 107 vs 122; H1500 R32 n=300: 0.915 vs
+       0.909. Single moves of the 25%-worse model are indistinguishable.
+     - 10x-teacher flat-row moves vs student moves on the teacher's own games,
+       H1500 R32 n=300, student continuation: died 0.178 vs 0.178 [+-0.01],
+       mean turns 1,370 vs 1,372 -> single teacher moves carry ZERO value.
+     - Arms (1M r2_bulk rows from scratch, 4ep bs4096 lr1e-3, 500-game evals):
+       A control 318 / P50 282; C +16k RANDOM bulk rows at r3_tail weights
+       287 / 267 (-10%); B +16k relabelled rows 256 / 239 (-19.5%).
+       Decisiveness equal across arms (0.62/0.62/0.61) -> flattening is NOT
+       the mechanism; concentration on hard-argmax noise (-10%) + foreign-policy
+       content (-10%) is.
+     - Self-search of 18b96e40 (FV leaf, virtual mean, c1.5, q1, 400 sims,
+       cap 3000, 60 games, seeds 2,800,000+): 80% reach 3,000 turns vs greedy
+       69% (P10 turns 2,306 vs 974) -> hazard ratio ~0.6, ~1.7x teacher. The
+       10x (vh2) came with the NN survival head at q=2.
+     - Built value_targets_18b96e40.pt (2,081,728 states from the 1,000 recorded
+       uncapped greedy games, every 4th state + full final 300 turns, no
+       censoring). Training value_head_18b96e40 (frozen backbone, 5 ep) ->
+       pv_18b96e40_ts.pt -> 60 self-search games with the head at q=2, cap 3k.
+     Scripts: hazard_curve.py, style_density.py, policy_decisiveness.py,
+     export_model_pair_judge.py, build_gun_arms.py, build_value_targets_from_records.py.
+
+234. **Self-search WITH a survival head is a strong self-teacher; flywheel-2
+     corpus generation launched; soft-target pilot.** (2026-09-17)
+
+     value_head_18b96e40 (3,268 params, frozen 18b96e40 backbone, 5 ep on
+     value_targets_18b96e40.pt = 2.08M states of its own uncapped games): inner-val
+     BCE 0.116 (per-H 0.022/0.051/0.121/0.271). Fused pv_18b96e40_ts.pt.
+     Self-search, same 60 seeds (2,800,000+), cap 3,000, virtual mean, c1.5, 400 sims:
+       greedy                : 69% reach 3,000 turns, P10 974 turns
+       FV leaf, q=1          : 78% (score P10 4,653)
+       NN head, q=2          : 92% (score P10 6,001)  -> hazard ratio ~0.22 vs greedy
+     Visit distributions (scripts/visit_stats.py), corrected search: top-share
+     mean 0.69 (old VL/c2.5 pilot 0.49), <0.3 on 1.9% of moves (old 8.6%),
+     visit argmax != prior argmax 8% (old 2.2%), 30 cands saved.
+     LAUNCHED: fw2_18b96e40_pv_cap3k = 300 games, seeds 2,810,000-2,810,299,
+     same search, full record (~11 h M5). Corpus recipe (build_soft_visit_corpus.py):
+     EVERY move, top-5 renormalized visits as SOFT targets, no argmax forcing, no
+     per-game cap. Training: warm-start e40, soft CE, gentle LR, few epochs, on M5;
+     gate greedy 1k on 2,600,000-2,600,999 (+20%) and the hazard curve.
+     Pilot on the 60 head games (fw2_pilot60_soft.pt) first.
+
+235. **Flywheel-2 recipe pilots on the 60 head-search games (175k rows, warm-start
+     e40): soft visit targets regress 7-12%; sharpened (T0.7 dw3) is a wash.**
+     (2026-09-17)  Gate bank 2,600,000-2,600,999 (baseline e40 15,164 / P50 10,683 /
+     <1k 3.6%), all in EVAL.md:
+       soft T1.0 lr1e-5 (scheduler quirk: --warmup-epochs 0 keeps LinearLR at 0.1x)
+         ep1/2: 13,886 / 13,746 mean; soft T0.7: 14,103 / 13,386
+       soft T1.0 lr1e-4 warmup1 bs2048 ep2/3/4: 13,648 / 14,103 / 13,496 (P50 9.6-9.9k)
+       soft T0.7 dw3 ep2/3: 14,687 / P50 11,038 ; 14,144 / 10,338  (wash)
+     Targets' top-share 0.69 < policy top-1 0.80 -> soft CE de-peaks; sharpening
+     removes the regression but adds nothing. Visit argmax != prior on 8% of moves.
+     Hard-CE (chosen-move) arm queued. Corpus generation fw2 (300 games) continues.
+
+236. **Why own-search distillation washes: two thirds of the search's overrides
+     are single-search noise; the distilled student churns more good moves than
+     it gains.** (2026-09-22, Opus 5.5)
+     Held-out 60 head-search games (58,243 states, every 3rd move):
+       search overrides base prior on 8.1% (mostly occupancy <50).
+       fw2_300_hardCE ep2/ep3 adopt 22.8% of overrides (e40: 4.8%) but keep only
+       96.1-96.4% of agree rows (e40: 99.3%): agreement with search 91.6 -> 90.2%.
+     Search self-consistency (new `--seed-salt` in MctsConfig/mcts_relabel;
+     default 0 = unchanged; mcts_controls_test PASS): 4,697 override + 2,000
+     agree states re-searched x3 independently @400 sims: override reproduced
+     36.9%, prior picked 53.8%; agree rows 94.5%; pairwise agreement 57.7% vs
+     92.3%; per-state reproductions 0/1/2/3 = 1,684/1,406/1,023/584; normalized
+     Q(choice)-Q(prior) P50 +0.014. Robust (>=2/3) 34%, noise (0/3) 36%.
+     hardCE ep3 adopts 33% robust / 12% noise / keeps 96% agree.
+     Recorded stats cannot filter (scripts/override_predictors.py): best
+     precision ~55%; recorded Q margin anti-predictive.
+     RUNNING: 3x re-search of all 71k overrides in the 300-game corpus ->
+     fw2_300_denoise.pt (override kept iff >=2/3 reproduce, else target=prior)
+     and fw2_300_self.pt (all targets = prior; fine-tuning-tax control) -> same
+     hard-CE recipe -> held-out absorption + gate evals (scripts/denoise_chain.sh
+     in session scratchpad; builder scripts/build_denoised_corpus.py).
+
+237. **SYMMETRY: the committed training code has broken D4 augmentation (the whole
+     256ch line and vh1-vh3 trained on it); averaging the small net over the 8 exact
+     board symmetries at inference = +50% with NO training.** (2026-09-22, Opus 5.5)
+
+     D4 ground truth (scripts/verify_d4_transform.py: dataset LUT transform vs the
+     observation rebuilt from the actually transformed board+preview, 300 r2_bulk
+     states): committed HEAD (ac5a50b) and the June 24 code (1284624, pillar3k era)
+     rotate the 9x9 planes but NOT the line-direction channels 13-16 -> wrong in 6 of
+     8 views on 95-100% of states. Working tree and both Aug code tarballs (used by
+     18b96 and every scratch run since Aug 9): exact on all 8 views, obs and policy.
+     The fix is still UNCOMMITTED.
+     Symmetry consistency (scripts/d4_consistency.py, 5,980 pilot states): all 8
+     views same argmax: 18b96e40 60.5%, pillar3k ep22 41.5%, pillar3b ep20 38.3%;
+     TTA-8 changes the move on 13.2 / 20.0 / 23.2%.
+     BN FP16 overflow: 18b96e40 backbone_bn ch 9/48 running_var 100,447/70,628
+     (> 65,504 -> +inf in FP16); pillar3k/3b max 16k-18k (no overflow). FP32 eval of
+     e40 = 14,732 vs FP16 15,164 (-2.9% [-10.5,+5.2], wash). export_ts.py now applies
+     an exact reparameterization (fp16_safe_batchnorm; 486 ch rescaled; FP32 logits
+     max diff 0.0015, argmax identical); e40 re-exported = 14,296.
+     eval --tta 8 (new): greedy on the mean of the 8 views' logits mapped back to the
+     original frame (observation built natively from each transformed board).
+     Gate bank 2,600,000-2,600,999, uncapped, same export:
+       e40 plain  14,296 / P50  9,944 / P10 1,806 / <1k 4.4%
+       e40 TTA-8  21,436 / P50 14,776 / P10 2,449 / <1k 3.3%   +49.9% [+39.7,+61.4]
+     Hazard 3000-5000 bucket 26.8% -> 15.4%. On held-out search states TTA-8 adopts
+     34% of the search's robust overrides (single view 8%).
+     Also measured today: interpolation of fw2_300_hardCE into e40 (a=.2/.3/.5):
+     14,118 / 14,213 / 14,649 = wash. Trust-region imitation chain paused.
+     NEXT (running): symmetric self-distillation — record 400 TTA-8 games (seeds
+     2,900,000+), target = e40's own 8-view-averaged policy, correct D4 aug, frozen BN,
+     warm e40 -> single-pass model; audit symmetry + gate.
+
+238. **Anomaly hunt (after the D4 bug): pipeline verified against ground truth;
+     one structural defect found — the policy head's "which ball" axis is 81
+     absolute-position readouts.** (2026-09-22, Opus 5.5)
+     Verified CLEAN: training obs builder (_build_obs_core) == reference
+     build_observation on 20k r2_bulk states (all 18 channels); C++ Game::BuildObs +
+     LegalMask (new tool build/obs_dump) == reference on 30k states incl. 10k student
+     near-death boards (occupancy up to 80); stored r2_bulk target argmax legal on
+     20k/20k; BN eval-mode vs train-mode argmax agreement 96.6% (target match 78.2 vs
+     78.0); game rules (path reachability, 5+ clears, spawn clears, displaced spawns)
+     match CL98; every input group is used (zeroing changes argmax 32-88%); r2_bulk has
+     0 duplicate positions even up to symmetry (scripts/label_symmetry_audit.py, hash
+     unit-tested); preview-ball ORDER is harmless (99.4% consistent); C++ TTA ==
+     Python TTA 99.9%. All top-k>1 call sites of _legal_priors_jit (ASCENDING order)
+     audited: handled correctly (my build_tta_corpus stat line was wrong, targets fine).
+     Color relabeling consistency: 90.8% per relabel, 79.1% all-8 (vs D4 80.9 / 60.5).
+     STRUCTURAL DEFECT: the policy head emits, at each destination cell, 81 logits
+     indexed by ABSOLUTE source position (1x1 conv) -> the "which ball" axis shares no
+     weights across positions or rotations. When rotated views disagree, it is a
+     different ball to the same destination 36.5% of the time vs same ball to a
+     different destination 17.0% (pillar3k: 46.7% vs 13.1%) (scripts/d4_src_dst.py).
+     Added PolicyNet(head='pair'): logit(s,d) = u(s).w(d)/sqrt(k) + a(s) + b(d) from
+     shared 1x1 convs (exactly permutation-equivariant; tests/test_model_pair_head.py);
+     train_path_b --policy-head pair --pair-dim; loaders infer the head from keys; the
+     C++ engine needs no change (same 6561 output).
+     Small A/B queued (1M rows, identical to smoking-gun arm A = 318 / P50 282).
+
+239. **Every warm-start fine-tune of e40 loses 10-18%, including one on its OWN moves;
+     the +50% is an ensemble effect (canonical single-pass = baseline). From-scratch
+     "born-again" runs on 8-view-averaged labels prepared for Colab.** (2026-09-23, Opus 5.5)
+     Gate bank 2,600,000-2,600,999 (e40 re-export baseline 14,296 / P50 9,944), all in EVAL.md:
+       canonical inference (eval --canon, D4 x color canonical form)      14,018  (-1.9%)
+       sym1 soft 8-view targets, 360 TTA games (1.0M rows) ep2/ep4       12,509 / 13,009
+       symhard (hard targets, same corpus) ep1/ep2/ep4                   13,575 / 13,537 / 12,339
+       symcanon (canonical corpus + eval --canon) ep1/ep2/ep4            13,949 / 13,319 / 12,642
+       r2tta_tta (ALL 12.5M r2_bulk rows relabeled, hard) ep1/ep2        12,609 / 12,329
+       r2tta_hybrid (orig label if top-share>=0.4) ep1/ep2               12,281 / 12,793
+       r2self (targets = e40's OWN view-0 move, D4 aug) ep1/ep2          12,202 / 11,692
+       checkpoint average e33-e40 / + BN re-estimate                     14,762 / 13,834
+     Students adopt ~24% of the 8-view overrides but change ~2.3% of already-agreed
+     moves (scripts/tta_adoption.py); symmetry barely improves (all-8-agree 68->71%).
+     r2self uses view-0 targets under D4 aug (non-equivariant), so clean controls without
+     augmentation are running (C1 bs4096 lr5e-5, C2 bs32768 lr3e-5).
+     Tools: alphatrain/canonical.py + inference_cpp/src/canonical.h (C++ == Python on 30k
+     states), eval --canon / --tta 8, relabel_tta_tensor.py (GPU, 12.5M rows in 46 min, ==
+     native TTA 1000/1000), build_tta_r2_corpus.py, build_canonical_corpus.py,
+     average_checkpoints.py. Trainer: warmup-0 LR bug FIXED (+test); --legal-mask-loss
+     (+test); PolicyNet head 'pair2' (geometry-gated, exactly D4-equivariant; +test).
+     Colab package: colorlines_pillar3d_v7.tar.gz (1,267,609 B), r2_bulk_tta8_tta.pt.gz
+     (650,115,072 B), notebooks train_scratch18b96_tta_colab.ipynb (abs head, born-again)
+     and train_scratch18b96_pair2_tta_colab.ipynb (pair2 head + legal-mask loss).
+
+240. **Fine-tuning damage is LR-driven drift, not the targets: e40 on its OWN moves (no aug, frozen
+     BN, hard CE, 1 epoch of r2_bulk) loses 9.6% at bs4096/lr5e-5, 5.0% at bs16384/lr2e-5, 0% at
+     bs16384/lr5e-6.** (2026-09-23)
+       self_noD4_C1  bs4096  lr5e-5   12,921 / P50 9,093
+       self_noD4_C2b bs16384 lr2e-5   13,580 / P50 9,745
+       self_noD4_C3  bs16384 lr5e-6   14,350 / P50 10,378   (baseline 14,296 / 9,944)
+     (bs32768 run died, likely MPS memory; bs16384 epochs took 3.0-3.4 h on the M5 vs 37 min at
+     bs4096 — large batches are ~5x slower per sample locally.) e40 sits in a sharp optimum; any
+     fine-tune above ~5e-6 perturbs decisions more than it teaches. Running: gentle fine-tune toward
+     the 8-view-averaged moves, bs4096 lr2.5e-6 (same Adam noise per epoch as C3, 2x the directed
+     movement), 3 epochs.
+
+241. **ARCHITECTURE WIN: from-scratch 18b96 with the geometry-aware PAIR2 policy head +
+     legal-mask loss plays +44% over e40 in a single pass at epoch 27 of 40, and captures most of
+     the 8-view ensemble gain.** (2026-09-23, Colab runs by the owner; evals on the M5)
+     Notebook train_scratch18b96_pair2_tta_colab.ipynb (tarball v7, r2_bulk_tta8_tta.pt.gz = r2_bulk
+     relabeled with e40's 8-view-averaged move; e40 recipe bs32768 lr3e-3 warmup 1, 40 ep, hard CE,
+     --policy-head pair2 --pair-dim 64 --legal-mask-loss). Gate bank 2,600,000-2,600,999, single pass:
+       epoch   original run   old head + averaged labels   PAIR2 + mask + averaged labels
+         18        9,280              7,113                     18,029 / P50 12,478
+         23       10,463                -                       19,464 / P50 13,868 / <1k 1.9%
+         27       12,437             10,361                     20,642 / P50 14,014 / <1k 2.9%
+       e40 (original, finished) 14,296 / P50 9,944.
+     8-view averaging: e40 14,296 -> 21,436 (+50%); PAIR2 e23 19,464 -> 21,681 (+11%) — one pass of the
+     new head ~= eight of the old. Symmetry (all 8 views agree, 5,980 states): e40 60.5%, old head +
+     averaged labels e27 65.0%, PAIR2 e23 70.4%.
+     Averaged labels alone HURT the old head (-17% at e27): the win is the head (+ mask).
+     Running (Colab): the PAIR2 winner to epoch 40; attribution arm without the mask
+     (train_scratch18b96_pair2_nomask_tta_colab.ipynb); labels arm on the ORIGINAL r2_bulk labels
+     (train_scratch18b96_pair2_orig_colab.ipynb). Old-head born-again run stopped (dead branch).
+
+242. **NEW BEST: PAIR2 head + legal-mask loss on the ORIGINAL r2_bulk labels = 25,190 single pass
+     at EPOCH 7 (P50 18,234, P10 2,722, <1k 2.2%).** (2026-09-23, Colab by the owner)
+     train_scratch18b96_pair2_orig_colab.ipynb (tarball v7, r2_bulk.pt; e40 recipe; checkpoint args
+     verified: r2_bulk.pt, head pair2, legal_mask_loss True). Gate bank, single pass, epoch 7:
+       original run (old head)                        4,898 / P50 3,715 / <1k 11.6%
+       PAIR2, no mask, 8-view-averaged labels        14,753 / P50 10,150 / <1k 3.5%
+       PAIR2 + mask, ORIGINAL labels                 25,190 / P50 18,234 / <1k 2.2%
+     vs e40 (finished old head) 14,296 and its 8-view average 21,436; the averaged-label PAIR2 run
+     reaches 20,436-21,413 at epochs 32-34. The 8-view-averaged labels hurt BOTH heads; the head +
+     mask on the original labels is the new line. Mask share still open (winner's ep7 missing; compare
+     the no-mask arm's later epochs with the winner's ep18/23/27).
+
+243. **The small model was never capacity-limited — the old policy head capped it at ~15k. PAIR2 +
+     legal mask on the ORIGINAL labels = 40,154 single pass at epoch 33 (2.8x e40, same 3M 18b96).**
+     (2026-09-24) Gate bank 2,600,000-2,600,999, single pass (mean / P50 / P10 / <1k):
+       run \ epoch             7        18        23        27        33-35         40
+       original (old head)   4,898     9,280    10,463    12,437         -        15,164 (e40)
+       PAIR2+mask, ORIG     25,190    30,615    36,450      -       40,154 (e33)   pending
+                             P50 18,234 / 21,164 / 24,135 / 28,817; P10 5,669 and <1k 0.7% at e33
+       PAIR2+mask, TTA lab     -      18,029    19,464    20,642    21,413 (e34)   19,916
+       PAIR2 no mask, TTA   14,753    17,745    18,110      -       18,850 (e35)     -
+       old head, TTA lab       -       7,113       -      10,361         -            -
+     Attribution: head ~2.5x (PAIR2 no-mask vs old head, same labels, ep18); mask +2%/+7%/+14%
+     (ep18/23/34, same labels); labels: 8-view-averaged e40 labels cap students at ~21k (= the
+     teacher's own strength) while the original search-teacher labels are absorbed to 40k+.
+     Pillar3k (256ch, 11.9M params) greedy reference: 43,390.
+
+244. **Final epoch 40: PAIR2 + mask on ORIGINAL labels = 41,938 / P50 28,442 / P10 4,552 / <1k 0.9%
+     (plateau: e33 40,154). New small-model actor A1 = scratch18b96_pair2_orig_ckpts_epoch_40.**
+     (2026-09-24) Mask attribution at e40: PAIR2 no-mask (averaged labels) 19,425 vs with mask 19,916
+     (+2.5%, noise; +2..14% across epochs) — the head carries the win, the mask is a small bonus.
+     e33 8-view average 47,622 (+19% over single) -> residual backbone asymmetry.
+     Law observed: a PAIR2 student reaches its label source's strength (averaged-e40 labels 21.4k ->
+     student ~21k), so the next gain must come from stronger labels: A1's own search.

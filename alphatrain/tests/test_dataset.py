@@ -109,6 +109,14 @@ class TestDihedralAugmentation:
         assert np.all(obs_lut == np.arange(81))
         assert np.all(pol_lut == np.arange(NUM_MOVES))
 
+    def test_color_only_augmentation_keeps_repeat_factor(self, tmp_path):
+        path = _make_fake_tensor_file(tmp_path, n_states=2)
+        ds = TensorDatasetGPU(
+            path, augment=False, color_augment=True, augment_factor=8,
+            device='cpu')
+        assert len(ds) == 16
+        assert ds.augment_factor == 8
+
     def test_rotation_is_valid_permutation(self):
         from alphatrain.dataset import _OBS_LUTS
         for t in range(8):
@@ -120,6 +128,181 @@ class TestDihedralAugmentation:
         for t in range(8):
             lut = _POL_LUTS[t]
             assert len(set(lut)) == NUM_MOVES, f"Transform {t} has duplicates"
+
+    def test_observation_transform_matches_rebuilt_rotated_board(self):
+        """Spatial and directional feature transforms must both be exact."""
+        from alphatrain.dataset import (
+            _LINE_INV_LUTS, _OBS_INV_LUTS, _OBS_LUTS,
+            _transform_observation,
+        )
+        from alphatrain.observation import build_observation
+
+        board = np.zeros((9, 9), dtype=np.int8)
+        board[1, 1:4] = 1
+        board[3:6, 7] = 2
+        board[5, 2] = board[6, 3] = board[7, 4] = 3
+        board[2, 6] = board[3, 5] = board[4, 4] = 4
+        next_r = np.array([0, 4, 8], dtype=np.int64)
+        next_c = np.array([8, 1, 0], dtype=np.int64)
+        next_color = np.array([5, 6, 7], dtype=np.int64)
+        original = torch.from_numpy(build_observation(
+            board, next_r, next_c, next_color, 3)).unsqueeze(0)
+
+        for t in range(8):
+            transformed_board = board.reshape(-1)[
+                _OBS_INV_LUTS[t]].reshape(9, 9)
+            next_flat = _OBS_LUTS[t][next_r * 9 + next_c]
+            expected = torch.from_numpy(build_observation(
+                transformed_board, next_flat // 9, next_flat % 9,
+                next_color, 3)).unsqueeze(0)
+            actual = _transform_observation(
+                original, torch.as_tensor(_OBS_INV_LUTS[t]),
+                torch.as_tensor(_LINE_INV_LUTS[t]))
+            assert torch.equal(actual, expected), f"transform {t}"
+
+    def test_flywheel_behavior_matches_dense_policy_transform(
+            self, tmp_path, monkeypatch):
+        """Scalar behavior and its one-hot policy must use one transform."""
+        path = _make_fake_tensor_file(tmp_path, n_states=1)
+        data = torch.load(path, weights_only=True)
+        old_action = 100
+        data['pol_indices'][0].zero_()
+        data['pol_values'][0].zero_()
+        data['pol_indices'][0, 0] = old_action
+        data['pol_values'][0, 0] = 1.0
+        data['behavior_move'] = torch.tensor([old_action])
+        data['teacher_move'] = torch.tensor([old_action])
+        data['target_weight'] = torch.tensor([1.0])
+        data['source_id'] = torch.tensor([2], dtype=torch.int16)
+        data['split'] = torch.tensor([0], dtype=torch.uint8)
+        torch.save(data, path)
+
+        from alphatrain.dataset import _BACKING_CACHE, _POL_LUTS
+        _BACKING_CACHE.clear()
+        ds = TensorDatasetGPU(path, augment=True, color_augment=False,
+                              augment_factor=1, device='cpu')
+        ds.return_flywheel = True
+
+        def fixed_transform(*args, **kwargs):
+            return torch.tensor([1], dtype=kwargs.get('dtype', torch.long),
+                                device=kwargs.get('device', 'cpu'))
+
+        monkeypatch.setattr(torch, 'randint', fixed_transform)
+        _, policy, weight, behavior, teacher, source = ds.collate([0])
+        expected = int(_POL_LUTS[1][old_action])
+        assert int(policy.argmax(1)[0]) == expected
+        assert int(behavior[0]) == expected
+        assert int(teacher[0]) == expected
+        assert weight.tolist() == [1.0]
+        assert source.tolist() == [2]
+
+    def test_fp16_sparse_policy_reconstructs_float32_dense_target(
+            self, tmp_path):
+        path = _make_fake_tensor_file(tmp_path, n_states=2)
+        data = torch.load(path, weights_only=True)
+        data['pol_values'] = data['pol_values'].half()
+        torch.save(data, path)
+        from alphatrain.dataset import _BACKING_CACHE
+        _BACKING_CACHE.clear()
+        ds = TensorDatasetGPU(
+            path, augment=False, color_augment=False, device='cpu')
+        _, policy = ds.collate([0, 1])
+        assert policy.dtype == torch.float32
+        torch.testing.assert_close(policy.sum(1), torch.ones(2))
+
+    def test_flywheel_can_return_original_view_disagreement(self, tmp_path):
+        path = _make_fake_tensor_file(tmp_path, n_states=2)
+        data = torch.load(path, weights_only=True)
+        data['behavior_move'] = torch.tensor([1, 2])
+        data['teacher_move'] = torch.tensor([3, 4])
+        data['target_weight'] = torch.ones(2)
+        data['source_id'] = torch.zeros(2, dtype=torch.int16)
+        data['split'] = torch.zeros(2, dtype=torch.uint8)
+        torch.save(data, path)
+        from alphatrain.dataset import _BACKING_CACHE
+        _BACKING_CACHE.clear()
+        ds = TensorDatasetGPU(
+            path, augment=False, color_augment=False, device='cpu')
+        ds.return_flywheel = True
+        ds.flywheel_disagree = torch.tensor([True, False])
+        batch = ds.collate([0, 1])
+        assert len(batch) == 7
+        assert batch[-1].tolist() == [True, False]
+
+    def test_gumbel_dense_fields_use_same_transform_as_observation(
+            self, tmp_path, monkeypatch):
+        """The legacy completed-Q path must obey old->new LUT semantics."""
+        path = _make_fake_tensor_file(tmp_path, n_states=1)
+        data = torch.load(path, weights_only=True)
+        data.update({
+            'cand_idx': torch.tensor([[100, 200, 300]]),
+            'cand_visit': torch.tensor([[40.0, 30.0, 20.0]]),
+            'cand_prior': torch.tensor([[0.0, -0.4, -0.8]]),
+            'cand_q': torch.tensor([[0.2, 0.1, 0.0]]),
+            'cand_nnz': torch.tensor([3]),
+            'root_value': torch.tensor([0.1]),
+        })
+        torch.save(data, path)
+
+        from alphatrain.dataset import (
+            _BACKING_CACHE, _LINE_INV_LUTS, _OBS_INV_LUTS,
+            _POL_INV_LUTS, _transform_observation, GumbelDatasetGPU,
+        )
+        _BACKING_CACHE.clear()
+        plain = GumbelDatasetGPU(
+            path, augment=False, color_augment=False,
+            augment_factor=1, device='cpu')
+        plain_obs, plain_target, plain_prior, plain_sup, _ = plain.collate([0])
+
+        augmented = GumbelDatasetGPU(
+            path, augment=True, color_augment=False,
+            augment_factor=1, device='cpu')
+
+        def fixed_transform(*args, **kwargs):
+            return torch.tensor([1], dtype=kwargs.get('dtype', torch.long),
+                                device=kwargs.get('device', 'cpu'))
+
+        monkeypatch.setattr(torch, 'randint', fixed_transform)
+        obs, target, prior, support, _ = augmented.collate([0])
+        obs_inv = torch.as_tensor(_OBS_INV_LUTS[1])
+        pol_inv = torch.as_tensor(_POL_INV_LUTS[1])
+        expected_obs = _transform_observation(
+            plain_obs, obs_inv, torch.as_tensor(_LINE_INV_LUTS[1]))
+        assert torch.equal(obs, expected_obs)
+        assert torch.equal(target, plain_target[:, pol_inv])
+        assert torch.equal(prior, plain_prior[:, pol_inv])
+        assert torch.equal(support, plain_sup[:, pol_inv])
+
+
+class TestGpuObservationParity:
+    def test_winding_component_matches_cpu_observation(self, tmp_path):
+        path = _make_fake_tensor_file(tmp_path, n_states=1)
+        data = torch.load(path, weights_only=True)
+        board = np.ones((9, 9), dtype=np.int8)
+        board[0, :] = 0
+        board[1, 8] = 0
+        board[2, :] = 0
+        board[3, 0] = 0
+        board[4, :] = 0
+        board[5, 8] = 0
+        board[6, :] = 0
+        board[7, 0] = 0
+        board[8, :] = 0
+        data['boards'][0] = torch.from_numpy(board)
+        data['n_next'][0] = 0
+        torch.save(data, path)
+
+        from alphatrain.dataset import _BACKING_CACHE
+        from alphatrain.observation import build_observation
+        _BACKING_CACHE.clear()
+        ds = TensorDatasetGPU(path, augment=False, color_augment=False,
+                              device='cpu')
+        actual, _ = ds.collate([0])
+        expected = build_observation(
+            board, np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), 0)
+        np.testing.assert_allclose(actual[0].numpy(), expected,
+                                   rtol=0, atol=1e-7)
 
 
 def _make_fake_tensor_file(tmp_path, n_states=8, device='cpu'):
@@ -200,7 +383,7 @@ class TestColorPermutationAugmentation:
         from alphatrain.dataset import _BACKING_CACHE
         _BACKING_CACHE.clear()
         ds = TensorDatasetGPU(path, augment=False, color_augment=True,
-                               device='cpu')
+                              augment_factor=1, device='cpu')
         torch.manual_seed(0)
         obs, policy = ds.collate(list(range(8)))
         # Sum over channels 0-6 should equal occupancy = (board != 0).sum()
@@ -222,7 +405,7 @@ class TestColorPermutationAugmentation:
         ds_noaug = TensorDatasetGPU(path, augment=False, color_augment=False,
                                       device='cpu')
         ds_color = TensorDatasetGPU(path, augment=False, color_augment=True,
-                                      device='cpu')
+                                    augment_factor=1, device='cpu')
         # Run multiple times with different RNG; policy targets should still
         # match across the two datasets (color perm doesn't touch policy).
         torch.manual_seed(0)
@@ -240,7 +423,7 @@ class TestColorPermutationAugmentation:
         ds_noaug = TensorDatasetGPU(path, augment=False, color_augment=False,
                                       device='cpu')
         ds_color = TensorDatasetGPU(path, augment=False, color_augment=True,
-                                      device='cpu')
+                                    augment_factor=1, device='cpu')
         torch.manual_seed(0)
         obs_color, _ = ds_color.collate(list(range(8)))
         obs_noaug, _ = ds_noaug.collate(list(range(8)))
@@ -265,7 +448,7 @@ class TestColorPermutationAugmentation:
         from alphatrain.dataset import _BACKING_CACHE
         _BACKING_CACHE.clear()
         ds_color = TensorDatasetGPU(path, augment=False, color_augment=True,
-                                      device='cpu')
+                                    augment_factor=1, device='cpu')
         ds_noaug = TensorDatasetGPU(path, augment=False, color_augment=False,
                                       device='cpu')
         torch.manual_seed(0)
@@ -326,7 +509,7 @@ class TestColorPermutationAugmentation:
         from alphatrain.dataset import _BACKING_CACHE
         _BACKING_CACHE.clear()
         ds = TensorDatasetGPU(p, augment=False, color_augment=True,
-                                device='cpu')
+                              augment_factor=1, device='cpu')
         torch.manual_seed(123)
         obs, _ = ds.collate(list(range(n_states)))
         # For each sample, infer the new color from channel index where (0,0)

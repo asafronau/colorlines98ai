@@ -23,6 +23,23 @@ from alphatrain.evaluate import load_model
 from alphatrain import value_head as vh
 
 
+def head_output_to_scalar(out, head_type, target_type):
+    """Apply the same head-output semantics used by MCTS inference."""
+    if head_type == 'spatial' or out.shape[-1] == 1:
+        return out.squeeze(-1)
+    if target_type == 'density':
+        weights = out.new_tensor((0.5, 0.3, 0.2))
+        if out.shape[-1] != len(weights):
+            raise ValueError(
+                f'density head has {out.shape[-1]} outputs; expected '
+                f'{len(weights)}')
+        return (out * weights).sum(dim=-1)
+    # Survival heads emit logits, not probabilities.  The historical gate
+    # accidentally ranked a weighted sum of raw logits; mirror mcts.py by
+    # applying sigmoid before the horizon weights.
+    return vh.survival_to_scalar(torch.sigmoid(out))
+
+
 def load_pairs(path):
     out = []
     with open(path, 'rb') as f:
@@ -59,17 +76,22 @@ def main():
     p.add_argument('--head', default='alphatrain/data/value_head_small128.pt')
     p.add_argument('--backbone', default='alphatrain/data/pillar3k_small128_hardce_epoch_87.pt')
     p.add_argument('--clear-gap', type=float, default=0.08)
+    p.add_argument('--device', default='mps')
+    p.add_argument('--fp32', action='store_true',
+                   help='Diagnostic override; FP16 is the default protocol.')
     a = p.parse_args()
 
     pairs = load_pairs(a.pairs)
     res = np.genfromtxt(a.results, delimiter=',', names=True)
     assert len(pairs) == len(res), f'{len(pairs)} pairs vs {len(res)} results'
 
-    dev = torch.device('mps')
-    net, _ = load_model(a.backbone, dev, fp16=False)
+    dev = torch.device(a.device)
+    net, _ = load_model(a.backbone, dev, fp16=not a.fp32)
+    net_dtype = next(net.parameters()).dtype
     head, ckpt, head_type = vh.load_any(a.head, dev)
     head.train(False)
-    print(f'head type={head_type} target={ckpt.get("target_type")}')
+    target_type = ckpt.get('target_type', 'survival')
+    print(f'head type={head_type} target={target_type}')
 
     def head_v(board, nb):
         nr = np.zeros(3, dtype=np.int64); nc = np.zeros(3, dtype=np.int64)
@@ -79,11 +101,11 @@ def main():
         obs = build_observation(board, nr, nc, ncol, min(len(nb), 3))
         with torch.inference_mode():
             feats = net.backbone_features(
-                torch.from_numpy(obs).unsqueeze(0).to(dev))
+                torch.from_numpy(obs).unsqueeze(0).to(
+                    device=dev, dtype=net_dtype))
             out = head(feats.float())
-            if head_type == 'spatial':
-                return float(out.squeeze())
-            return float(vh.survival_to_scalar(out).squeeze())
+            return float(head_output_to_scalar(
+                out, head_type, target_type).squeeze())
 
     dv, gap = [], []
     for i, (board, nb, m1, m2) in enumerate(pairs):

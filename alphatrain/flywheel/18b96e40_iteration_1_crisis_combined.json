@@ -1,0 +1,124 @@
+{
+  "schema_version": 2,
+  "iteration": "18b96e40_iteration_1_crisis_combined",
+  "lineage": "scratch18b96_lr3e3_e40",
+  "lineage_family": "small_policy",
+  "source_generator_prefix": "scratch18b96_lr3e3_e40_",
+  "base_checkpoint": "alphatrain/data/scratch18b96_lr3e3_ckpts_epoch_40.pt",
+  "base_policy_ts": "alphatrain/inference_cpp/data/scratch18b96_lr3e3_ckpts_epoch_40_ts.pt",
+  "feature_value": "alphatrain/inference_cpp/data/feature_value.bin",
+  "label_protocol": "combined same-actor crisis corpus: greedy 18b96e40 probes, noise-free recovery/prevention feature-value MCTS, full top-30 visits, priors, and Q values retained; both source tranches independently pass held-out common-random-number validation",
+  "target_output": "alphatrain/data/flywheel_18b96e40_i1_crisis_combined_targets.pt",
+  "anchor_output": "alphatrain/data/flywheel_18b96e40_i1_anchors.pt",
+  "generation_provenance": {
+    "policy_checkpoint_sha256": "233809b150e94341b250d31a112111fc36381f5f9604c6d67afcaa738740da93",
+    "policy_ts_sha256": "982f5e0e225b53980cbe1301fa71297525f34e5d7f6e7793caef17d044f56d95",
+    "feature_value_sha256": "dba601a781b2a95f6a35788e5b8d5108b4a332d8f57602af13b0da2635951889",
+    "precision": "fp16",
+    "leaf_value_semantics": "historical 27-feature geometry evaluator; neural survival value is not active",
+    "reserved_final_seed_range": [1100000, 1120000],
+    "constituent_manifests": {
+      "alphatrain/flywheel/18b96e40_iteration_1_pilot.json": "a7706ac9e822ad077a380d966fbe5d3e4a76c8fa58ff251c09c8e3ccf45be965",
+      "alphatrain/flywheel/18b96e40_iteration_1_crisis_expansion.json": "baf4bd63f5bcc768fc6365db4882b3742923cc28b8f066743f22f6685e7c72f4"
+    },
+    "combined_budget": {
+      "probe_seeds": 2500,
+      "death_seeds": 1867,
+      "crisis_replay_games": 3734,
+      "search_states": 1140229,
+      "recorded_actor_root_edits": 46320
+    }
+  },
+  "target_sources": [
+    {
+      "name": "18b96e40_i1_crisis_pilot_600_1600",
+      "path": "alphatrain/data/flywheel_18b96e40_i1_pilot/crisis",
+      "format": "moves",
+      "role": "target",
+      "generator": "scratch18b96_lr3e3_e40_native_feature_value",
+      "seed_start": 2204000,
+      "seed_end": 2204500,
+      "require_complete_marker": true,
+      "require_full_record": true,
+      "failed_tail_weight": 0.25,
+      "expected_game_fields": {
+        "generator_schema_version": 4,
+        "run_id": "18b96e40_i1_pilot_crisis_r600_p1600_v1",
+        "policy_model": "data/scratch18b96_lr3e3_ckpts_epoch_40_ts.pt",
+        "value_module": "",
+        "precision": "fp16",
+        "full_record": true,
+        "clean_label_sims": 0,
+        "q_weight": 1.0,
+        "c_puct": 2.5,
+        "top_k": 30,
+        "mcts_batch_size": 8,
+        "value_kind": "feature",
+        "behavior_dirichlet_weight": 0.0,
+        "label_dirichlet_weight": 0.0,
+        "continue_turns": 500,
+        "policy_max_turns": 10000
+      }
+    },
+    {
+      "name": "18b96e40_i1_crisis_expand_600_1600",
+      "path": "alphatrain/data/flywheel_18b96e40_i1_crisis_expansion/crisis",
+      "format": "moves",
+      "role": "target",
+      "generator": "scratch18b96_lr3e3_e40_native_feature_value",
+      "seed_start": 2210000,
+      "seed_end": 2212000,
+      "require_complete_marker": true,
+      "require_full_record": true,
+      "failed_tail_weight": 0.25,
+      "expected_game_fields": {
+        "generator_schema_version": 4,
+        "run_id": "18b96e40_i1_crisis_expand_r600_p1600_v1",
+        "policy_model": "data/scratch18b96_lr3e3_ckpts_epoch_40_ts.pt",
+        "value_module": "",
+        "precision": "fp16",
+        "full_record": true,
+        "clean_label_sims": 0,
+        "q_weight": 1.0,
+        "c_puct": 2.5,
+        "top_k": 30,
+        "mcts_batch_size": 8,
+        "value_kind": "feature",
+        "behavior_dirichlet_weight": 0.0,
+        "label_dirichlet_weight": 0.0,
+        "continue_turns": 500,
+        "policy_max_turns": 10000
+      }
+    }
+  ],
+  "anchor_sources": [
+    {
+      "name": "18b96e40_greedy_recorded",
+      "path": "alphatrain/data/flywheel_18b96e40_i1_pilot/anchors",
+      "format": "states",
+      "role": "anchor",
+      "generator": "scratch18b96_lr3e3_e40_greedy_fp16",
+      "seed_start": 2205000,
+      "seed_end": 2210000,
+      "expected_files": 5000,
+      "require_complete_marker": true,
+      "expected_complete_fields": {
+        "schema_version": 1,
+        "run_id": "18b96e40_i1_pilot_anchor_greedy_v1",
+        "policy_ts_sha256": "982f5e0e225b53980cbe1301fa71297525f34e5d7f6e7793caef17d044f56d95",
+        "precision": "fp16",
+        "seed_start": 2205000,
+        "seed_end": 2210000,
+        "expected_games": 5000,
+        "max_turns": 1000,
+        "record_every": 4,
+        "record_tail": 160
+      }
+    }
+  ],
+  "excluded_by_default": [
+    "all vh3, 192-channel, 256-channel, and Pillar3f/Pillar3k game labels",
+    "neutral exploit and explore teacher edits",
+    "the reserved final seed range 1100000--1119999"
+  ]
+}

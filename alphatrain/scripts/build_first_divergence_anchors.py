@@ -59,12 +59,12 @@ def main():
             logits = net(x)
             if isinstance(logits, tuple):
                 logits = logits[0]
-            pol = torch.softmax(logits.float()[0], dim=-1).cpu().numpy()
-        priors = _get_legal_priors_flat(game.board, pol, 10)
+            logits_np = logits.float()[0].cpu().numpy()
+        priors = _get_legal_priors_flat(game.board, logits_np, 10)
         if not priors:
             return None, None
         # argmax over legal moves
-        return max(priors.items(), key=lambda x: x[1])[0], pol
+        return max(priors.items(), key=lambda x: x[1])[0], logits_np
 
     anchors = []
     skipped = 0

@@ -33,6 +33,9 @@ add_executable(game_test src/game_test.cc src/game.cc src/obs.cc src/mcts.cc
 # Feature-value evaluator golden test — no LibTorch needed.
 add_executable(feature_test src/feature_test.cc src/feature_value.cc src/game.cc)
 
+add_executable(mcts_controls_test src/mcts_controls_test.cc src/mcts.cc
+                                 src/game.cc src/obs.cc src/feature_value.cc)
+
 # Full policy eval: C++ game loop + LibTorch batched inference.
 add_executable(eval src/eval.cc src/game.cc src/obs.cc)
 target_link_libraries(eval PRIVATE "${TORCH_LIBRARIES}")
@@ -59,3 +62,9 @@ target_link_libraries(mcts_crisis PRIVATE "${TORCH_LIBRARIES}")
 add_executable(rollout_judge src/rollout_judge.cc src/mcts.cc src/game.cc
                              src/obs.cc src/feature_value.cc)
 target_link_libraries(rollout_judge PRIVATE "${TORCH_LIBRARIES}")
+
+add_executable(mcts_relabel src/mcts_relabel.cc src/mcts.cc src/game.cc
+               src/obs.cc src/feature_value.cc)
+target_link_libraries(mcts_relabel PRIVATE "${TORCH_LIBRARIES}")
+
+add_executable(obs_dump src/obs_dump.cc src/game.cc src/obs.cc)
