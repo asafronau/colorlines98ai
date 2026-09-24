@@ -71,6 +71,7 @@ struct Args {
   int threads = 14;
   bool fp32 = false;
   bool full_record = false;
+  bool virtual_mean = false;  // corrected pending-visit placeholder (see mcts.h)
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -79,6 +80,7 @@ Args ParseArgs(int argc, char** argv) {
     std::string k = argv[i];
     if (k == "--fp32") { a.fp32 = true; continue; }
     if (k == "--full-record") { a.full_record = true; continue; }
+    if (k == "--virtual-mean") { a.virtual_mean = true; continue; }
     if (i + 1 >= argc) {
       std::fprintf(stderr, "FATAL: missing value for %s\n", k.c_str());
       std::exit(2);
@@ -230,6 +232,7 @@ int main(int argc, char** argv) {
     clines::AppendD(config, args.c_puct);
     config += ", \"q_weight\": ";
     clines::AppendD(config, args.q_weight);
+    config += std::string(", \"virtual_mean\": ") + (args.virtual_mean ? "true" : "false");
     config += ", \"dirichlet_alpha\": ";
     clines::AppendD(config, args.dirichlet_alpha);
     config += ", \"dirichlet_weight\": ";
@@ -423,6 +426,7 @@ int main(int argc, char** argv) {
       cfg.top_k = args.top_k;
       cfg.batch_size = args.batch_size;
       cfg.q_weight = args.q_weight;
+      cfg.virtual_mean = args.virtual_mean;
       cfg.early_stop = false;  // full visit distribution for targets
       cfg.dirichlet_alpha = args.dirichlet_alpha;
       cfg.dirichlet_weight = args.dirichlet_weight;
@@ -491,6 +495,7 @@ int main(int argc, char** argv) {
               ", \"clean_label_sims\": " +
                   std::to_string(args.clean_label_sims) +
               ", \"q_weight\": " + std::to_string(args.q_weight) +
+              ", \"virtual_mean\": " + (args.virtual_mean ? std::string("true") : std::string("false")) +
               ", \"c_puct\": " + std::to_string(args.c_puct) +
               ", \"top_k\": " + std::to_string(args.top_k) +
               ", \"mcts_batch_size\": " +
