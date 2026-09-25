@@ -5639,3 +5639,13 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      e33 8-view average 47,622 (+19% over single) -> residual backbone asymmetry.
      Law observed: a PAIR2 student reaches its label source's strength (averaged-e40 labels 21.4k ->
      student ~21k), so the next gain must come from stronger labels: A1's own search.
+
+245. **Flywheel generation 1 prepared (A1 = PAIR2 + mask e40).** (2026-09-24)
+     A1 on fresh seeds 3,000,000-3,000,999: 41,667 / P50 30,387 / <1k 1.0% (reproduces the gate).
+     A1 survival head value_head_A1.pt (frozen A1 backbone, 2.81M states of A1's own uncapped games,
+     record-every 8 + final 300; inner-val BCE 0.0756, per-H 0.013/0.028/0.075/0.187); fused
+     pv_A1_ts.pt (traced == eager); C++ search with the PAIR2 head verified (mcts_selfplay smoke).
+     mcts_crisis gained --virtual-mean. Timing (10 seeds, recovery 15 @600 + prevention 30 @600,
+     c1.5 q2 virtual mean): 9 deaths -> 18 replays, 3,780 rows in 583 s (39% of replays survive to
+     the continue cap). Owner runs: gen1_crisis_A1 (seeds 3,200,000-3,200,999) and gen1_selfplay_A1
+     (200 games, seeds 3,300,000+, 400 sims, cap 3000), both Dirichlet 0.
