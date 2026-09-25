@@ -3,7 +3,7 @@
 # epochs, export TS, screen each on dev slice 775000-775999 (1k, screen
 # resolution +-1100 mean; vh3 same-slice baseline mean=14429 P50=10334).
 set -e
-cd /path/to/colorlines98
+cd "$(dirname "$0")/.."
 source .venv/bin/activate
 mkdir -p checkpoints/r2m alphatrain/inference_cpp/data/r2m logs/r2m
 

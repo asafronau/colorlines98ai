@@ -261,7 +261,7 @@ to its own TorchScript path, then use aggregate-only MPS FP16 evaluation.  A
 individual seeds or rank close candidates from it.
 
 ```bash
-cd /path/to/colorlines98
+cd "$(git rev-parse --show-toplevel)"
 PYTHONPATH=. NUMBA_CACHE_DIR=/tmp/colorlines98-numba-cache \
   caffeinate -i -s .venv/bin/python -m alphatrain.inference_cpp.export_ts \
   --model alphatrain/data/18b96e40_i1_mixed_warm_epoch_3.pt \
@@ -280,7 +280,7 @@ that distribution once.  Compare them with independent resampling, never
 per-seed deltas:
 
 ```bash
-cd /path/to/colorlines98
+cd "$(git rev-parse --show-toplevel)"
 .venv/bin/python -m alphatrain.scripts.compare_score_distributions \
   alphatrain/inference_cpp/data/18b96e40_base_cap1k_1000k_5k.csv \
   alphatrain/inference_cpp/data/18b96e40_i1_mixed_warm_epoch_3_cap1k_1000k_5k.csv

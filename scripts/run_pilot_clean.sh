@@ -3,7 +3,7 @@
 # ETA ~10-15 min on M5 MAX.
 
 set -uo pipefail
-cd /path/to/colorlines98
+cd "$(dirname "$0")/.."
 source .venv/bin/activate
 
 STAMP=$(date +%Y%m%d_%H%M)

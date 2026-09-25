@@ -42,3 +42,7 @@ checkpoints/
 
 # Runtime logs (training/eval/qsweep)
 logs/
+
+# Local-only notes, session transcripts, review briefs (never pushed)
+private/
+/*.jsonl

@@ -6,7 +6,7 @@
 # logs/overnight_phase2/.
 
 set -u
-cd /path/to/colorlines98
+cd "$(dirname "$0")/.."
 source .venv/bin/activate
 
 OUT=logs/overnight_phase2

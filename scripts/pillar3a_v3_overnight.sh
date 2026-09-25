@@ -18,7 +18,7 @@
 # Usage: ./scripts/pillar3a_v3_overnight.sh
 
 set -uo pipefail
-cd /path/to/colorlines98
+cd "$(dirname "$0")/.."
 source .venv/bin/activate
 
 caffeinate -dimsu &

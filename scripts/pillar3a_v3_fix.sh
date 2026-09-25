@@ -11,7 +11,7 @@
 # This script applies the three fixes and re-runs the q-sweep.
 
 set -uo pipefail
-cd /path/to/colorlines98
+cd "$(dirname "$0")/.."
 source .venv/bin/activate
 
 caffeinate -dimsu &

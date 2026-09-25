@@ -16,7 +16,7 @@
 # Usage: ./scripts/pillar3a_v2_overnight.sh
 
 set -uo pipefail
-cd /path/to/colorlines98
+cd "$(dirname "$0")/.."
 source .venv/bin/activate
 
 # Master caffeinate: keep the entire pipeline awake (display, disk, system,
