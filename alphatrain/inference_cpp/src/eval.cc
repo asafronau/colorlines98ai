@@ -23,6 +23,7 @@
 #include "game.h"
 #include "game_json.h"
 #include "canonical.h"
+#include "anchors.h"
 
 using clines::Game;
 using Clock = std::chrono::high_resolution_clock;
@@ -46,6 +47,9 @@ struct Args {
   std::string record_dir;
   int record_every = 8;
   int record_tail = 160;
+  // Anchor mode: start each game from a saved state (anchors.h) and play greedily for at most its
+  // `cap` more turns, with the same spawn stream as the mcts_crisis replay from that state.
+  std::string anchors;
 };
 
 // One recorded pre-move snapshot: state + the move the policy chose there.
@@ -162,6 +166,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--record-dir") a.record_dir = argv[++i];
     else if (k == "--record-every") a.record_every = std::stoi(argv[++i]);
     else if (k == "--record-tail") a.record_tail = std::stoi(argv[++i]);
+    else if (k == "--anchors") a.anchors = argv[++i];
   }
   if (a.device != "mps" && a.device != "cpu") {
     std::fprintf(stderr, "FATAL: unsupported device %s (expected mps or cpu)\n",
@@ -224,9 +229,18 @@ int main(int argc, char** argv) {
                                            {8, clines::kActions}, torch::kLong).clone().to(dev);
   std::vector<int64_t> canon_view;
 
-  // Seed queue.
+  // Seed queue (anchor mode: one entry per anchor; `todo` holds anchor indices).
+  const bool anchor_mode = !args.anchors.empty();
+  std::vector<clines::Anchor> anchors;
   std::vector<uint64_t> todo;
-  for (uint64_t s = args.seed_start; s < args.seed_end; ++s) todo.push_back(s);
+  if (anchor_mode) {
+    anchors = clines::ReadAnchors(args.anchors);
+    for (uint64_t i = 0; i < anchors.size(); ++i) todo.push_back(i);
+    std::printf("ANCHORS: %zu start states from %s\n", anchors.size(), args.anchors.c_str());
+  } else {
+    for (uint64_t s = args.seed_start; s < args.seed_end; ++s) todo.push_back(s);
+  }
+  if (todo.empty()) { std::printf("nothing to play\n"); return 2; }
   size_t next = 0;
   const int B = std::min<int>(args.batch, (int)todo.size());
 
@@ -235,14 +249,26 @@ int main(int argc, char** argv) {
     std::vector<TurnRec> broad, ring;  // recording only
     size_t ring_head = 0;
     long next_progress_turn = 500;
+    long turn_limit = 0;   // absolute turn at which the game counts as capped
+    int start_turn = 0;    // anchor mode: turn of the start state
   };
   const bool recording = !args.record_dir.empty();
   std::vector<Slot> slots;
   auto make_slot = [&](Slot& dst) -> bool {
     if (next >= todo.size()) return false;
-    dst.seed = todo[next++];
-    dst.game = Game(dst.seed);
-    dst.game.Reset();
+    if (anchor_mode) {
+      const clines::Anchor& a = anchors[todo[next++]];
+      dst.seed = a.seed;
+      dst.game = clines::StartFromAnchor(a);  // same spawn stream as the mcts_crisis replay
+      dst.start_turn = a.turn;
+      dst.turn_limit = (long)a.turn + a.cap;
+    } else {
+      dst.seed = todo[next++];
+      dst.game = Game(dst.seed);
+      dst.game.Reset();
+      dst.start_turn = 0;
+      dst.turn_limit = args.max_turns;
+    }
     dst.broad.clear();
     dst.ring.clear();
     dst.ring_head = 0;
@@ -359,7 +385,7 @@ int main(int argc, char** argv) {
         }
         int s = (int)(m / 81), t = (int)(m % 81);
         bool ok = slots[i].game.Move(s / 9, s % 9, t / 9, t % 9);
-        dead = !ok || slots[i].game.over() || slots[i].game.turns() >= args.max_turns;
+        dead = !ok || slots[i].game.over() || slots[i].game.turns() >= slots[i].turn_limit;
         if (args.verbose_games && !dead &&
             slots[i].game.turns() >= slots[i].next_progress_turn) {
           double el = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -373,7 +399,7 @@ int main(int argc, char** argv) {
       }
       if (dead) {
         const bool capped = (!slots[i].game.over()
-                             && slots[i].game.turns() >= args.max_turns);
+                             && slots[i].game.turns() >= slots[i].turn_limit);
         if (recording)
           WriteGameRecord(args, slots[i].seed, slots[i].game.score(),
                           slots[i].game.turns(), slots[i].game.over(),
@@ -384,6 +410,8 @@ int main(int argc, char** argv) {
         capped_games += capped;
         ++done;
         if (scores_file) {
+          // Anchor mode: `score` is gained since the anchor (SetState starts it at 0) and
+          // `turns` is the absolute turn; survived = turns - start_turn.
           std::fprintf(scores_file, "%llu,%d,%d,%d\n",
                        (unsigned long long)slots[i].seed,
                        slots[i].game.score(), slots[i].game.turns(),
@@ -432,10 +460,14 @@ int main(int argc, char** argv) {
   std::snprintf(tag, sizeof(tag), "scores [%llu,%llu):",
                 (unsigned long long)args.seed_start, (unsigned long long)args.seed_end);
   Percentile(scores, tag);
-  std::printf("  mean turns=%.1Lf  capped@%ld: %zu (%.3f%%)\n",
-              turn_sum / std::max<size_t>(scores.size(), 1), args.max_turns,
-              capped_games, 100.0 * capped_games
-              / std::max<size_t>(scores.size(), 1));
+  if (anchor_mode)
+    std::printf("  anchors reaching their turn cap (escaped): %zu (%.2f%%)\n", capped_games,
+                100.0 * capped_games / std::max<size_t>(scores.size(), 1));
+  else
+    std::printf("  mean turns=%.1Lf  capped@%ld: %zu (%.3f%%)\n",
+                turn_sum / std::max<size_t>(scores.size(), 1), args.max_turns,
+                capped_games, 100.0 * capped_games
+                / std::max<size_t>(scores.size(), 1));
   if (scores_file) {
     std::fclose(scores_file);
     std::printf("score-distribution CSV: %s\n", args.scores_out.c_str());

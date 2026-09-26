@@ -58,6 +58,11 @@ add_executable(mcts_crisis src/mcts_crisis.cc src/mcts.cc src/game.cc
                            src/obs.cc src/feature_value.cc)
 target_link_libraries(mcts_crisis PRIVATE "${TORCH_LIBRARIES}")
 
+# Teacher-strength probe: search the first W moves from saved anchors, then greedy.
+add_executable(anchor_search src/anchor_search.cc src/mcts.cc src/game.cc
+                             src/obs.cc src/feature_value.cc)
+target_link_libraries(anchor_search PRIVATE "${TORCH_LIBRARIES}")
+
 # Rollout judge: teacher-move vs base-move on correction states (died-within-H).
 add_executable(rollout_judge src/rollout_judge.cc src/mcts.cc src/game.cc
                              src/obs.cc src/feature_value.cc)

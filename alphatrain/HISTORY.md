@@ -1498,7 +1498,7 @@ Without it, multiple leaves in a batch of 64 all go down the same branch, wastin
 90%+ of search budget on redundant simulations. Even the "garbage" value head
 (trained with val_weight=0) provided essential Q-diversity for exploration.
 
-**Fix:** Reverted MCTS stack to last known-good commit (87e2d5f). The value head
+**Fix:** Reverted MCTS stack to last known-good commit (bfb5fd9). The value head
 stays in the model for MCTS inference (provides Q-diversity) but gets zero training
 gradient (val_weight=0 in training).
 
@@ -3059,7 +3059,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 
      **TWO DISTINCT crisis pipelines (do not conflate — this cost hours):**
      - *MCTS pipeline (made pillar3f, the +37% breakthrough, HISTORY 167-168,
-       commit 6bd133f):* `gen_corrections_parallel.py` runs widened MCTS@4800
+       commit 76d1fed):* `gen_corrections_parallel.py` runs widened MCTS@4800
        (3 determinizations, q_weight 2.0, FV value net — NO neural value head)
        on each death game's crisis band, keeps states where MCTS top != policy
        move, target = soft visit dist. Writes `crisis/corrections/corr_<seed>.json`
@@ -3145,7 +3145,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      pillar3f --death-glob 'alphatrain/data/death_games/death_300*.json' --sims 4800
      --mcts-seeds 3 --q-weight 2.0 --top-k 300 --topk-visits 20 --lo 15 --hi 85
      --workers 16 --out-dir crisis/corrections_pillar3f`** (FV value net, no neural
-     head; script logic unchanged since commit 6bd133f — fb890b7 only ADDED clean-prior
+     head; script logic unchanged since commit 76d1fed — fac2009 only ADDED clean-prior
      recording). ~1.5 days on M5, resumable, additive corpus. Then build_corrections_
      corpus → train_crisis_ft(pillar3f) → merge α∈[0.4,0.7] → eval + drift gate →
      pillar3f' = pillar3f + α·MCTS_vector. Bar to beat = base pillar3f above.
@@ -3482,7 +3482,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      256ch teacher pillar3k_ep22 (5k mean 43,390, GREEDY eval) is a different
      signal — its per-move choices are cashable by a greedy executor.
 
-     **ChatGPT review corrections, all verified then adopted (commit 452afd4):**
+     **ChatGPT review corrections, all verified then adopted (commit 3e19e19):**
      crisis tensors are ~99.7% MCTS-replay states (only first-of-replay rows are
      true student-visited anchors — original 0a measured the wrong distribution);
      old judge exporter restricted base move to stored teacher top-5; the 2.5M
@@ -5497,7 +5497,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 
      D4 ground truth (scripts/verify_d4_transform.py: dataset LUT transform vs the
      observation rebuilt from the actually transformed board+preview, 300 r2_bulk
-     states): committed HEAD (ac5a50b) and the June 24 code (1284624, pillar3k era)
+     states): committed HEAD (5b714b9) and the June 24 code (a7ce846, pillar3k era)
      rotate the 9x9 planes but NOT the line-direction channels 13-16 -> wrong in 6 of
      8 views on 95-100% of states. Working tree and both Aug code tarballs (used by
      18b96 and every scratch run since Aug 9): exact on all 8 views, obs and policy.
@@ -5649,3 +5649,109 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      c1.5 q2 virtual mean): 9 deaths -> 18 replays, 3,780 rows in 583 s (39% of replays survive to
      the continue cap). Owner runs: gen1_crisis_A1 (seeds 3,200,000-3,200,999) and gen1_selfplay_A1
      (200 games, seeds 3,300,000+, 400 sims, cap 3000), both Dirichlet 0.
+
+246. **Flywheel gen-1 crisis mining done; blending an A1 fine-tune on the WHOLE crisis corpus is a
+     wash (alpha 0.5) and plain continued training loses 22% (alpha 1.0).** (2026-09-25)
+     Mining (owner run, 24.3 h on the M5): mcts_crisis --model A1_pair2_orig_e40_ts.pt --value-module
+     pv_A1_ts.pt, seeds 3,200,000-3,202,999, recovery 15 @600 + prevention 30 @600, c1.5 q2
+     --virtual-mean, Dirichlet 0, threads 14 -> data/gen1_crisis_A1. 3,000 probes: 2,588 deaths, 412
+     reached the 40k-turn probe cap. 5,176 replays: prevention escapes (survives the 500-turn
+     continuation) 63.6%, recovery 34.0%; 72% of deaths escaped by at least one rewind.
+     Corpus: build_expert_v2_tensor --policy-only-data -> alphatrain/data/gen1_crisis_A1.pt
+     (1,353,669 rows). Checks (anomaly_checks, 20k rows): obs builder == reference, 0 illegal
+     targets, A1 argmax == search move on 84.6%.
+     Fine-tune (task-arithmetic vector, M5, 12 min): train_path_b --resume A1_pair2_orig_e40.pt
+     --warm-start --freeze-bn --policy-head pair2 --pair-dim 64 --legal-mask-loss --epochs 2
+     --batch-size 1024 --lr 1e-4 --warmup-epochs 0 --target-temperature 0.5 --augment-factor 1
+     (D4 + color aug) -> checkpoints/gen1_crisis_ft/epoch_2.pt (val 1.2549 -> 1.2531).
+     Merge + gate (scripts/ta_sweep.sh = scripts/merge_checkpoints.py + eval_log run), gate bank
+     2,600,000-2,600,999 uncapped (A1 41,938 / P50 28,442 / P10 4,552 / <1k 0.9%):
+       alpha 0.5   41,146 / P50 28,123 / P10 4,918 / P95 119,852 / <1k 1.2%   (wash)
+       alpha 1.0   32,758 / P50 22,095 / P10 3,949 / P95  95,764 / <1k 1.9%   (-22%)
+     Why (scratchpad crisis_composition.py): 86% of rows are the post-escape 500-turn continuation
+     (quiet late-game states under search), i.e. own-search distillation, which washed before
+     (entry 236). The corrections (moves up to the death turn) are 106k rows (8%).
+     Running: the pillar3f analogue on the corrections only (alphatrain/scripts/build_crisis_windows.py
+     --after 15 --escaped-only -> 100,515 rows from 2,527 escaped replays; A1 matches 84.9%).
+
+247. **The pillar3f analogue (fine-tune on the corrections only, then blend) is also a wash on gen-1
+     data.** (2026-09-25)
+     Corpus: alphatrain/scripts/build_crisis_windows.py --in-dir data/gen1_crisis_A1 --out-dir
+     data/gen1_crisis_A1_windows --after 15 --escaped-only (2,527 escaped replays, moves up to the
+     original death turn + 15) -> build_expert_v2_tensor --policy-only-data ->
+     alphatrain/data/gen1_crisis_A1_windows.pt (100,515 rows; 0 illegal targets; A1 == search move
+     84.9%; BN train-mode vs eval-mode argmax agreement only 61.7% on these dense boards, so the
+     frozen-BN fine-tune matters). Fine-tune: same flags as entry 246 but --epochs 8 (val 1.1481 ->
+     1.1345; max |task-vector| element 0.029 vs 0.128 for the full corpus). Gate bank, 1k uncapped:
+       alpha 0.4   41,962 / P50 29,526 / P10 4,928 / <1k 1.0%
+       alpha 0.7   41,236 / P50 29,054 / P10 5,411 / <1k 1.7%      (A1 41,938 / 28,442 / 4,552 / 0.9%)
+     Unlike pillar3f (+36%, MCTS@4800 widened labels), 600-sim labels on A1's crisis windows carry
+     little A1 doesn't already play: 85% agreement, and the rest is largely single-search noise
+     (entry 236). The escapes the search finds (72% of deaths) don't transfer move by move.
+     Running: AlphaZero-style continuous training (new train_path_b --mix-tensor/--mix-share replay
+     mix + --ema-decay weight EMA; tests added), treatment r2_bulk + 30% gen-1 crisis rows vs control
+     r2_bulk only, from A1, constant lr 3e-5, bs 4096, hard CE, frozen BN, EMA 0.999, 1 epoch.
+
+248. **Continuous training is safe but gen-1 data adds nothing, and the reason is measured: A1's
+     600-sim search is barely stronger than A1 greedy at A1's own crisis states.** (2026-09-25..26)
+     AlphaZero-style continuous training (new train_path_b options, tests added): --mix-tensor /
+     --mix-share (MixedLoader: every batch = base rows + a fixed share of the new corpus) and
+     --ema-decay (WeightEMA, validated and saved as ema_*.pt). From A1, 1 epoch of r2_bulk,
+     constant lr 3e-5 (--flat-epochs 1 --warmup-epochs 0), bs 4096, hard CE (--blend-alpha 0),
+     --freeze-bn --legal-mask-loss --augment-factor 1 --seed 42, EMA 0.999, gate on the EMA weights:
+       control   r2_bulk only                          40,971 / P50 28,437 / P10 4,912 / <1k 1.1%
+       treatment r2_bulk + 30% gen-1 crisis per batch  42,250 / P50 29,407 / P10 4,710 / <1k 0.9%
+     (A1 41,938.) The constant-LR + EMA regime keeps A1's strength (unlike every plain fine-tune of
+     e40); the crisis rows barely moved (crisis val CE 1.532 -> 1.507).
+     Teacher-advantage control (new eval --anchors mode: Game(seed) + SetState from each mcts_crisis
+     rewind state, same spawn seed as the replay; alphatrain/scripts/crisis_anchors.py export/compare):
+       prevention (rewind 30)  search@600 escapes 63.6%   A1 greedy 54.7%   (+8.9 pts)
+       recovery   (rewind 15)  search@600 escapes 34.0%   A1 greedy 27.1%   (+6.9 pts)
+     Paired: search-only escapes 502 vs greedy-only 271 (prevention), 402 vs 223 (recovery). Most of
+     the "72% of deaths escaped" (entry 246) is the replay's new spawn stream, not the search. With a
+     teacher this close to the student, no training channel can extract much (entries 246-248).
+     NEXT: measure teacher strength vs search budget cheaply (search only the crisis window, then
+     greedy, from the same anchors) and mine only with a configuration that clearly beats greedy.
+
+249. **BUG: mcts_crisis never used the survival head. Since 2026-07-08 every crisis corpus mined with
+     --value-module (gen-1, and r2_bulk's crisis_iter5 / crisis_vh3 / crisis_vh3_deep / crisis_vh2_r2
+     = its ~56% crisis-replay rows) was searched with the 27-feature leaf evaluator at q 2.0, while
+     the JSONs said value_kind "neural". Fixed, the teacher's edge over greedy triples.** (2026-09-26)
+     Cause: the replay worker built its MctsConfig without `cfg.nn_value = nn_value` (mcts_selfplay,
+     mcts_relabel and mcts_eval set it; the server loaded the fused module, whose policy logits were
+     used, but leaf values came from data/feature_value.bin). Introduced with --value-module in
+     87ee45a (2026-07-08). Fix: set the flag; value_kind now reports cfg.nn_value.
+     Measurement (new build/anchor_search: from each saved rewind state, Game(seed) + SetState exactly
+     as the replay, search the first 45 moves, then greedy to the 500-turn cap; --search-turns 0
+     reproduces eval --anchors, 54.9% vs 54.7%). 1,294 prevention anchors (30 moves before A1's death),
+     A1 prior, 600 sims, c1.5 q2 virtual mean:
+       A1 greedy                                       54.9% escape
+       feature leaf (the bug), 45 searched moves      60.2%   (+5.3)
+       gen-1 replays as mined (feature leaf, 500)     63.5%   (+8.6)
+       survival-head leaf (fixed), 45 searched moves  72.3%   (+17.4)
+     So entries 246-248 trained on the weak teacher, and A1 itself learned its crisis states from
+     feature-leaf labels. NEXT: re-mine gen-1 with the fixed binary; later, relabel r2_bulk's crisis
+     states with the fixed search.
+
+250. **BREAKTHROUGH: the same 45-move crisis windows, labeled by the FIXED search (survival-head leaf),
+     lift A1 by +60% mean: 67,240 / P50 46,422 / P10 8,240 / <1k 0.5% / max 539,980 (alpha 0.7).**
+     (2026-09-26)
+     Mining (owner run, 4.1 h, fixed binary from entry 249): mcts_crisis --run-id gen1b_crisis_A1_w45
+     --model A1_pair2_orig_e40_ts.pt --value-module pv_A1_ts.pt, seeds 3,200,000-3,202,999 (same
+     probes: 2,588 deaths, identical to gen-1), recovery 15 @600 + prevention 30 @600, c1.5 q2
+     --virtual-mean, Dirichlet 0, --continue-turns 45 -> data/gen1b_crisis_A1_w45 (value_kind
+     neural checked). Corpus alphatrain/data/gen1b_crisis_A1_w45.pt: 194,302 rows, 0 illegal
+     targets, A1 == teacher move 86.3% (buggy windows: 84.9% -> the gain is override QUALITY).
+     Orchestration: scripts/gen1b_after_mining.sh.
+     Arm 1 (fine-tune + blend): train_path_b --resume A1 --warm-start --freeze-bn --policy-head pair2
+     --legal-mask-loss --epochs 4 --batch-size 1024 --lr 1e-4 --warmup-epochs 0
+     --target-temperature 0.5 --augment-factor 1 --seed 42 -> checkpoints/gen1b_ft/epoch_4.pt
+     (val 1.3674), scripts/ta_sweep.sh (merge_checkpoints + eval_log). Arm 2 (continuous): r2_bulk +
+     30% new rows per batch, 1 epoch, constant lr 3e-5, bs 4096, hard CE, frozen BN, EMA 0.999.
+     Gate bank 2,600,000-2,600,999, 1k uncapped (A1 41,938 / P50 28,442 / P10 4,552 / <1k 0.9%):
+       blend alpha 0.4        53,877 / P50 38,312 / P10 6,973 / P95 164,800 / <1k 0.5%   (+28%)
+       blend alpha 0.7        67,240 / P50 46,422 / P10 8,240 / P95 202,981 / <1k 0.5%   (+60%)
+       continuous EMA, 1 ep   54,320 / P50 38,738 / P10 5,408 / P95 166,313 / <1k 1.1%   (+30%)
+     Same windows from the buggy teacher (entry 247): wash. The flywheel works once the teacher is
+     right. Running: alpha 0.85 / 1.0 (dose-response still rising at 0.7) and a fresh-bank
+     confirmation of alpha 0.7 (seeds 3,000,000-3,000,999, A1 = 41,667 there).

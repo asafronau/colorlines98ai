@@ -205,3 +205,61 @@ def test_legal_mask_from_obs_matches_reference_legality():
         c, idx, _ = _legal_priors_jit(b, np.zeros(6561, np.float32), 6561)
         ref = np.zeros(6561, bool); ref[idx[:c]] = True
         assert np.array_equal(got, ref)
+
+
+# ── continuous training: replay mix + weight EMA ──────────────────────
+
+class _FakeMixSet:
+    """Duck-typed TensorDatasetGPU: row i is the value i; collate returns (obs, policy)."""
+
+    def __init__(self, n):
+        self.n = n
+
+    def __len__(self):
+        return self.n
+
+    def collate(self, indices):
+        t = torch.as_tensor(indices, dtype=torch.float32)
+        return t[:, None], -t[:, None]
+
+
+class _FakeBaseLoader(list):
+    batch_size = 3
+
+
+def test_mixed_loader_appends_fixed_share_and_cycles_without_replacement():
+    from alphatrain.train_path_b import MixedLoader
+    base = _FakeBaseLoader([(torch.full((3, 1), 100.0 + i), torch.zeros(3, 1)) for i in range(7)])
+    loader = MixedLoader(base, _FakeMixSet(5), n_mix=2, seed=1)
+    assert len(loader) == 7 and loader.batch_size == 5
+    mixed = [row for obs, pol in loader for row in obs[3:, 0].tolist()]
+    for obs, pol in loader:
+        assert obs.shape == (5, 1) and torch.equal(obs[:3], obs[:3].new_full((3, 1), obs[0, 0].item()))
+    # 14 mix rows from a 5-row set: each full pass of 5 is a permutation (no repeats inside a pass)
+    for p in range(2):
+        assert sorted(mixed[5 * p:5 * p + 5]) == [0, 1, 2, 3, 4]
+    assert set(mixed[10:14]) <= {0, 1, 2, 3, 4} and len(set(mixed[10:14])) == 4
+
+
+def test_mixed_loader_rejects_field_mismatch():
+    from alphatrain.train_path_b import MixedLoader
+    base = _FakeBaseLoader([(torch.zeros(3, 1), torch.zeros(3, 1), torch.zeros(3))])
+    with pytest.raises(ValueError):
+        list(MixedLoader(base, _FakeMixSet(4), n_mix=1))
+
+
+def test_weight_ema_tracks_float_state_and_copies_integer_buffers():
+    from alphatrain.train_path_b import WeightEMA
+    net = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.BatchNorm1d(2))
+    ema = WeightEMA(net, decay=0.9)
+    w0 = net[0].weight.detach().clone()
+    rv0 = net[1].running_var.detach().clone()
+    with torch.no_grad():
+        net[0].weight.add_(1.0)
+    net[1].num_batches_tracked += 5
+    ema.update(net)
+    assert torch.allclose(ema.state['0.weight'], w0 + 0.1)
+    assert torch.equal(ema.state['1.running_var'], rv0)          # unchanged stat stays bit-identical
+    assert int(ema.state['1.num_batches_tracked']) == 5
+    ema.update(net)
+    assert torch.allclose(ema.state['0.weight'], w0 + 1.0 - 0.9 ** 2)

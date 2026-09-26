@@ -30,6 +30,7 @@ both on.
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import shutil
 import time
@@ -170,7 +171,7 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
                  aux=None, epoch=0, grad_audit=0, decisiveness_power=0.0,
                  disagree_gamma=0.0, save_every_steps=0, save_hook=None,
                  anchor=None, freeze_bn=False, set_loss_on_mask=False,
-                 set_tau=0.5, legal_mask_loss=False):
+                 set_tau=0.5, legal_mask_loss=False, ema=None):
     """One epoch. Optionally adds the listwise margin aux loss.
 
     `aux`, when not None, is a dict with:
@@ -332,6 +333,8 @@ def train_epoch(model, loader, optimizer, device, scaler, amp_dtype,
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+        if ema is not None:
+            ema.update(base_model)
 
         total_loss += loss.item()
         n += 1
@@ -495,6 +498,66 @@ def validate(model, loader, device, amp_dtype=torch.float32, legal_mask_loss=Fal
     return total / n
 
 
+class MixedLoader:
+    """Replay mix: every batch = one base-corpus batch + `n_mix` rows of a second corpus.
+
+    The second corpus (a new generation's data) keeps a fixed share of every gradient step however
+    large the base corpus is, and the base corpus keeps being replayed. Mix rows are drawn without
+    replacement from a reshuffled permutation that wraps around as often as needed.
+    """
+
+    def __init__(self, base_loader, mix_set, n_mix, seed=0):
+        self.base_loader, self.mix_set, self.n_mix = base_loader, mix_set, n_mix
+        self.batch_size = base_loader.batch_size + n_mix
+        self._gen = torch.Generator().manual_seed(seed)
+        self._perm = torch.randperm(len(mix_set), generator=self._gen)
+        self._ptr = 0
+
+    def _next_mix(self):
+        parts, need = [], self.n_mix
+        while need:
+            take = self._perm[self._ptr:self._ptr + need]
+            parts.append(take)
+            need -= len(take)
+            self._ptr += len(take)
+            if self._ptr == len(self._perm):
+                self._perm = torch.randperm(len(self.mix_set), generator=self._gen)
+                self._ptr = 0
+        return torch.cat(parts).tolist()
+
+    def __len__(self):
+        return len(self.base_loader)
+
+    def __iter__(self):
+        for batch in self.base_loader:
+            mix = self.mix_set.collate(self._next_mix())
+            if len(batch) != len(mix):
+                raise ValueError(f'base batch has {len(batch)} fields, mix batch {len(mix)}')
+            yield tuple(torch.cat([a, b]) for a, b in zip(batch, mix))
+
+
+class WeightEMA:
+    """Per-step exponential moving average of the full model state.
+
+    Float entries (weights, BN running stats) are averaged; integer buffers are copied. Training can
+    then run at a constant LR while play and gates use the average, which sits near the centre of
+    the SGD noise instead of wherever the last step landed.
+    """
+
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            e = self.state[k]
+            if e.dtype.is_floating_point:
+                e.lerp_(v.detach(), 1.0 - self.decay)   # exact no-op where v == e (frozen BN stats)
+            else:
+                e.copy_(v)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--tensor-file', required=True)
@@ -536,6 +599,13 @@ def main():
     p.add_argument('--pair-dim', type=int, default=64)
     p.add_argument('--legal-mask-loss', action='store_true',
                    help='softmax over LEGAL moves only (mask rebuilt from the obs colour planes); the net no longer has to learn reachability')
+    p.add_argument('--mix-tensor', default=None,
+                   help='second corpus replayed at a fixed share of every batch (continuous training: '
+                        'new generation = --mix-tensor, old data = --tensor-file)')
+    p.add_argument('--mix-share', type=float, default=0.0,
+                   help='fraction of each batch drawn from --mix-tensor')
+    p.add_argument('--ema-decay', type=float, default=0.0,
+                   help='per-step EMA of the model state, validated and saved as ema_*.pt (0 = off)')
     p.add_argument('--seed', type=int, default=None,
                    help='Seed torch/numpy/random for reproducible runs '
                         '(unseeded near-replicates differ by ~1k median).')
@@ -721,6 +791,24 @@ def main():
                             shuffle=False, num_workers=0,
                             collate_fn=val_set.collate)
     print(f"Train={len(train_set):,}  Val={len(val_set):,}", flush=True)
+    mix_val_loader = None
+    if args.mix_tensor:
+        if not 0.0 < args.mix_share < 1.0:
+            raise SystemExit('--mix-tensor needs 0 < --mix-share < 1')
+        if not args.freeze_bn:
+            print('WARNING: --mix-tensor with live BN: running stats will absorb the mix share',
+                  flush=True)
+        mix_train, mix_val = TensorDatasetGPU.make_train_val_split(
+            args.mix_tensor, val_split=args.val_split, augment=dihedral_augment,
+            color_augment=color_augment, augment_factor=1, device=str(device), seed=42)
+        n_mix = round(args.batch_size * args.mix_share)
+        base_loader = DataLoader(train_set, batch_size=args.batch_size - n_mix, shuffle=True,
+                                 num_workers=0, collate_fn=train_set.collate)
+        train_loader = MixedLoader(base_loader, mix_train, n_mix, seed=args.seed or 0)
+        mix_val_loader = DataLoader(mix_val, batch_size=args.batch_size * 2, shuffle=False,
+                                    num_workers=0, collate_fn=mix_val.collate)
+        print(f"Replay mix: {n_mix}/{args.batch_size} rows of every batch from {args.mix_tensor} "
+              f"(train {len(mix_train):,}, val {len(mix_val):,})", flush=True)
 
     # Model
     model = AlphaTrainNet(num_blocks=args.num_blocks,
@@ -762,6 +850,11 @@ def main():
         else:
             print(f"Warm-start from epoch {ckpt.get('epoch', '?')}, "
                   f"fresh optimizer", flush=True)
+
+    ema = WeightEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    ema_model = None
+    if ema is not None:
+        print(f"Weight EMA: decay {args.ema_decay} per step (from the starting weights)", flush=True)
 
     if args.compile and hasattr(torch, 'compile'):
         model = torch.compile(model)
@@ -1075,11 +1168,18 @@ def main():
         lr = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {epoch+1}/{args.epochs} (lr={lr:.2e})", flush=True)
 
+        def _save_ema(name, **extra):
+            torch.save({'model': {k: v.detach().cpu().clone() for k, v in ema.state.items()},
+                        'args': vars(args), 'policy_only': True, 'ema_decay': args.ema_decay,
+                        **extra}, os.path.join(args.save_dir, name))
+
         def _step_hook(ep, step):
             ck_s = {'epoch': ep, 'model': model.state_dict(),
                     'args': vars(args), 'policy_only': True, 'step': step}
             torch.save(ck_s, os.path.join(args.save_dir,
                                           f'e{ep+1}_s{step}.pt'))
+            if ema is not None:
+                _save_ema(f'ema_e{ep+1}_s{step}.pt', epoch=ep, step=step)
             print(f"  [ckpt] e{ep+1}_s{step}.pt", flush=True)
         tl, aux_tl = train_epoch(model, train_loader, optimizer, device,
                                   scaler, amp_dtype,
@@ -1092,7 +1192,8 @@ def main():
                                   decisiveness_power=args.decisiveness_power,
                                   anchor=anchor_data, freeze_bn=args.freeze_bn,
                                   set_loss_on_mask=args.set_loss_on_mask,
-                                  set_tau=args.set_tau, legal_mask_loss=args.legal_mask_loss)
+                                  set_tau=args.set_tau, legal_mask_loss=args.legal_mask_loss,
+                                  ema=ema)
         vl = validate(model, val_loader, device, amp_dtype=amp_dtype, legal_mask_loss=args.legal_mask_loss)
         scheduler.step()
 
@@ -1101,6 +1202,21 @@ def main():
               flush=True)
         print(f"  V12 val: loss={vl:.4f} [{time.time()-et:.0f}s]",
               flush=True)
+        if mix_val_loader is not None:
+            print(f"  mix val: loss={validate(model, mix_val_loader, device, amp_dtype=amp_dtype, legal_mask_loss=args.legal_mask_loss):.4f}",
+                  flush=True)
+        if ema is not None:
+            if ema_model is None:
+                ema_model = copy.deepcopy(getattr(model, '_orig_mod', model))
+            ema_model.load_state_dict(ema.state)
+            vl_ema = validate(ema_model, val_loader, device, amp_dtype=amp_dtype,
+                              legal_mask_loss=args.legal_mask_loss)
+            line = f"  EMA val: loss={vl_ema:.4f}"
+            if mix_val_loader is not None:
+                line += (f"  EMA mix val: loss="
+                         f"{validate(ema_model, mix_val_loader, device, amp_dtype=amp_dtype, legal_mask_loss=args.legal_mask_loss):.4f}")
+            print(line, flush=True)
+            _save_ema(f'ema_epoch_{epoch+1}.pt', epoch=epoch, val_loss=vl_ema)
         if aux is not None:
             pf = _run_soft_preflight if aux.get('mode') == 'soft' else _run_preflight
             pf(model, aux, device, amp_dtype, epoch=epoch,

@@ -427,6 +427,10 @@ int main(int argc, char** argv) {
       cfg.batch_size = args.batch_size;
       cfg.q_weight = args.q_weight;
       cfg.virtual_mean = args.virtual_mean;
+      // Leaf value from the fused survival head when --value-module is given. Missing until
+      // 2026-09-26: every replay searched with the 27-feature evaluator while the server held the
+      // value head and the JSON claimed value_kind "neural" (HISTORY 249).
+      cfg.nn_value = nn_value;
       cfg.early_stop = false;  // full visit distribution for targets
       cfg.dirichlet_alpha = args.dirichlet_alpha;
       cfg.dirichlet_weight = args.dirichlet_weight;
@@ -501,7 +505,7 @@ int main(int argc, char** argv) {
               ", \"mcts_batch_size\": " +
                   std::to_string(args.batch_size) +
               ", \"value_kind\": \"" +
-                  (nn_value ? std::string("neural") : std::string("feature")) +
+                  (cfg.nn_value ? std::string("neural") : std::string("feature")) +
                   "\"" +
               ", \"behavior_dirichlet_alpha\": " +
                   std::to_string(args.dirichlet_alpha) +
