@@ -40,6 +40,7 @@ struct Args {
   bool canon = false;  // feed the net the canonical form (D4 x color relabel), map logits back
   bool verbose_games = false;  // opt-in per-game + every-500-turn traces
   int progress_every = 100;    // compact aggregate progress by default
+  long progress_forwards = 50000;  // heartbeat for the long tail (games in flight, longest game); 0 = off
   std::string scores_out;  // optional streamed CSV for distribution statistics
   // On-policy trajectory recording (DAgger harvest + value-head fuel):
   // keep the FULL last `record_tail` turns (death band) + every
@@ -162,6 +163,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--batch") a.batch = std::stoi(argv[++i]);
     else if (k == "--max-turns") a.max_turns = std::stol(argv[++i]);
     else if (k == "--progress-every") a.progress_every = std::stoi(argv[++i]);
+    else if (k == "--progress-forwards") a.progress_forwards = std::stol(argv[++i]);
     else if (k == "--scores-out") a.scores_out = argv[++i];
     else if (k == "--record-dir") a.record_dir = argv[++i];
     else if (k == "--record-every") a.record_every = std::stoi(argv[++i]);
@@ -362,6 +364,17 @@ int main(int argc, char** argv) {
     torch::Tensor moves = logits.masked_fill(legal == 0, ninf).argmax(1).to(torch::kCPU);
     auto mv = moves.accessor<int64_t, 1>();
     ++fwd;
+    if (args.progress_forwards > 0 && fwd % args.progress_forwards == 0) {
+      size_t longest = 0;
+      for (size_t i = 1; i < slots.size(); ++i)
+        if (slots[i].game.turns() > slots[longest].game.turns()) longest = i;
+      double el = std::chrono::duration<double>(Clock::now() - t0).count();
+      std::printf("  [%ld forwards] %zu/%zu done, %d in flight, longest seed=%llu turn=%d "
+                  "score=%d  elapsed=%.0fs\n",
+                  fwd, done, todo.size(), n, (unsigned long long)slots[longest].seed,
+                  slots[longest].game.turns(), slots[longest].game.score(), el);
+      std::fflush(stdout);
+    }
 
     std::vector<Slot> survivors;
     survivors.reserve(n);

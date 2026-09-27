@@ -5755,3 +5755,38 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Same windows from the buggy teacher (entry 247): wash. The flywheel works once the teacher is
      right. Running: alpha 0.85 / 1.0 (dose-response still rising at 0.7) and a fresh-bank
      confirmation of alpha 0.7 (seeds 3,000,000-3,000,999, A1 = 41,667 there).
+     CONFIRMED on fresh seeds 3,000,000-3,000,999 (A1 there: 41,667 / P50 30,387 / <1k 1.0%):
+       blend alpha 0.7        70,782 / P50 49,390 / P10 7,171 / P95 213,013 / <1k 0.5% / max 578,521
+     (+70% mean, +63% median). Candidate A2 = alphatrain/data/ta_gen1b_e4_a0.7.pt.
+     Dose-response keeps rising through the plain fine-tune (gate bank, 1k uncapped):
+       alpha 0.85             75,353 / P50 52,067 / P10 8,954 / P95 236,692 / <1k 0.4%
+       alpha 1.0              81,033 / P50 54,926 / P10 9,670 / P95 252,156 / <1k 0.3%   (+93%)
+     alpha 1.0 == checkpoints/gen1b_ft/epoch_4.pt itself (frozen BN): with a correct teacher, plain
+     "resume from A1 and continue" on the crisis windows is the best channel (the -22% of entry 246
+     was the buggy teacher's labels). Running: alpha 1.0 on the fresh bank, alpha 1.3 extrapolation.
+     alpha 1.0 CONFIRMED on fresh seeds 3,000,000-3,000,999: 77,311 / P50 52,597 / P10 7,795 / P95
+     242,302 / <1k 0.6% / max 580,375 (A1 there 41,667 / 30,387: +86% mean, +73% median; alpha 0.7
+     there 70,782). **A2 = checkpoints/gen1b_ft/epoch_4.pt** (== alphatrain/data/ta_gen1b_e4_a1.0.pt,
+     TS inference_cpp/data/ta_gen1b_e4_a1.0_ts.pt): A1 fine-tuned 4 epochs on 194k fixed-teacher
+     crisis-window rows.
+     EXTRAPOLATION keeps improving (theta = A1 + alpha * task vector, gate bank, percentiles; ">=100k" =
+     share of games reaching 100k turns, the new infinite-play metric):
+       model       P10     P25     P50      P75   >=100k
+       A1          4,552  12,468  28,442   56,904    1.0%
+       alpha 1.0   9,670  25,768  54,926  112,766    7.9%
+       alpha 1.3   9,621  25,719  62,498  122,076   10.4%
+       alpha 1.6  10,776  30,179  71,431  144,984   13.8%
+       alpha 2.0  12,204  33,234  79,481  166,507   18.4%
+     The fine-tune points the right way but moves too little. New eval protocol (owner, 2026-09-26):
+     every eval --max-turns 100000 (eval_log default), judged by percentiles + capped share, never the
+     mean; EVAL.md gained a `capped` column (older rows uncapped -> 0.0%). Evals are C++ only.
+     Running: alpha 2.5 / 3.0 (capped 100k).
+       alpha 2.5  16,085  43,272 102,938  203,505   25.3%   (cap 100k)
+       alpha 3.0  16,249  43,321 100,123  194,884   23.3%   (cap 100k)
+     Peak around alpha 2.5-3.0 (P75 is now at the cap's ceiling). Candidate A2 = alpha 2.5
+     (alphatrain/data/ta_gen1b_e4_a2.5.pt): P50 3.6x A1, a quarter of games survive 100k turns.
+     gen1_selfplay_A1 (owner) finished: 200 games, 45,859 s (not yet used).
+     alpha 2.5 CONFIRMED on fresh seeds 3,000,000-3,000,999 (cap 100k): P10 15,884 / P25 46,727 /
+     P50 104,629 / P75 203,185 / 24.9% reach 100k turns (A1 there: 4,785 / 13,211 / 30,387 / 59,487
+     / 0.9%). **A2 = alphatrain/data/ta_gen1b_e4_a2.5.pt** = A1 + 2.5*(checkpoints/gen1b_ft/epoch_4.pt
+     - A1), TS inference_cpp/data/ta_gen1b_e4_a2.5_ts.pt. Next turn: scripts/flywheel_turn.sh from A2.
