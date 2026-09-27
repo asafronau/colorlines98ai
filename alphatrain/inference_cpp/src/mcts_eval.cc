@@ -58,7 +58,7 @@ Args ParseArgs(int argc, char** argv) {
     if (k == "--early-stop") { a.early_stop = true; continue; }
     if (k == "--fp32") { a.fp32 = true; continue; }
     if (k == "--virtual-mean") { a.virtual_mean = true; continue; }
-    if (i + 1 >= argc) break;
+    if (i + 1 >= argc) { std::fprintf(stderr, "FATAL: missing value for %s\n", k.c_str()); std::exit(2); }
     if (k == "--model") a.model = argv[++i];
     else if (k == "--csv") a.csv = argv[++i];
     else if (k == "--value-module") a.value_module = argv[++i];
@@ -73,6 +73,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--q-range-floor") a.q_range_floor = std::stod(argv[++i]);
     else if (k == "--max-turns") a.max_turns = std::stol(argv[++i]);
     else if (k == "--threads") a.threads = std::stoi(argv[++i]);
+    else { std::fprintf(stderr, "FATAL: unknown argument %s\n", k.c_str()); std::exit(2); }
   }
   if (!std::isfinite(a.q_range_floor) || a.q_range_floor < 0 ||
       a.batch_size <= 0 || a.sims <= 0 || a.top_k <= 0 ||

@@ -61,7 +61,7 @@ Args ParseArgs(int argc, char** argv) {
     std::string k = argv[i];
     if (k == "--fp32") { a.fp32 = true; continue; }
     if (k == "--virtual-mean") { a.virtual_mean = true; continue; }
-    if (i + 1 >= argc) break;
+    if (i + 1 >= argc) { std::fprintf(stderr, "FATAL: missing value for %s\n", k.c_str()); std::exit(2); }
     if (k == "--model") a.model = argv[++i];
     else if (k == "--value-module") a.value_module = argv[++i];
     else if (k == "--device") a.device = argv[++i];

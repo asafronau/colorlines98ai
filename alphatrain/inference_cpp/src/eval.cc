@@ -154,7 +154,7 @@ Args ParseArgs(int argc, char** argv) {
     if (k == "--fp32") { a.fp32 = true; continue; }
     if (k == "--verbose-games") { a.verbose_games = true; continue; }
     if (k == "--canon") { a.canon = true; continue; }
-    if (i + 1 >= argc) break;  // remaining flags take a value
+    if (i + 1 >= argc) { std::fprintf(stderr, "FATAL: missing value for %s\n", k.c_str()); std::exit(2); }
     if (k == "--model") a.model = argv[++i];
     else if (k == "--tta") a.tta = std::stoi(argv[++i]);
     else if (k == "--device") a.device = argv[++i];
@@ -169,6 +169,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--record-every") a.record_every = std::stoi(argv[++i]);
     else if (k == "--record-tail") a.record_tail = std::stoi(argv[++i]);
     else if (k == "--anchors") a.anchors = argv[++i];
+    else { std::fprintf(stderr, "FATAL: unknown argument %s\n", k.c_str()); std::exit(2); }
   }
   if (a.device != "mps" && a.device != "cpu") {
     std::fprintf(stderr, "FATAL: unsupported device %s (expected mps or cpu)\n",

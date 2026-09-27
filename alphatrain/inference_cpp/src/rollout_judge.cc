@@ -59,7 +59,7 @@ Args ParseArgs(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k == "--fp32") { a.fp32 = true; continue; }
-    if (i + 1 >= argc) break;
+    if (i + 1 >= argc) { std::fprintf(stderr, "FATAL: missing value for %s\n", k.c_str()); std::exit(2); }
     if (k == "--model") a.model = argv[++i];
     else if (k == "--burst-model") a.burst_model = argv[++i];
     else if (k == "--burst-len") a.burst_len = std::stoi(argv[++i]);
@@ -70,6 +70,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--horizon") a.horizon = std::stoi(argv[++i]);
     else if (k == "--seed-offset") a.seed_offset = std::stoull(argv[++i]);
     else if (k == "--batch") a.batch = std::stoi(argv[++i]);
+    else { std::fprintf(stderr, "FATAL: unknown argument %s\n", k.c_str()); std::exit(2); }
   }
   if (a.device != "mps" && a.device != "cpu") {
     std::fprintf(stderr, "FATAL: unsupported device %s (expected mps or cpu)\n",

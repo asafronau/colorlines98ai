@@ -6,17 +6,25 @@ An AlphaZero-inspired AI for [Color Lines 98](https://en.wikipedia.org/wiki/Line
 
 ## Current results
 
-The current model is a **3M-parameter ResNet (18 blocks × 96 channels)** that plays greedily: one forward pass per move, no search. Games run to natural death (no turn cap) on a fixed bank of 1,000 seeds (2,600,000–2,600,999):
+The current model is a **3M-parameter ResNet (18 blocks × 96 channels)** that plays greedily: one forward pass per move, no search. Games are played in the C++ engine on a fixed bank of 1,000 seeds (2,600,000–2,600,999) and stopped at 100,000 turns. Games are getting long, so results are judged by percentiles and by the share of games that survive to the cap, not by the mean:
 
-| Player | Mean | Median | P10 | P95 | Games < 1,000 | Max |
+| Player | P10 | P25 | Median | P75 | Reach 100k turns | Games < 1,000 |
 |---|---:|---:|---:|---:|---:|---:|
-| 18b96 e40 (old policy head) | 14,296 | 9,948 | 1,806 | 42,773 | 4.4% | 96,692 |
-| 18b96 e40, averaged over the 8 board symmetries | 21,436 | 14,778 | 2,449 | 60,291 | 3.3% | 148,976 |
-| **A1: 18b96 + PAIR2 policy head + legal-move mask (epoch 40)** | **41,938** | **28,442** | **4,552** | **134,502** | **0.9%** | **338,096** |
-| A1 at epoch 33, averaged over the 8 board symmetries | 47,622 | 33,624 | 5,487 | 141,758 | 1.3% | 340,408 |
-| *Reference:* pillar3k, 10 blocks × 256 channels, 11.9M params (5,000 other seeds) | 43,390 | 31,016 | 5,010 | 126,379 | 1.3% | 337,411 |
+| 18b96 e40 (old policy head) | 1,806 | 4,500 | 9,948 | 19,710 | 0.0% | 4.4% |
+| 18b96 e40, averaged over the 8 board symmetries | 2,449 | 6,168 | 14,778 | 32,317 | 0.0% | 3.3% |
+| A1: 18b96 + PAIR2 policy head + legal-move mask | 4,552 | 12,468 | 28,442 | 56,904 | 1.0% | 0.9% |
+| A2: A1 + first flywheel turn (fixed-teacher crisis corrections) | 16,085 | 43,272 | 102,938 | 203,505 | 25.3% | 0.1% |
+| **A3 (candidate): A2 + second flywheel turn** | **39,270** | **107,085** | **at the cap** | **at the cap** | **55.4%** | **0.2%** |
 
-Every evaluation is logged in [`alphatrain/EVAL.md`](alphatrain/EVAL.md), and every experiment in [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) (245 entries).
+A2 held up on two more banks: seeds 3,000,000–3,000,999 (P10 15,884 / median 104,629 / 24.9% reaching 100k turns, against A1's 4,785 / 30,387 / 0.9%) and 3,400,000–3,400,999 (16,470 / 104,883 / 27.0%). A3 is the second turn's result on the gate bank; its fresh-bank check is running. More than half of A3's games survive 100,000 turns, so its median now sits at the cap and the share of games reaching the cap, P10 and P25 are the numbers to watch. For reference, the 4× larger 256-channel pillar3k model had a median of 31,016 (5,000 other seeds).
+
+Every evaluation is logged in [`alphatrain/EVAL.md`](alphatrain/EVAL.md), and every experiment in [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) (252 entries).
+
+### The first flywheel turn: A1 → A2
+
+A1's own search (600 simulations, its survival head as leaf value) replayed each of A1's deaths from 15 and 30 moves earlier, and the first 45 searched moves of each replay became training labels: 194k positions. A1 was fine-tuned on them for 4 epochs with BatchNorm statistics frozen, and A2 moves 2.5× as far as that fine-tune did, **A2 = A1 + 2.5 · (fine-tuned − A1)**. The fine-tune points in the right direction but stops short; the gain keeps growing up to 2.5–3× before it flattens.
+
+It only worked after finding a bug. For two months the crisis-mining tool had loaded the survival head but searched with an older 27-feature value estimate, while its output files claimed otherwise. Replayed from the same states with the same spawns, the buggy search escaped 60% of A1's deaths against 55% for A1 alone; the fixed search escaped 72%. Every way of training on the buggy labels (weight blending, continuous training, correction-only fine-tunes) came out even with A1. The same recipe on the fixed labels tripled the median.
 
 ### What changed: the policy head
 
@@ -47,17 +55,24 @@ It is exactly equivariant under the 8 board symmetries and still outputs 81 × 8
 - **Game engines:** Python (Numba) in `game/` and C++ in `alphatrain/inference_cpp/`, checked against each other with golden tests.
 - **Input:** 18 channels: 7 color planes, empty cells, next-ball positions, connected-component areas, and line potentials in 4 directions.
 - **Model:** a ResNet trunk plus the PAIR2 policy head. A separate **survival head** is trained on the frozen trunk to predict the probability of surviving the next H turns, at several horizons. Only the search uses it.
-- **Labels:** PUCT MCTS with 400–600 simulations, c_puct 1.5, Q weight 2.0, and the survival head as leaf value. Two sources:
-  - self-play games;
-  - **crisis mining:** play the policy greedily, then at each death rewind 15 and 30 moves and replay with search to find an escape.
-- **Training:** from scratch, on Colab.
+- **Labels:** PUCT MCTS with 400–600 simulations, c_puct 1.5, Q weight 2.0, and the survival head as leaf value. The main source is **crisis mining**: play the policy greedily, then at each death rewind 15 and 30 moves and replay with search to find an escape.
+- **A1 (base model):** trained from scratch on Colab on 12.5M search-labeled positions.
   - Loss: hard cross-entropy on the search's move, with illegal moves masked.
   - D4 augmentation.
   - Batch 32,768; lr 3e-3 with 1 warmup epoch, then cosine; 40 epochs.
   - Command: `alphatrain/train_path_b.py --policy-head pair2 --legal-mask-loss`.
-- **Evaluation:** greedy policy only, in the C++ engine (MPS, fp16), 1,000 uncapped games on the fixed seed bank. The policy plays alone; search is used only to make training labels.
+- **Flywheel turn** (`scripts/flywheel_turn.sh`), a few hours on one Mac:
+  1. Record the actor's own games.
+  2. Train its survival head on the frozen trunk.
+  3. Mine its deaths with search.
+  4. Fine-tune on the crisis windows with BatchNorm frozen.
+  5. Sweep how far to push along the fine-tune's direction.
+  6. Gate the result.
+- **Evaluation:** greedy policy only, in the C++ engine (MPS, fp16), 1,000 games on the fixed seed bank, capped at 100,000 turns and judged by percentiles and the share of games reaching the cap. The policy plays alone; search is used only to make training labels.
 
-**Next:** flywheel generation 1. A1 and its own survival head generate new labels (crisis mining on A1's deaths, plus self-play). A2 then trains from scratch on the old and new labels. The bar is +20% (≥ 50k).
+**Second turn (A2 → A3):** the same script from A2, with A2's own survival head. 2,240 deaths in 3,000 probes (760 probes survived 100k turns), 4,480 replays, then **A3 = A2 + 2 · (fine-tuned − A2)**: P10 39,270 and 55.4% of games reaching 100k turns, from A2's 16,085 and 25.3%.
+
+**Next:** confirm A3 on fresh seeds, then the third turn. Deaths are getting rare, so mining will need more probe seeds or a longer probe cap, and evals a higher turn cap.
 
 ## How we got here
 
@@ -71,9 +86,11 @@ It is exactly equivariant under the 8 board symmetries and still outputs 81 × 8
 | pillar3f | 31,617 | Crisis fine-tune merged by task arithmetic |
 | pillar3k (11.9M params) | 43,390 | Decisiveness-weighted crisis distillation |
 | 18b96 e40 (3M params) | 14,296 | Small model trained from scratch on all data (12.5M positions) |
-| **A1 (3M params)** | **41,938** | **PAIR2 policy head + legal-move mask** |
+| A1 (3M params) | 41,938 | PAIR2 policy head + legal-move mask |
+| A2 (3M params) | median 102,938 | First flywheel turn with the fixed search |
+| **A3 candidate (3M params)** | **55.4% reach 100k turns** | **Second flywheel turn** |
 
-All rows after the heuristic are greedy policy play without search. Sample sizes and seed banks differ by row (100–5,000 games); HISTORY.md has each one.
+All rows after the heuristic are greedy policy play without search. Sample sizes and seed banks differ by row (100–5,000 games); HISTORY.md has each one. From A2 on, games are capped at 100,000 turns and compared by percentiles.
 
 ## Earlier discoveries
 
@@ -114,7 +131,7 @@ Requires Python 3.10+, PyTorch 2.0+, and Numba. The C++ engine needs CMake and L
 
 ```bash
 cd alphatrain/inference_cpp
-./build/eval --model data/<model>_ts.pt --device mps --batch 500 --seed-start 2600000 --seed-end 2601000
+./build/eval --model data/<model>_ts.pt --device mps --batch 500 --seed-start 2600000 --seed-end 2601000 --max-turns 100000
 ```
 
 ## Acknowledgments

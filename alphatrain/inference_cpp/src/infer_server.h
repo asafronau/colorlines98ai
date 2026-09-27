@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <future>
@@ -107,8 +108,16 @@ class InferenceServer {
       for (Req* r : batch) {
         std::memcpy(r->out, src, static_cast<size_t>(r->n) * 6561 * sizeof(float));
         src += static_cast<size_t>(r->n) * 6561;
-        if (r->out_v && vsrc)
+        if (r->out_v) {
+          // A search asking for leaf values from a policy-only module would otherwise read
+          // zeros (flat Q, prior-only search): the reverse of the HISTORY 249 bug.
+          if (!vsrc) {
+            std::fprintf(stderr, "FATAL: leaf values requested from a policy-only module "
+                                 "(nn_value search without a fused --value-module)\n");
+            std::abort();
+          }
           std::memcpy(r->out_v, vsrc, static_cast<size_t>(r->n) * sizeof(float));
+        }
         if (vsrc) vsrc += r->n;
         r->prom.set_value();
       }

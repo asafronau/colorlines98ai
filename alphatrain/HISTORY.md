@@ -5790,3 +5790,37 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      P50 104,629 / P75 203,185 / 24.9% reach 100k turns (A1 there: 4,785 / 13,211 / 30,387 / 59,487
      / 0.9%). **A2 = alphatrain/data/ta_gen1b_e4_a2.5.pt** = A1 + 2.5*(checkpoints/gen1b_ft/epoch_4.pt
      - A1), TS inference_cpp/data/ta_gen1b_e4_a2.5_ts.pt. Next turn: scripts/flywheel_turn.sh from A2.
+
+251. **MCTS config audit after the entry-249 bug: no other tool has it; parsers and the inference
+     server hardened.** (2026-09-26)
+     Every MctsConfig site (mcts_selfplay cfg + clean_cfg, mcts_crisis cfg + clean_cfg, mcts_relabel,
+     mcts_eval, anchor_search) copies every parsed search flag, and every tool derives the server's
+     fused mode and cfg.nn_value from the same bool. Confirmed minor defects: (1) label_dirichlet_weight
+     is written as a constant 0.0 (no consumer relies on it); (2) policy_model / run_config "model"
+     record --model, but with --value-module only the fused module is loaded, so the recorded policy is
+     right only if pv was exported from that checkpoint (flywheel_turn.sh does); (3) eval, mcts_eval
+     and rollout_judge silently ignored unknown flags (a typo like --max_turns would run uncapped), and
+     mcts_relabel ignored a trailing value-less flag. Fixed (3): all four now exit on unknown or
+     value-less flags. InferenceServer now aborts if a search asks for leaf values from a policy-only
+     module (it used to hand back zeros: a flat-Q, prior-only search, the reverse of entry 249).
+     Noted, not changed: per-tool defaults differ (c_puct 2.5 vs 1.5, q_weight 1.0 vs 2.0), so every
+     script passes the operating point explicitly (c1.5 q2 --virtual-mean).
+
+252. **Flywheel turn 2 (A2 -> A3): more than half the games now survive 100k turns.** (2026-09-26..27)
+     Owner run: scripts/flywheel_turn.sh alphatrain/data/ta_gen1b_e4_a2.5.pt A2 3400000 3500000
+     "1.0 2.0 3.0" (binaries with the entry-251 hardening; no previous-generation windows).
+     - Own games: 1,000 greedy games, seeds 3,400,000-3,400,999, cap 100k, 38 min: P10 16,470 /
+       P25 42,529 / P50 104,883 / 27.0% capped (third bank agreeing on A2).
+     - Survival head value_head_A2.pt on the frozen A2 trunk (5 ep, 19.6 min, inner-val 0.0270);
+       fused pv_A2_ts.pt.
+     - Mining: mcts_crisis --run-id A2_crisis_w45, seeds 3,500,000-3,502,999, probe cap 100k, 600 sims,
+       c1.5 q2 virtual mean, 45-move windows: 2,240 deaths (760 probes survived 100k turns), 4,480
+       replays (3,441 survived their 45 moves), 5.4 h (probes 2.3 h).
+     - Fine-tune: 4 ep, frozen BN, lr1e-4, T0.5 -> checkpoints/A2_ft/epoch_4.pt (val 1.6859).
+     Gate bank 2,600,000-2,600,999, cap 100k (A2: P10 16,085 / P25 43,272 / P50 102,938 / 25.3%):
+       alpha 1.0   P10 23,070 / P25  74,148 / P50 178,426 / capped 44.9%
+       alpha 2.0   P10 39,270 / P25 107,085 / P50  at cap / capped 55.4%
+       alpha 3.0   P10 33,314 / P25 113,973 / P50  at cap / capped 57.2%
+     A3 candidate = alpha 2.0 (best floor): alphatrain/data/ta_A2_e4_a2.0.pt. With >50% of games at
+     the cap, P50 is censored; the capped share, P10 and P25 are the live metrics. Running: fresh-bank
+     confirmation (3,000,000-3,000,999).
