@@ -14,9 +14,9 @@ The current model is a **3M-parameter ResNet (18 blocks × 96 channels)** that p
 | 18b96 e40, averaged over the 8 board symmetries | 2,449 | 6,168 | 14,778 | 32,317 | 0.0% | 3.3% |
 | A1: 18b96 + PAIR2 policy head + legal-move mask | 4,552 | 12,468 | 28,442 | 56,904 | 1.0% | 0.9% |
 | A2: A1 + first flywheel turn (fixed-teacher crisis corrections) | 16,085 | 43,272 | 102,938 | 203,505 | 25.3% | 0.1% |
-| **A3 (candidate): A2 + second flywheel turn** | **39,270** | **107,085** | **at the cap** | **at the cap** | **55.4%** | **0.2%** |
+| **A3: A2 + second flywheel turn** | **39,270** | **107,085** | **at the cap** | **at the cap** | **55.4%** | **0.2%** |
 
-A2 held up on two more banks: seeds 3,000,000–3,000,999 (P10 15,884 / median 104,629 / 24.9% reaching 100k turns, against A1's 4,785 / 30,387 / 0.9%) and 3,400,000–3,400,999 (16,470 / 104,883 / 27.0%). A3 is the second turn's result on the gate bank; its fresh-bank check is running. More than half of A3's games survive 100,000 turns, so its median now sits at the cap and the share of games reaching the cap, P10 and P25 are the numbers to watch. For reference, the 4× larger 256-channel pillar3k model had a median of 31,016 (5,000 other seeds).
+A2 held up on two more banks: seeds 3,000,000–3,000,999 (P10 15,884 / median 104,629 / 24.9% reaching 100k turns, against A1's 4,785 / 30,387 / 0.9%) and 3,400,000–3,400,999 (16,470 / 104,883 / 27.0%). A3 is confirmed on seeds 3,000,000–3,000,999: P1 5,236 / P10 31,404 / 56.3% reaching 100k turns (A2: 1,434 / 15,884 / 24.9%). More than half of A3's games survive 100,000 turns, so its median now sits at the cap and the share of games reaching the cap, P10 and P25 are the numbers to watch. For reference, the 4× larger 256-channel pillar3k model had a median of 31,016 (5,000 other seeds).
 
 Every evaluation is logged in [`alphatrain/EVAL.md`](alphatrain/EVAL.md), and every experiment in [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) (252 entries).
 
@@ -72,7 +72,9 @@ It is exactly equivariant under the 8 board symmetries and still outputs 81 × 8
 
 **Second turn (A2 → A3):** the same script from A2, with A2's own survival head. 2,240 deaths in 3,000 probes (760 probes survived 100k turns), 4,480 replays, then **A3 = A2 + 2 · (fine-tuned − A2)**: P10 39,270 and 55.4% of games reaching 100k turns, from A2's 16,085 and 25.3%.
 
-**Next:** confirm A3 on fresh seeds, then the third turn. Deaths are getting rare, so mining will need more probe seeds or a longer probe cap, and evals a higher turn cap.
+**Escaping trouble:** started from the 5,176 positions 30 and 15 moves before a weaker greedy player (A1) died, A1 itself escapes 54.7% / 27.1%, A2 63.7% / 34.1%, A3 68.0% / 36.6%. This improves much more slowly than survival in the model's own games: the models mostly learn to stay out of trouble.
+
+**Next:** keep turning the flywheel until P1 reaches the 100k-turn cap. Deaths are getting rare, so mining will need more probe seeds or a longer probe cap, and evals a higher turn cap.
 
 ## How we got here
 
@@ -88,7 +90,7 @@ It is exactly equivariant under the 8 board symmetries and still outputs 81 × 8
 | 18b96 e40 (3M params) | 14,296 | Small model trained from scratch on all data (12.5M positions) |
 | A1 (3M params) | 41,938 | PAIR2 policy head + legal-move mask |
 | A2 (3M params) | median 102,938 | First flywheel turn with the fixed search |
-| **A3 candidate (3M params)** | **55.4% reach 100k turns** | **Second flywheel turn** |
+| **A3 (3M params)** | **55.4% reach 100k turns** | **Second flywheel turn** |
 
 All rows after the heuristic are greedy policy play without search. Sample sizes and seed banks differ by row (100–5,000 games); HISTORY.md has each one. From A2 on, games are capped at 100,000 turns and compared by percentiles.
 

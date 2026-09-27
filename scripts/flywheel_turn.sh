@@ -7,7 +7,7 @@
 #   e.g. caffeinate -is scripts/flywheel_turn.sh alphatrain/data/ta_gen1b_e4_a1.3.pt A2 3400000 3500000 "1.0 1.3 1.6" data/gen1b_crisis_A1_w45
 #
 # record_seed: 1,000 fresh seeds for the actor's own games (cap 100k turns) (also a fresh-bank eval of it).
-# mine_seed:   3,000 fresh probe seeds for crisis mining. prev_windows_dir: earlier generations'
+# mine_seed:   $PROBES (default 3,000) fresh probe seeds for crisis mining. prev_windows_dir: earlier generations'
 # window corpora replayed in the fine-tune.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -15,6 +15,7 @@ ACTOR=$1; TAG=$2; RSEED=$3; MSEED=$4; ALPHAS=$5; shift 5; PREV=("$@")
 CPP=alphatrain/inference_cpp
 D=alphatrain/data
 PY=.venv/bin/python
+PROBES=${PROBES:-3000}   # crisis probe seeds; raise as deaths get rare (e.g. PROBES=5000 scripts/flywheel_turn.sh ...)
 mkdir -p logs checkpoints/${TAG}_ft $D/greedy_${TAG}_cap100k
 
 echo "=== [1/7] export $TAG ($(date)) ==="
@@ -40,9 +41,9 @@ $PY -m alphatrain.inference_cpp.export_policy_value --model "$ACTOR" --head $D/v
     > logs/${TAG}_export_pv.log 2>&1
 mv $CPP/data/policy_value_ts.pt $CPP/data/pv_${TAG}_ts.pt
 
-echo "=== [4/7] fixed-teacher crisis windows, probe seeds $MSEED+ ($(date)) ==="
+echo "=== [4/7] fixed-teacher crisis windows, $PROBES probe seeds from $MSEED ($(date)) ==="
 (cd $CPP && ./build/mcts_crisis --run-id ${TAG}_crisis_w45 --model data/${TAG}_ts.pt \
-    --value-module data/pv_${TAG}_ts.pt --device mps --seed-start $MSEED --seed-end $((MSEED + 3000)) \
+    --value-module data/pv_${TAG}_ts.pt --device mps --seed-start $MSEED --seed-end $((MSEED + PROBES)) \
     --recovery-turns 15 --recovery-sims 600 --prevention-turns 30 --prevention-sims 600 \
     --c-puct 1.5 --q-weight 2.0 --virtual-mean --dirichlet-weight 0 --continue-turns 45 \
     --policy-max-turns 100000 --threads 14 --out-dir ../../data/${TAG}_crisis_w45) \

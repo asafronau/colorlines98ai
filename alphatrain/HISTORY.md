@@ -5824,3 +5824,20 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      A3 candidate = alpha 2.0 (best floor): alphatrain/data/ta_A2_e4_a2.0.pt. With >50% of games at
      the cap, P50 is censored; the capped share, P10 and P25 are the live metrics. Running: fresh-bank
      confirmation (3,000,000-3,000,999).
+     A3 CONFIRMED on fresh seeds 3,000,000-3,000,999 (cap 100k): P1 5,236 / P5 14,160 / P10 31,404 /
+     P25 104,974 / P50 at cap / 56.3% capped (A2 there: 1,434 / 6,972 / 15,884 / 46,727 / 104,629 /
+     24.9%). **A3 = alphatrain/data/ta_A2_e4_a2.0.pt** (TS ta_A2_e4_a2.0_ts.pt).
+
+253. **Escape benchmark from a weaker greedy player's imminent-death states (owner's choice of
+     "troubled positions"; no human games).** (2026-09-27)
+     eval --anchors on A1's 5,176 gen-1 rewind states (Game(seed) + SetState, the replay's spawn stream;
+     escaped = survives 500 more turns), greedy, cap 500 per anchor, ~1 min per model:
+       player                         30 moves before death   15 moves before death
+       A1 greedy                      54.7%                   27.1%
+       A2 greedy                      63.7%                   34.1%
+       A3 greedy                      68.0%                   36.6%
+       (A1 + buggy 600-sim search      63.6%                   34.0%)
+     A2's greedy play already equals A1's (buggy) search. Escape ability grows far slower than
+     on-policy survival (capped share 1% -> 25% -> 56%): the actors mostly learn to avoid trouble.
+     Track this next to the gate for the hint use case. Owner's stop criterion for the flywheel:
+     continue until P1 reaches the 100k cap; track P1-P5 from now on.
