@@ -5841,3 +5841,27 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      on-policy survival (capped share 1% -> 25% -> 56%): the actors mostly learn to avoid trouble.
      Track this next to the gate for the hint use case. Owner's stop criterion for the flywheel:
      continue until P1 reaches the 100k cap; track P1-P5 from now on.
+
+254. **Flywheel turn 3 (A3 -> A4 candidate): smaller gain, probing is now the bottleneck; off-policy
+     crisis tooling (weak probe players, mouse slips).** (2026-09-27..28)
+     Owner run: PROBES=5000 scripts/flywheel_turn.sh alphatrain/data/ta_A2_e4_a2.0.pt A3 3600000 3700000
+     "1.0 2.0 3.0". A3 own games (seeds 3.6M, cap 100k): P1 3,675 / P10 37,439 / 57.4% capped. Mining:
+     5,000 probes -> 2,159 deaths, 4,318 replays; probe phase 5.2 h of 8.3 h. Fine-tune val 1.4603.
+     Gate bank, cap 100k (A3: P1 3,459 / P5 16,380 / P10 39,270 / P25 107,085 / 55.4%):
+       alpha 1.0   P1 5,583 / P5 21,611 / P10 45,152 / P25 124,695 / capped 62.3%   <- A4 candidate
+       alpha 2.0   P1 3,908 / P5 18,811 / P10 40,468 / P25 115,615 / capped 60.5%
+       alpha 3.0   P1 2,411 / P5 16,905 / P10 32,463 / P25  90,680 / capped 50.4%
+     Diminishing returns (capped share 1% -> 25% -> 55% -> 62%) and the optimal alpha fell to 1.0.
+     Owner's direction: two goals (infinite play on a small model; recover from real human positions);
+     death spirals may be alike, so cheap probes by a human-level player (scratch18b96_lr3e3_ckpts_epoch_4,
+     mean 2,368 = average human; games die in ~1-2k turns) could replace most strong-actor probing; bad
+     play simulated with mouse slips; quiet play stays in the data.
+     New mcts_crisis options (tested on MPS, scratchpad test_probe_model2.sh): --probe-model (a weaker
+     policy plays the probes, the actor's search replays; recorded as probe_model), --probe-slip p (per
+     move, a uniformly random legal move; reproducible per seed; recorded), --anchors-out (anchors.h
+     lines, seed = ReplaySeed = original*37+rewind), --probe-only. Checks: same-model --probe-model and
+     --probe-slip 0 reproduce the default anchors exactly; 5% slips cut epoch-4's mean death turn from
+     1,399 to 244. Bug caught in testing: slip RNGs seeded with seed*gamma made consecutive games'
+     streams overlap (4.37% instead of 5%); hashed seeding gives 5.05% over 99k moves.
+     Escape horizon: failed rescues die fast (95-98% by move 100, 99-100% by move 200, gen-1 search and
+     A1-A3 greedy), so escape = survive 200 moves from now on.

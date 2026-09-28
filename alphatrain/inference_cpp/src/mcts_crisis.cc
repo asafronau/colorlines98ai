@@ -29,6 +29,7 @@
 #include <dirent.h>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -72,6 +73,12 @@ struct Args {
   bool fp32 = false;
   bool full_record = false;
   bool virtual_mean = false;  // corrected pending-visit placeholder (see mcts.h)
+  // Off-policy crises (HISTORY 254): a different (weaker) policy plays the probes, the actor's
+  // search still does the replays. Empty = the actor probes (the server's own policy).
+  std::string probe_model;
+  std::string anchors_out;  // write every replay checkpoint as an anchors.h line
+  bool probe_only = false;  // stop after phase 1 (with --anchors-out: build escape benchmarks)
+  double probe_slip = 0.0;  // per-move probability of a uniformly random legal probe move (mouse slip)
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -81,6 +88,7 @@ Args ParseArgs(int argc, char** argv) {
     if (k == "--fp32") { a.fp32 = true; continue; }
     if (k == "--full-record") { a.full_record = true; continue; }
     if (k == "--virtual-mean") { a.virtual_mean = true; continue; }
+    if (k == "--probe-only") { a.probe_only = true; continue; }
     if (i + 1 >= argc) {
       std::fprintf(stderr, "FATAL: missing value for %s\n", k.c_str());
       std::exit(2);
@@ -107,6 +115,9 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--dirichlet-alpha") a.dirichlet_alpha = std::stod(argv[++i]);
     else if (k == "--dirichlet-weight") a.dirichlet_weight = std::stod(argv[++i]);
     else if (k == "--threads") a.threads = std::stoi(argv[++i]);
+    else if (k == "--probe-model") a.probe_model = argv[++i];
+    else if (k == "--probe-slip") a.probe_slip = std::stod(argv[++i]);
+    else if (k == "--anchors-out") a.anchors_out = argv[++i];
     else {
       std::fprintf(stderr, "FATAL: unknown argument %s\n", k.c_str());
       std::exit(2);
@@ -117,6 +128,10 @@ Args ParseArgs(int argc, char** argv) {
       a.policy_max_turns <= 0 || a.probe_batch <= 0 ||
       a.batch_size <= 0 || a.top_k <= 0 || a.threads <= 0) {
     std::fprintf(stderr, "FATAL: invalid seed/search/batch/turn arguments\n");
+    std::exit(2);
+  }
+  if (a.probe_slip < 0.0 || a.probe_slip > 1.0) {
+    std::fprintf(stderr, "FATAL: --probe-slip must be in [0, 1]\n");
     std::exit(2);
   }
   if (a.device != "mps" && a.device != "cpu") {
@@ -140,6 +155,10 @@ struct ReplayTask {
   const char* label;  // "recovery" | "prevention"
   int rewind, sims;
 };
+
+// Spawn-stream seed of a replay (and of its anchor, so eval --anchors / anchor_search replay the
+// same spawns): recoverable rewind = seed % 37.
+inline uint64_t ReplaySeed(const ReplayTask& t) { return t.original_seed * 37 + t.rewind; }
 
 constexpr int kRecoveryBit = 1, kPreventionBit = 2;
 
@@ -237,6 +256,9 @@ int main(int argc, char** argv) {
     clines::AppendD(config, args.dirichlet_alpha);
     config += ", \"dirichlet_weight\": ";
     clines::AppendD(config, args.dirichlet_weight);
+    config += ", \"probe_model\": \"" + args.probe_model + "\"";
+    config += ", \"probe_slip\": ";
+    clines::AppendD(config, args.probe_slip);
     config += ", \"threads\": " + std::to_string(args.threads) +
               ", \"full_record\": " +
               (args.full_record ? std::string("true") : std::string("false")) +
@@ -247,6 +269,14 @@ int main(int argc, char** argv) {
   clines::InferenceServer server(nn_value ? args.value_module : args.model,
                                  dev, fp16, 10000, nn_value);
   if (nn_value) std::printf("NN value head: %s\n", args.value_module.c_str());
+  // Phase-1 probes: the actor's policy (the same server) unless --probe-model names another one.
+  std::unique_ptr<clines::InferenceServer> probe_server;
+  if (!args.probe_model.empty()) {
+    probe_server = std::make_unique<clines::InferenceServer>(args.probe_model, dev, fp16, 10000,
+                                                             /*fused=*/false);
+    std::printf("probe policy (off-policy crises): %s\n", args.probe_model.c_str());
+  }
+  clines::InferenceServer& probe_eval = probe_server ? *probe_server : server;
 
   std::vector<uint64_t> seeds;
   for (uint64_t s = args.seed_start; s < args.seed_end; ++s) seeds.push_back(s);
@@ -286,6 +316,7 @@ int main(int argc, char** argv) {
     uint64_t seed;
     clines::Game game;
     std::deque<Snapshot> ring;
+    clines::SimpleRng slip_rng{0};  // --probe-slip: per-game, seeded from the probe seed
   };
   const size_t ring_cap = args.prevention_turns + 1;
   size_t next_seed = 0;
@@ -304,6 +335,10 @@ int main(int argc, char** argv) {
     s.game = clines::Game(s.seed);
     s.game.Reset();
     s.ring.clear();
+    // Hash the seed first: SplitMix64 steps its state by the golden gamma, so seeding with seed*gamma
+    // made game k+1's stream game k's shifted by one draw (correlated slips across games).
+    clines::SimpleRng mix(s.seed ^ 0x534C4950ULL);
+    s.slip_rng = clines::SimpleRng(mix.NextU64());
     return true;
   };
   int B = std::min<int>(args.probe_batch, (int)seeds.size());
@@ -317,6 +352,9 @@ int main(int argc, char** argv) {
   std::vector<float> obs_buf, logits_buf;
   std::vector<int> lp_acts(1);
   std::vector<double> lp_pris(1);
+  std::vector<float> slip_mask(clines::kActions);
+  std::vector<int> slip_legal;
+  long probe_moves = 0, probe_slips = 0;
   int probes_done = 0, probe_deaths = 0;
 
   while (!slots.empty()) {
@@ -335,7 +373,7 @@ int main(int argc, char** argv) {
       if (s.ring.size() > ring_cap) s.ring.pop_front();
       s.game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
     }
-    server.Eval(obs_buf.data(), n, logits_buf.data());  // ONE bulk forward
+    probe_eval.Eval(obs_buf.data(), n, logits_buf.data());  // ONE bulk forward
 
     std::vector<Slot> survivors;
     survivors.reserve(n);
@@ -347,7 +385,20 @@ int main(int argc, char** argv) {
           lp_acts.data(), lp_pris.data());
       bool dead = (k == 0);
       if (!dead) {
-        int src = lp_acts[0] / 81, tgt = lp_acts[0] % 81;
+        int action = lp_acts[0];
+        ++probe_moves;
+        // Mouse slip (simulated human error): with probability --probe-slip, a uniformly random
+        // legal move instead of the policy's. The draw happens every move, so runs are
+        // reproducible and --probe-slip 0 leaves the probe untouched.
+        if (s.slip_rng.NextF64() < args.probe_slip) {
+          s.game.LegalMask(slip_mask.data());
+          slip_legal.clear();
+          for (int a = 0; a < clines::kActions; ++a)
+            if (slip_mask[a] > 0.5f) slip_legal.push_back(a);
+          action = slip_legal[s.slip_rng.RandInt(0, (int)slip_legal.size())];
+          ++probe_slips;
+        }
+        int src = action / 81, tgt = action % 81;
         if (!s.game.Move(src / 9, src % 9, tgt / 9, tgt % 9)) {
           std::fprintf(stderr, "FATAL: illegal greedy move (seed=%llu turn=%d)\n",
                        (unsigned long long)s.seed, s.game.turns());
@@ -401,7 +452,35 @@ int main(int argc, char** argv) {
   std::printf("phase 1 done: %d probes, %d deaths, %zu replay checkpoints in "
               "%.0fs\n\n",
               probes_done, probe_deaths, tasks.size(), el1);
+  if (args.probe_slip > 0.0)
+    std::printf("probe slips: %ld of %ld probe moves (%.2f%%)\n\n", probe_slips, probe_moves,
+                100.0 * probe_slips / std::max(1L, probe_moves));
   std::fflush(stdout);
+
+  if (!args.anchors_out.empty()) {
+    FILE* af = std::fopen(args.anchors_out.c_str(), "w");
+    if (!af) { std::fprintf(stderr, "FATAL: cannot write %s\n", args.anchors_out.c_str()); return 1; }
+    for (const ReplayTask& t : tasks) {  // anchors.h format
+      std::fprintf(af, "%llu %d %d", (unsigned long long)ReplaySeed(t), t.anchor.turn,
+                   args.continue_turns);
+      for (int i = 0; i < 81; ++i) std::fprintf(af, " %d", (int)t.anchor.board[i]);
+      for (int k = 0; k < 3; ++k) {
+        if (k < (int)t.anchor.next_balls.size()) {
+          const clines::NextBall& b = t.anchor.next_balls[k];
+          std::fprintf(af, " %d %d %d", b.r, b.c, b.color);
+        } else {
+          std::fprintf(af, " -1 -1 -1");
+        }
+      }
+      std::fprintf(af, "\n");
+    }
+    std::fclose(af);
+    std::printf("wrote %zu anchors to %s\n", tasks.size(), args.anchors_out.c_str());
+  }
+  if (args.probe_only) {
+    std::printf("--probe-only: no replays\n");
+    return 0;
+  }
 
   // ============ Phase 2: deep-MCTS replays from the checkpoints ============
   std::atomic<size_t> next_task{0};
@@ -415,7 +494,7 @@ int main(int argc, char** argv) {
       const ReplayTask& task = tasks[ti];
       auto tg0 = Clock::now();
 
-      uint64_t replay_seed = task.original_seed * 37 + task.rewind;
+      uint64_t replay_seed = ReplaySeed(task);
       clines::Game rg(replay_seed);
       rg.SetState(task.anchor.board, task.anchor.next_balls, task.anchor.score,
                   task.anchor.turn);
@@ -485,6 +564,8 @@ int main(int argc, char** argv) {
                    : ", \"run_id\": \"" + args.run_id + "\"") +
               ", \"policy_model\": \"" + args.model + "\"" +
               ", \"value_module\": \"" + args.value_module + "\"" +
+              ", \"probe_model\": \"" + args.probe_model + "\"" +
+              ", \"probe_slip\": " + std::to_string(args.probe_slip) +
               ", \"precision\": \"" +
                   (fp16 ? std::string("fp16") : std::string("fp32")) + "\"" +
               ", \"full_record\": " +
