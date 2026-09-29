@@ -1,7 +1,7 @@
 #!/bin/bash
 # Distillation corpus for a smaller student (HISTORY 258). Three state sources, ALL labeled with the teacher's
 # 8-symmetry-averaged policy (top-5, softmax over the 5; build_tta_corpus / relabel_tta_tensor):
-#   1. the teacher's own games: 2,000 at cap 100k, every 25th move + the last 300 (its death spirals)
+#   1. the teacher's own games: 3,000 at cap 100k, every 25th move + the last 300 (its death spirals)
 #   2. a human-level player's games (epoch 4, mean ~2.4k): 1,000 games, every move
 #   3. the states of the fixed-teacher crisis corpora (spirals from several actors and from epoch-4 deaths)
 # GPU steps run sequentially.   caffeinate -is scripts/prep_distill.sh <teacher.pt> <tag>
@@ -14,12 +14,12 @@ NAME=$(basename "$TEACHER" .pt)
 CRISIS="gen1b_crisis_A1_w45 A2_crisis_w45 A3_crisis_w45 offp_b_ep4_w45 offp_c_ep4_w200"
 mkdir -p logs $D/distill_${TAG}_teacher_games $D/distill_${TAG}_ep4_games
 
-echo "=== [1/5] teacher games ($NAME): 2,000 at cap 100k, every 25th move + last 300 ($(date)) ==="
+echo "=== [1/5] teacher games ($NAME): 3,000 at cap 100k, every 25th move + last 300 ($(date)) ==="
 [ -f $CPP/data/${NAME}_fold_ts.pt ] || $PY -m alphatrain.inference_cpp.export_ts --model "$TEACHER" \
     --output $CPP/data/${NAME}_fold_ts.pt --fold-bn > logs/distill_${TAG}_export.log 2>&1
-(cd $CPP && ./build/eval --model data/${NAME}_fold_ts.pt --device mps --batch 2000 --seed-start 4300000 \
-    --seed-end 4302000 --max-turns 100000 --record-dir ../../$D/distill_${TAG}_teacher_games --record-every 25 \
-    --record-tail 300 --scores-out data/distill_${TAG}_teacher_4300000_2000.csv) > logs/distill_${TAG}_teacher_games.log 2>&1
+(cd $CPP && ./build/eval --model data/${NAME}_fold_ts.pt --device mps --batch 3000 --seed-start 4300000 \
+    --seed-end 4303000 --max-turns 100000 --record-dir ../../$D/distill_${TAG}_teacher_games --record-every 25 \
+    --record-tail 300 --scores-out data/distill_${TAG}_teacher_4300000_3000.csv) > logs/distill_${TAG}_teacher_games.log 2>&1
 tail -n 4 logs/distill_${TAG}_teacher_games.log
 
 echo "=== [2/5] epoch-4 games: 1,000, every move ($(date)) ==="

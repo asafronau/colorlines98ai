@@ -42,7 +42,7 @@ def main():
             for j, (b, nb, mv) in enumerate(batch):
                 avg = np.stack([lg[j, v, ACT[v]] for v in range(8)]).mean(0).astype(np.float32)
                 c, idx, pri = _legal_priors_jit(b, avg, 5); k = int(c)
-                PI[s + j, :k] = idx[:k]; PV[s + j, :k] = pri[:k] / pri[:k].sum(); NZ[s + j] = k; agree += int(idx[0] == mv)
+                PI[s + j, :k] = idx[:k]; PV[s + j, :k] = pri[:k] / pri[:k].sum(); NZ[s + j] = k; agree += int(idx[int(np.argmax(pri[:k]))] == mv)  # top-k is ASCENDING: idx[0] is the 5th best
             if (s // a.chunk) % 25 == 0: print(f'  {s:,}/{n:,}', flush=True)
     perm = np.random.default_rng(0).permutation(n)
     B = np.stack([b for b, _, _ in tr]); NP = np.zeros((n, 3, 2), np.int8); NC = np.zeros((n, 3), np.int8); NN = np.zeros(n, np.int8)

@@ -36,6 +36,7 @@ def main():
                 back = lg[:, pol[t]]                                   # original action a <- view action pol[t][a]
                 if t == 0: v0_lg = back
                 acc = back if acc is None else acc + back
+            acc = acc / 8                  # MEAN logits, as build_tta_corpus (softmax of the SUM = temperature 1/8)
             legal = gpu_legal_mask(B)
             acc = acc.masked_fill(~legal, float('-inf')); v0_lg = v0_lg.masked_fill(~legal, float('-inf'))
             top = acc.topk(5, dim=1); vals = torch.softmax(top.values, dim=1)

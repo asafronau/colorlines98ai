@@ -5935,3 +5935,38 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Core ML potential (Python throughput test, not an eval): GPU 61k positions/s, GPU+Neural Engine
      66k/s at batch 1k-4k (Neural Engine alone 13.5k/s) vs ~50k/s folded MPS -> another ~1.3x if the
      C++ eval gets a Core ML (Objective-C++) inference path.
+
+258. **Data scaling at a fixed teacher: 3x the crisis data ~= 1x (union 0.48 vs A4 0.49 deaths per 100k
+     turns). Teacher strength is the lever. The union model teaches a 9x64 student.** (2026-09-28..29)
+     A3 fine-tuned 4 epochs on arms a+b+c together (A3 deaths 45 moves + epoch-4 deaths 45 + 200 moves;
+     alphatrain/data/union_abc.pt, 511,834 rows, val 1.3773), alpha 1.0 = ta_union_abc_a1.0. Folded 2k
+     gates (seeds 2,600,000-2,601,999, cap 100k, optimized eval, all games in flight):
+       union (3x data)  0.48 [0.45, 0.52]/100k turns  MTBF 207,927  P1 5,815  P5 23,452  P10 47,413  61.7%
+       A4 (arm a only)  0.49 [0.46, 0.53]/100k turns  MTBF 202,343  P1 5,643  P5 20,184  P10 41,715  61.1%
+     Intervals overlap: at the same teacher (A3 + 600-sim fixed search) more rows don't buy a lower
+     death rate. Next flywheel turns: stronger teacher (owner: 800 sims) rather than more rows.
+     Owner's decision: shrink to a 9 blocks x 64 channels PAIR2 student (~4x cheaper forward -> ~4x faster
+     evals and mining). Teacher = union (lower rate, picked automatically). Corpus: scripts/prep_distill.sh
+     alphatrain/data/ta_union_abc_a1.0.pt union -> teacher games (3,000, seeds 4,300,000+, every 25th
+     move + last 300), epoch-4 games (1,000, seeds 4,400,000+, every move), and the five crisis corpora's
+     states, all labeled with the union model's 8-view TTA top-5 -> alphatrain/data/distill_union.pt.
+     Training on Colab (A1 recipe, soft and hard arms): alphatrain/train_scratch9b64_pair2_distill_colab.ipynb.
+     Corpus (2026-09-29): 12,417,115 rows, .pt 1,986,742,177 B, .gz 842,220,899 B:
+       teacher games  10,368,754 rows  3,000 games at cap 100k (P1 5,138, P50 203,931, 64.1% capped)
+       epoch-4 games   1,167,348 rows  1,000 games (P1 299, P50 1,818, 26.4% < 1,000)
+       crisis states     881,013 rows  gen1b_crisis_A1_w45 194,302, A2_crisis_w45 174,877,
+                                       A3_crisis_w45 170,483, offp_b_ep4_w45 175,107, offp_c_ep4_w200 166,244
+     Label checks (logs/distill_union_verify.log, _redo_crisis.log, _crosscheck.log): rows realign to the
+     recorded games 100%; every target's top move is legal; it equals the move played on 92.5% of the
+     teacher's rows (single pass vs 8-view average) and 70.4% of epoch-4's; 5 moves per target, mean
+     top-share 0.747 / 0.712 / 0.65-0.70 (teacher / epoch-4 / crisis rows).
+     BUG caught before training: relabel_tta_tensor.py took the softmax of the SUM of the 8 views' logits
+     (temperature 1/8; fp16 then zeroed the tail: crisis targets had 2.7 moves, top-share 0.94) while
+     build_tta_corpus uses the MEAN. The argmax is unaffected, and every earlier use trained hard CE; the
+     soft arm would have mixed two label temperatures. Fixed (acc / 8), crisis rows relabeled: top-5 moves
+     identical on 100% of rows; values match build_tta_corpus's labeller on 2k-row samples (same top move
+     99.7%, median |diff| 1.7e-3 = fp16 deploy net vs fp32). Also: _legal_priors_jit returns its top-k
+     ASCENDING, so build_tta_corpus's "argmax == recorded" stat compared the 5th-best move (printed 0.0%);
+     stat fixed, labels were never affected.
+     Smoke (M5, 40k rows, 1 epoch): 9x64 PAIR2 = 734,722 params; both arms train; the folded export runs
+     in the C++ eval.
