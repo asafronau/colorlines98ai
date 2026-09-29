@@ -5909,3 +5909,29 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      CSVs); eval_log computes both; gate bank = 2,600,000-2,601,999 (eval_log + ta_sweep defaults).
      Gate: death rate down >= 20% with non-overlapping intervals; the 0-5k hazard must not rise.
      Escape-rate benchmarks retired as a metric (owner: escape depends on position badness + spawn luck).
+
+257. **Eval 1.8x faster: the CPU game loop redone and parallelized (bit-identical), BatchNorm folded
+     into the convolutions; the forward pass is now the limit (GPU-bound at every batch size).**
+     (2026-09-29) Workload: A4, 4,000 games x 1,000 turns (4M positions), same seeds.
+       old binary, batch 500                        155.3 s
+       new CPU path, batch 500 / 1k / 2k / 4k      116.7 / 114.4 / 115.2 / 118.5 s   (CSV byte-identical to old)
+       + BatchNorm folded (export --fold-bn), 1k     86.5 s
+     CPU path (game.cc / obs.cc / eval.cc; build/eval_cpu_bench checks bit-exactness on 4,000 real
+     states from A2's games and times it): the empty-cell flood fill ran 3x per game per step (obs,
+     legal mask, move) -> once, shared (Game::Labels, BuildObs(labels), LegalMaskU8, Move(labels));
+     the legal mask was 6,561 floats + a float->uint8 pass -> built as uint8 from 128-bit component
+     sets; spawns allocated 3-4 heap vectors per move -> stack arrays with the same RNG draws
+     (SimpleRng::ChoiceNoReplaceArr); per-game work split over a thread pool (--cpu-threads, default
+     8). CPU per step at 4,000 games: 36.1 ms -> 17.2 ms single-thread -> 2.6 ms on 8 threads.
+     game_test (Python goldens incl. spawns) and mcts_controls_test pass; the spawn change also speeds
+     up MCTS. Byte-identical CSVs vs the old binary on 400 capped A4 games and 300 full epoch-4 games.
+     Per-step time grows linearly with batch: the GPU saturates at ~35k positions/s (~17 TFLOPS for
+     ~0.5 GFLOP/position), so bigger batches don't help. Folding the 20 conv->BN pairs (stem, each
+     block's conv1->bn2, policy conv1->bn; bn1 and backbone_bn can't fold) removes memory-bound
+     elementwise passes: 1.32x on the forward. Folded exports play the same policy with different fp16
+     rounding (3,604 of 4,000 games diverge somewhere within 1,000 turns; deaths 18 vs 17), so every
+     model in a comparison must use the same export. eval_log now exports folded by default ([fold]
+     tag, _fold_ts.pt, --no-fold for the old) and keeps all games in flight (batch = #games, <= 4k).
+     Core ML potential (Python throughput test, not an eval): GPU 61k positions/s, GPU+Neural Engine
+     66k/s at batch 1k-4k (Neural Engine alone 13.5k/s) vs ~50k/s folded MPS -> another ~1.3x if the
+     C++ eval gets a Core ML (Objective-C++) inference path.

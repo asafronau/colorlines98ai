@@ -31,6 +31,12 @@ int LineLen(const int8_t* b, int r, int c, int dr, int dc) {
 }  // namespace
 
 void Game::BuildObs(float* out) const {
+  int8_t labels[kNN];
+  LabelEmpty(board_.data(), labels);
+  BuildObs(out, labels);
+}
+
+void Game::BuildObs(float* out, const int8_t* labels) const {
   std::fill(out, out + 18 * kNN, 0.0f);
   const int8_t* b = board_.data();
 
@@ -50,8 +56,6 @@ void Game::BuildObs(float* out) const {
   }
 
   // 12 component-size heatmap (size of the empty component each cell belongs to)
-  int8_t labels[kNN];
-  LabelEmpty(b, labels);
   int counts[kNN + 1] = {0};
   for (int i = 0; i < kNN; ++i)
     if (labels[i] > 0) counts[labels[i]]++;

@@ -73,3 +73,7 @@ add_executable(mcts_relabel src/mcts_relabel.cc src/mcts.cc src/game.cc
 target_link_libraries(mcts_relabel PRIVATE "${TORCH_LIBRARIES}")
 
 add_executable(obs_dump src/obs_dump.cc src/game.cc src/obs.cc)
+
+# CPU cost + bit-exactness of eval's per-step game work, old vs fast path (HISTORY 257).
+add_executable(eval_cpu_bench src/eval_cpu_bench.cc src/game.cc src/obs.cc)
+target_link_libraries(eval_cpu_bench PRIVATE "${TORCH_LIBRARIES}")

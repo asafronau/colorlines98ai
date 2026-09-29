@@ -29,7 +29,7 @@ def repo_path(*parts):
     return os.path.join(_REPO_ROOT, *parts)
 
 
-def load_model(path, device, dtype):
+def load_model(path, device, dtype, fold_bn=False):
     """Rebuild PolicyNet from a checkpoint, inferring arch from the weights."""
     ck = torch.load(path, map_location='cpu', weights_only=False)
     st = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
@@ -44,9 +44,27 @@ def load_model(path, device, dtype):
     n_fix = fp16_safe_batchnorm(m)
     if n_fix:
         print(f'fp16-safe BN: rescaled {n_fix} channel(s) with running_var > {FP16_SAFE_VAR:g}')
+    if fold_bn:
+        print(f'folded {fold_batchnorm(m)} BatchNorm layers into the preceding convolutions')
     m.to(device=device, dtype=dtype)
     return m, nblocks, ch
 
+
+
+def fold_batchnorm(m):
+    """Fold every BatchNorm that directly follows a convolution into that convolution (eval mode, exact
+    up to rounding): the stem, each block's conv1 -> bn2, and the policy head's conv1 -> bn. A block's
+    bn1 (pre-activation, before a ReLU) and backbone_bn (after the residual sum) cannot fold.
+    Removes ~half the per-position elementwise passes (HISTORY 257)."""
+    from torch.nn.utils.fusion import fuse_conv_bn_eval
+    m.stem[0] = fuse_conv_bn_eval(m.stem[0], m.stem[1])
+    m.stem[1] = torch.nn.Identity()
+    for blk in m.blocks:
+        blk.conv1 = fuse_conv_bn_eval(blk.conv1, blk.bn2)
+        blk.bn2 = torch.nn.Identity()
+    m.policy_conv1 = fuse_conv_bn_eval(m.policy_conv1, m.policy_bn)
+    m.policy_bn = torch.nn.Identity()
+    return len(m.blocks) + 2
 
 FP16_SAFE_VAR = 1e3
 
@@ -116,6 +134,8 @@ def main():
                    help='Verification device. auto prefers MPS, then CUDA, '
                         'and never silently falls back to CPU.')
     p.add_argument('--precision', choices=('fp16', 'fp32'), default='fp16')
+    p.add_argument('--fold-bn', action='store_true',
+                   help='fold conv -> BatchNorm pairs into the convolutions (faster inference)')
     a = p.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
     output = a.output or f'{a.outdir}/policy_ts.pt'
@@ -142,7 +162,7 @@ def main():
     if device.type == 'cpu' and dtype == torch.float16:
         raise ValueError('fp16 export verification requires mps or cuda')
 
-    m, nblocks, ch = load_model(a.model, device, dtype)
+    m, nblocks, ch = load_model(a.model, device, dtype, fold_bn=a.fold_bn)
     obs, legal = load_or_build_fixture(a, device, dtype)
 
     with torch.no_grad():

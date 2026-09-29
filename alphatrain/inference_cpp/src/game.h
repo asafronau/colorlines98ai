@@ -53,6 +53,16 @@ class Game {
   // 18x9x9 observation (row-major, channel-major) into out[18*81]. (obs.cc)
   void BuildObs(float* out) const;
 
+  // Fast path for the batched greedy loops (HISTORY 257): the empty-cell components are computed
+  // once per state (Labels) and shared by the observation, the legal mask and the move. Results are
+  // bit-identical to BuildObs / LegalMask / Move (eval_cpu_bench checks it on real states).
+  void Labels(int8_t* labels) const { LabelEmpty(board_.data(), labels); }
+  void BuildObs(float* out, const int8_t* labels) const;
+  // uint8 legal mask (1 = legal); returns the number of legal moves.
+  int LegalMaskU8(uint8_t* out, const int8_t* labels) const;
+  // Move validated against `labels`, which must be Labels() of the current board.
+  bool Move(int sr, int sc, int tr, int tc, const int8_t* labels);
+
   const std::array<int8_t, kNN>& board() const { return board_; }
   const std::vector<NextBall>& next_balls() const { return next_balls_; }
   int score() const { return score_; }
@@ -71,7 +81,9 @@ class Game {
 
  private:
   void GenerateNextBalls(SimpleRng& rng);
-  std::vector<int> SpawnBalls(SimpleRng& rng);  // returns landed flat cell indices
+  // Places the preview balls; writes the landed flat cells to `landed` (<= 3) and returns how many.
+  int SpawnBalls(SimpleRng& rng, int* landed);
+  void AfterMove(int tr, int tc, SimpleRng& rng);  // clears / spawns / next preview / game over
 
   std::array<int8_t, kNN> board_{};
   std::vector<NextBall> next_balls_;

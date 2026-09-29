@@ -24,6 +24,7 @@
 #include "game_json.h"
 #include "canonical.h"
 #include "anchors.h"
+#include "thread_pool.h"
 
 using clines::Game;
 using Clock = std::chrono::high_resolution_clock;
@@ -41,6 +42,7 @@ struct Args {
   bool verbose_games = false;  // opt-in per-game + every-500-turn traces
   int progress_every = 100;    // compact aggregate progress by default
   long progress_forwards = 50000;  // heartbeat for the long tail (games in flight, longest game); 0 = off
+  int cpu_threads = 8;  // per-game obs/legal/move work split across threads (results identical)
   std::string scores_out;  // optional streamed CSV for distribution statistics
   // On-policy trajectory recording (DAgger harvest + value-head fuel):
   // keep the FULL last `record_tail` turns (death band) + every
@@ -164,6 +166,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--max-turns") a.max_turns = std::stol(argv[++i]);
     else if (k == "--progress-every") a.progress_every = std::stoi(argv[++i]);
     else if (k == "--progress-forwards") a.progress_forwards = std::stol(argv[++i]);
+    else if (k == "--cpu-threads") a.cpu_threads = std::stoi(argv[++i]);
     else if (k == "--scores-out") a.scores_out = argv[++i];
     else if (k == "--record-dir") a.record_dir = argv[++i];
     else if (k == "--record-every") a.record_every = std::stoi(argv[++i]);
@@ -301,7 +304,12 @@ int main(int argc, char** argv) {
     std::fprintf(scores_file, "seed,score,turns,capped\n");
     std::fflush(scores_file);
   }
-  std::vector<float> obs_buf, legal_buf;
+  std::vector<float> obs_buf;
+  std::vector<uint8_t> legal_buf;
+  std::vector<int8_t> label_buf;
+  std::vector<int> legal_count;
+  std::vector<char> dead_flag;
+  clines::ThreadPool pool(std::max(1, args.cpu_threads));
   long fwd = 0;
   auto t0 = Clock::now();
   size_t done = 0;
@@ -314,26 +322,34 @@ int main(int argc, char** argv) {
     canon_view.assign(n, 0);
     obs_buf.resize((size_t)n * V * 18 * clines::kNN);
     legal_buf.resize((size_t)n * clines::kActions);
-    // Build each game's obs+legal. Single-threaded on purpose: profiling showed
-    // this eval is forward-bound (the heavy-tail long games run solo at tiny
-    // batch and dominate wall-clock), so parallelizing this loop gave ~0 gain.
-    for (int i = 0; i < n; ++i) {
-      if (V == 1 && args.canon) {
-        const clines::Canonical cf = clines::Canonicalize(slots[i].game.board().data(),
-                                                          slots[i].game.next_balls(), d4);
-        canon_view[i] = cf.view;
-        Game tmp(0);
-        tmp.SetState(cf.board, cf.next, slots[i].game.score(), slots[i].game.turns());
-        tmp.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
-      } else if (V == 1) {
-        slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
-      } else {
-        for (int v = 0; v < V; ++v)
-          BuildViewObs(slots[i].game, d4, v,
-                       obs_buf.data() + ((size_t)i * V + v) * 18 * clines::kNN);
+    label_buf.resize((size_t)n * clines::kNN);
+    legal_count.resize(n);
+    dead_flag.assign(n, 0);
+    // Each game's obs + legal mask, split across --cpu-threads (games are independent). The empty-cell
+    // labels are computed once per state and shared by the obs, the uint8 mask and the move
+    // (HISTORY 257; bit-identical to the old BuildObs/LegalMask/Move path, see eval_cpu_bench).
+    pool.ParallelFor(n, [&](int b, int e) {
+      for (int i = b; i < e; ++i) {
+        int8_t* lab = label_buf.data() + (size_t)i * clines::kNN;
+        slots[i].game.Labels(lab);
+        if (V == 1 && args.canon) {
+          const clines::Canonical cf = clines::Canonicalize(slots[i].game.board().data(),
+                                                            slots[i].game.next_balls(), d4);
+          canon_view[i] = cf.view;
+          Game tmp(0);
+          tmp.SetState(cf.board, cf.next, slots[i].game.score(), slots[i].game.turns());
+          tmp.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN);
+        } else if (V == 1) {
+          slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN, lab);
+        } else {
+          for (int v = 0; v < V; ++v)
+            BuildViewObs(slots[i].game, d4, v,
+                         obs_buf.data() + ((size_t)i * V + v) * 18 * clines::kNN);
+        }
+        legal_count[i] = slots[i].game.LegalMaskU8(
+            legal_buf.data() + (size_t)i * clines::kActions, lab);
       }
-      slots[i].game.LegalMask(legal_buf.data() + (size_t)i * clines::kActions);
-    }
+    });
     // --- Shrink the CPU->GPU transfer (the profiled copy_and_sync bottleneck) ---
     // Obs: convert fp32->fp16 on the CPU *before* uploading, so we ship half the
     // bytes. (Uploading fp32 then .to(kHalf) on the GPU pays the full fp32
@@ -341,13 +357,10 @@ int main(int argc, char** argv) {
     torch::Tensor obs = torch::from_blob(obs_buf.data(), {(int64_t)n * V, 18, 9, 9});
     if (use_half) obs = obs.to(torch::kHalf);
     obs = obs.to(dev);
-    // Legal mask: it's just 0/1, so upload it as uint8 (1 byte) instead of fp32
-    // (4 bytes) -> 4x less, and it's the single biggest per-step transfer.
-    // `legal == 0` is then the bool "illegal" mask for masked_fill (works on the
-    // fp16 logits regardless of the mask's own dtype).
-    torch::Tensor legal = torch::from_blob(legal_buf.data(), {n, clines::kActions})
-                              .to(torch::kByte)
-                              .to(dev);
+    // Legal mask: built directly as uint8 (0/1), uploaded as is. `legal == 0` is the bool
+    // "illegal" mask for masked_fill (works on the fp16 logits regardless of the mask's dtype).
+    torch::Tensor legal =
+        torch::from_blob(legal_buf.data(), {n, clines::kActions}, torch::kUInt8).to(dev);
     torch::Tensor logits = net.forward({obs}).toTensor();
     if (V == 1 && args.canon) {
       // logits are in each game's canonical frame; bring them back to the original frame.
@@ -377,15 +390,11 @@ int main(int argc, char** argv) {
       std::fflush(stdout);
     }
 
-    std::vector<Slot> survivors;
-    survivors.reserve(n);
-    for (int i = 0; i < n; ++i) {
-      // legal-move count for this game (no legal moves => dead)
-      const float* lg = legal_buf.data() + (size_t)i * clines::kActions;
-      bool any_legal = false;
-      for (int a = 0; a < clines::kActions; ++a) if (lg[a] > 0.5f) { any_legal = true; break; }
-      bool dead = !any_legal;
-      if (!dead) {
+    // Apply every game's move (plus recording) in parallel; all bookkeeping below stays serial and in
+    // slot order, so the CSV, the records and the printout are exactly as before.
+    pool.ParallelFor(n, [&](int b, int e) {
+      for (int i = b; i < e; ++i) {
+        if (legal_count[i] == 0) { dead_flag[i] = 1; continue; }  // no legal moves => dead
         int64_t m = mv[i];
         if (recording) {
           TurnRec tr = SnapTurn(slots[i].game, (int)m);
@@ -398,9 +407,18 @@ int main(int argc, char** argv) {
           }
         }
         int s = (int)(m / 81), t = (int)(m % 81);
-        bool ok = slots[i].game.Move(s / 9, s % 9, t / 9, t % 9);
-        dead = !ok || slots[i].game.over() || slots[i].game.turns() >= slots[i].turn_limit;
-        if (args.verbose_games && !dead &&
+        bool ok = slots[i].game.Move(s / 9, s % 9, t / 9, t % 9,
+                                     label_buf.data() + (size_t)i * clines::kNN);
+        dead_flag[i] = !ok || slots[i].game.over() || slots[i].game.turns() >= slots[i].turn_limit;
+      }
+    });
+
+    std::vector<Slot> survivors;
+    survivors.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      const bool dead = dead_flag[i];
+      if (!dead) {
+        if (args.verbose_games &&
             slots[i].game.turns() >= slots[i].next_progress_turn) {
           double el = std::chrono::duration<double>(Clock::now() - t0).count();
           std::printf("    seed=%llu turn=%d score=%d elapsed=%.0fs\n",

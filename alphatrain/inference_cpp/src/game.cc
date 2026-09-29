@@ -1,6 +1,7 @@
 #include "game.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace clines {
 namespace {
@@ -102,15 +103,42 @@ void Game::LegalMask(float* out) const {
   }
 }
 
+int Game::LegalMaskU8(uint8_t* out, const int8_t* labels) const {
+  std::memset(out, 0, kActions);
+  // Empty cells of each component as a 128-bit set (labels are 1..#components, at most 41).
+  uint64_t lo[kNN + 1] = {0}, hi[kNN + 1] = {0};
+  for (int t = 0; t < kNN; ++t) {
+    const int8_t l = labels[t];
+    if (l <= 0) continue;
+    if (t < 64) lo[l] |= uint64_t{1} << t;
+    else hi[l] |= uint64_t{1} << (t - 64);
+  }
+  int n_legal = 0;
+  for (int s = 0; s < kNN; ++s) {
+    if (board_[s] == 0) continue;
+    const int r = s / kN, c = s % kN;
+    // A ball reaches every empty cell of every component it touches (OR of the 4 neighbours' sets).
+    uint64_t mlo = 0, mhi = 0;
+    if (c + 1 < kN && labels[s + 1] > 0) { mlo |= lo[labels[s + 1]]; mhi |= hi[labels[s + 1]]; }
+    if (c > 0 && labels[s - 1] > 0) { mlo |= lo[labels[s - 1]]; mhi |= hi[labels[s - 1]]; }
+    if (r + 1 < kN && labels[s + kN] > 0) { mlo |= lo[labels[s + kN]]; mhi |= hi[labels[s + kN]]; }
+    if (r > 0 && labels[s - kN] > 0) { mlo |= lo[labels[s - kN]]; mhi |= hi[labels[s - kN]]; }
+    uint8_t* row = out + s * kNN;
+    for (uint64_t m = mlo; m; m &= m - 1) { row[__builtin_ctzll(m)] = 1; ++n_legal; }
+    for (uint64_t m = mhi; m; m &= m - 1) { row[64 + __builtin_ctzll(m)] = 1; ++n_legal; }
+  }
+  return n_legal;
+}
+
 void Game::GenerateNextBalls(SimpleRng& rng) {
   next_balls_.clear();
-  std::vector<int> empty;
-  for (int i = 0; i < kNN; ++i) if (board_[i] == 0) empty.push_back(i);
-  int n_empty = static_cast<int>(empty.size());
+  int empty[kNN];
+  int n_empty = 0;
+  for (int i = 0; i < kNN; ++i) if (board_[i] == 0) empty[n_empty++] = i;
   if (n_empty == 0) return;
   int n = std::min(kBallsPerTurn, n_empty);
-  std::vector<int> idx;
-  rng.ChoiceNoReplace(n_empty, n, idx);
+  int idx[kBallsPerTurn];
+  rng.ChoiceNoReplaceArr(n_empty, n, idx);  // same draws as ChoiceNoReplace
   for (int i = 0; i < n; ++i) {
     int cell = empty[idx[i]];
     int color = rng.RandInt(1, kColors + 1);
@@ -118,42 +146,67 @@ void Game::GenerateNextBalls(SimpleRng& rng) {
   }
 }
 
-std::vector<int> Game::SpawnBalls(SimpleRng& rng) {
-  std::vector<int> landed;
+int Game::SpawnBalls(SimpleRng& rng, int* landed) {
+  int n_landed = 0;
   for (const NextBall& nb : next_balls_) {
     int cell = Idx(nb.r, nb.c);
     if (board_[cell] == 0) {
       board_[cell] = static_cast<int8_t>(nb.color);
-      landed.push_back(cell);
+      landed[n_landed++] = cell;
     } else {
-      std::vector<int> empty;
-      for (int i = 0; i < kNN; ++i) if (board_[i] == 0) empty.push_back(i);
-      if (!empty.empty()) {
-        int j = rng.RandInt(0, static_cast<int>(empty.size()));
+      int empty[kNN];
+      int n_empty = 0;
+      for (int i = 0; i < kNN; ++i) if (board_[i] == 0) empty[n_empty++] = i;
+      if (n_empty > 0) {
+        int j = rng.RandInt(0, n_empty);
         board_[empty[j]] = static_cast<int8_t>(nb.color);
-        landed.push_back(empty[j]);
+        landed[n_landed++] = empty[j];
       }
     }
   }
-  return landed;
+  return n_landed;
 }
 
 void Game::Reset() {
   board_.fill(0);
   score_ = 0; turns_ = 0; over_ = false;
   GenerateNextBalls(rng_);
-  SpawnBalls(rng_);
+  int landed[kBallsPerTurn];
+  SpawnBalls(rng_, landed);
   GenerateNextBalls(rng_);
 }
 
+void Game::AfterMove(int tr, int tc, SimpleRng& rng) {
+  int cleared = ClearLinesAt(board_.data(), tr, tc);
+  if (cleared > 0) {
+    score_ += LineScore(cleared);
+    return;
+  }
+  int landed[kBallsPerTurn];
+  int n_landed = SpawnBalls(rng, landed);
+  for (int i = 0; i < n_landed; ++i) {
+    int cell = landed[i];
+    if (board_[cell] != 0) {  // an earlier landing's clear may already have removed it
+      int sc2 = ClearLinesAt(board_.data(), cell / kN, cell % kN);
+      if (sc2 > 0) score_ += LineScore(sc2);
+    }
+  }
+  GenerateNextBalls(rng);
+  if (CountEmpty() == 0) over_ = true;
+}
+
 bool Game::Move(int sr, int sc, int tr, int tc) {
+  int8_t labels[kNN];
+  LabelEmpty(board_.data(), labels);
+  return Move(sr, sc, tr, tc, labels);
+}
+
+bool Game::Move(int sr, int sc, int tr, int tc, const int8_t* labels) {
   if (over_) return false;
   int s = Idx(sr, sc), t = Idx(tr, tc);
   if (board_[s] == 0 || board_[t] != 0) return false;
 
   // reachability: target's empty-component must touch the source
-  int8_t labels[kNN];
-  LabelEmpty(board_.data(), labels);
   int8_t tl = labels[t];
   if (tl <= 0) return false;
   bool reachable = false;
@@ -168,21 +221,7 @@ bool Game::Move(int sr, int sc, int tr, int tc) {
   board_[s] = 0;
   board_[t] = color;
   ++turns_;
-
-  int cleared = ClearLinesAt(board_.data(), tr, tc);
-  if (cleared > 0) {
-    score_ += LineScore(cleared);
-  } else {
-    std::vector<int> landed = SpawnBalls(rng_);
-    for (int cell : landed) {
-      if (board_[cell] != 0) {
-        int sc2 = ClearLinesAt(board_.data(), cell / kN, cell % kN);
-        if (sc2 > 0) score_ += LineScore(sc2);
-      }
-    }
-    GenerateNextBalls(rng_);
-    if (CountEmpty() == 0) over_ = true;
-  }
+  AfterMove(tr, tc, rng_);
   return true;
 }
 
@@ -193,20 +232,7 @@ void Game::TrustedMove(int sr, int sc, int tr, int tc, SimpleRng& rng) {
   board_[s] = 0;
   board_[t] = color;
   ++turns_;
-  int cleared = ClearLinesAt(board_.data(), tr, tc);
-  if (cleared > 0) {
-    score_ += LineScore(cleared);
-  } else {
-    std::vector<int> landed = SpawnBalls(rng);
-    for (int cell : landed) {
-      if (board_[cell] != 0) {
-        int sc2 = ClearLinesAt(board_.data(), cell / kN, cell % kN);
-        if (sc2 > 0) score_ += LineScore(sc2);
-      }
-    }
-    GenerateNextBalls(rng);
-    if (CountEmpty() == 0) over_ = true;
-  }
+  AfterMove(tr, tc, rng);
 }
 
 void Game::SetState(const int8_t* board81, const std::vector<NextBall>& nb,

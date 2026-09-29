@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace clines {
@@ -92,6 +93,17 @@ class SimpleRng {
       int j = i + static_cast<int>(NextU64() % static_cast<uint64_t>(n - i));
       std::swap(scratch_[i], scratch_[j]);
       out.push_back(scratch_[i]);
+    }
+  }
+
+  // ChoiceNoReplace without heap use: identical draws and result, for n <= 81 (one board).
+  void ChoiceNoReplaceArr(int n, int k, int* out) {
+    int scratch[81];
+    for (int i = 0; i < n; ++i) scratch[i] = i;
+    for (int i = 0; i < k; ++i) {
+      int j = i + static_cast<int>(NextU64() % static_cast<uint64_t>(n - i));
+      std::swap(scratch[i], scratch[j]);
+      out[i] = scratch[i];
     }
   }
 
