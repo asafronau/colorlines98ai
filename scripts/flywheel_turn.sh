@@ -16,6 +16,10 @@ CPP=alphatrain/inference_cpp
 D=alphatrain/data
 PY=.venv/bin/python
 PROBES=${PROBES:-3000}   # crisis probe seeds; raise as deaths get rare (e.g. PROBES=5000 scripts/flywheel_turn.sh ...)
+# Default mining source (owner, 2026-09-28): a WEAKER player's deaths, replayed by the actor's search. The
+# actor's own deaths get rare as it nears infinite play; epoch-4 deaths teach the same (HISTORY 255).
+PROBE_MODEL=${PROBE_MODEL-data/scratch18b96_lr3e3_ckpts_epoch_4_ts.pt}   # empty = the actor probes itself
+PROBE_SLIP=${PROBE_SLIP:-0}   # per-move mouse-slip probability for the probe player
 mkdir -p logs checkpoints/${TAG}_ft $D/greedy_${TAG}_cap100k
 
 echo "=== [1/7] export $TAG ($(date)) ==="
@@ -46,6 +50,7 @@ echo "=== [4/7] fixed-teacher crisis windows, $PROBES probe seeds from $MSEED ($
     --value-module data/pv_${TAG}_ts.pt --device mps --seed-start $MSEED --seed-end $((MSEED + PROBES)) \
     --recovery-turns 15 --recovery-sims 600 --prevention-turns 30 --prevention-sims 600 \
     --c-puct 1.5 --q-weight 2.0 --virtual-mean --dirichlet-weight 0 --continue-turns 45 \
+    ${PROBE_MODEL:+--probe-model $PROBE_MODEL} --probe-slip $PROBE_SLIP \
     --policy-max-turns 100000 --threads 14 --out-dir ../../data/${TAG}_crisis_w45) \
     > logs/${TAG}_crisis_w45.log 2>&1
 tail -n 1 logs/${TAG}_crisis_w45.log

@@ -28,7 +28,7 @@ def main():
         for r in csv.DictReader(open(path)):
             d = depth[int(r['seed'])]
             n[d] += 1
-            esc[d] += r['capped'] == '1'
+            esc[d] += r.get('capped', r.get('escaped')) == '1'   # eval --anchors | anchor_search
         missing = len(depth) - sum(n.values())
         if missing:
             raise SystemExit(f'{name}: {missing} anchors missing from {path}')

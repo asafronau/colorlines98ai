@@ -5865,3 +5865,47 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      streams overlap (4.37% instead of 5%); hashed seeding gives 5.05% over 99k moves.
      Escape horizon: failed rescues die fast (95-98% by move 100, 99-100% by move 200, gen-1 search and
      A1-A3 greedy), so escape = survive 200 moves from now on.
+
+255. **Off-policy experiment: crises from a human-level player's deaths teach as much as the actor's
+     own (death spirals are alike) at ~1/150 of the probing cost; no arm moves the escape benchmarks.**
+     (2026-09-28) Owner run: scripts/offpolicy_experiment.sh (all arms from A3 = ta_A2_e4_a2.0.pt,
+     A3's search: pv_A3_ts.pt, 600 sims, c1.5 q2 virtual mean; turn-3 fine-tune recipe).
+     A4 (= ta_A3_e4_a1.0) CONFIRMED on fresh seeds 3,000,000-3,000,999: P1 2,314 / P5 19,580 / P10
+     52,388 / P25 127,099 / 63.9% capped (A3 there: 5,236 / 14,160 / 31,404 / 104,974 / 56.3%).
+     Arms (gate bank, cap 100k; A3: P1 3,459 / P5 16,380 / P10 39,270 / P25 107,085 / 55.4%):
+       arm  source (probes)                  replays   probe time   alpha  P1     P5     P10    P25     capped
+       a    A3's own deaths (turn 3, 5,000)   4,318     5.2 h        1.0    5,583  21,611 45,152 124,695 62.3%
+       b    epoch-4 deaths (2,160)            4,320     134 s        1.0    8,556  26,608 49,879 118,313 60.0%
+                                                                     2.0    5,025  23,010 50,416 121,056 60.6%
+       c    epoch-4 deaths, 200-move replays   1,000     51 s         1.0    5,079  28,629 47,018 121,092 61.5%
+            (crisis + quiet play; 500 probes)                         2.0    5,440  17,277 36,080  97,327 56.2%
+     (A3's search survived its window in 82% of arm-b replays, 80% of arm-c.) Fine-tune val: b 1.4772,
+     c 1.2228. Escape benchmarks (200-move horizon; greedy): expert trouble (A1's 5,176 death states,
+     30/15 moves before death) A3 68.2/36.7%, A4 68.7/38.5%, b1.0 69.2/38.5%, c1.0 69.3/37.9%;
+     human trouble (epoch-4 deaths on held-out seeds 3.9M; built WITHOUT --prevention-turns 30, so its
+     deep anchors sit 75 moves before death and escape_benchmark labels them "1" = 75 % 37) A1 90.6/
+     34.8%, A2 93.3/47.4%, A3 94.8/47.3%, A4 95.2/47.6%, b1.0 95.2/48.6%, c1.0 94.7/47.4% (75/15 before).
+     Reading: the gate is the same for all three sources, so future turns can probe with the epoch-4
+     player. No arm improves escapes (all within ~2 pts), even arms trained on human-level crises.
+     NEXT: rebuild the human benchmark at 15/30; data scaling (A3 fine-tuned on a+b+c together);
+     teacher edge on the human benchmark (A3 greedy vs A3 search @600 and @1,600 for 45 moves).
+
+256. **Gate switch: the per-turn death rate (survival analysis), because the hazard is flat over game
+     age; escape-rate benchmarks retired; gate bank 2k seeds.** (2026-09-28, owner's direction)
+     alphatrain/scripts/survival_stats.py (every game's turns count as exposure, capped or not; hazard by
+     game-age bucket; S(t); --cap re-censors uncapped runs). Gate bank, cap 100k:
+       model   deaths/1k  deaths per 100k turns [95% CI]  MTBF turns  S(10k)  S(50k)  S(100k)  hazard 0-5k/5-20k/20-50k/50-100k
+       A1        990      4.9 [4.6, 5.2]                     20,567   61.9%    9.0%    1.0%   4.7 / 5.1 / 4.9 / 4.2
+       A2        747      1.4 [1.3, 1.5]                     71,984   87.2%   50.5%   25.3%   1.4 / 1.4 / 1.4 / 1.4
+       A3        446      0.6 [0.5, 0.6]                    170,727   94.4%   75.6%   55.4%   0.7 / 0.5 / 0.6 / 0.6
+       A4        377      0.47 [0.43, 0.53]                 210,640   95.4%   78.2%   62.3%   0.5 / 0.5 / 0.5 / 0.5
+     Deaths arrive at a constant rate per turn at every game age, so survival is exponential and the
+     death rate alone determines every percentile (P_q = -ln(1-q) / rate turns). P1-P5 are the same
+     information from 10-50 games; the rate uses all ~400 deaths (+-10% at 1k games, +-7% at 2k) and is
+     comparable across caps (A1 uncapped 4.88 vs re-censored at 100k 4.9). Per-turn improvement: A1->A2
+     3.5x, A2->A3 2.4x, A3->A4 1.2x. The stop criterion (P1 at the 100k cap) = ~0.01 per 100k turns,
+     ~50x below A4; the eval cost to measure a rate r grows ~1/r (~400 deaths of exposure).
+     EVAL.md gained "deaths/100k turns [95% CI]" and "MTBF turns" (all 121 rows backfilled from their
+     CSVs); eval_log computes both; gate bank = 2,600,000-2,601,999 (eval_log + ta_sweep defaults).
+     Gate: death rate down >= 20% with non-overlapping intervals; the 0-5k hazard must not rise.
+     Escape-rate benchmarks retired as a metric (owner: escape depends on position badness + spawn luck).
