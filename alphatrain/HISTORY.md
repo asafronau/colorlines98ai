@@ -5970,3 +5970,28 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      stat fixed, labels were never affected.
      Smoke (M5, 40k rows, 1 epoch): 9x64 PAIR2 = 734,722 params; both arms train; the folded export runs
      in the C++ eval.
+
+259. **9x64 student distilled from the union model: best = soft epoch 35 at 1.52 deaths per 100k turns
+     (teacher 0.48, 3.2x). Soft labels beat hard at every epoch; the soft arm plateaued from epoch 30.**
+     (2026-09-29) Colab (owner): alphatrain/train_scratch9b64_pair2_distill_colab.ipynb (tarball v8,
+     distill_union.pt of HISTORY 258): from scratch, 9 blocks x 64 ch PAIR2 + legal-mask loss (734,722
+     params vs the teacher's 3,071,170), 40 ep, bs 32768, lr 3e-3, warmup 1, AMP + compile, seed 42;
+     soft = --blend-alpha 1.0 (the teacher's top-5), hard = 0.0 (its move). Val loss: soft 0.8047 /
+     0.7974 / 0.7945 at ep 30/35/40 (still falling); hard best 1.0294 before ep 30, then 1.0443 /
+     1.0427 / 1.0447 (rising). Gates (2k, seeds 2,600,000-2,601,999, cap 100k turns, folded), scores:
+       model              P1     P5     P10     P25     P50      P75      P90      P95   capped  per 100k turns
+       teacher (union)  5,815 23,452  47,413 124,318 203,897  204,276  204,541  204,691  61.7%  0.48 [0.45, 0.52]
+       soft ep30        1,598  6,802  12,761  34,102  83,652  167,863  204,058  204,313  18.4%  1.69 [1.61, 1.78]
+       soft ep35        2,217  7,461  14,838  38,970  94,584  184,449  204,130  204,331  21.8%  1.52 [1.45, 1.60]
+       soft ep40        1,555  6,584  12,974  34,126  81,711  164,782  203,995  204,270  17.9%  1.72 [1.64, 1.80]
+       hard ep30        1,486  4,606   9,711  26,685  65,875  137,482  203,926  204,195  12.7%  2.09 [2.00, 2.19]
+       hard ep35        1,315  5,096  10,977  29,615  70,371  143,984  203,854  204,154  14.0%  1.98 [1.89, 2.08]
+       hard ep40        1,223  5,589  10,549  28,933  70,781  138,826  203,778  204,144  12.2%  2.05 [1.96, 2.15]
+     (1) Soft > hard at every epoch (disjoint CIs): the teacher's full top-5 carries what a small student
+     can use. (2) Epoch 35 beats 30 and 40 while val loss kept falling: val loss does not rank
+     checkpoints; gate several. (3) The 18b96 law "a PAIR2 student reaches its label source" (HISTORY
+     241-244) does not hold at 1/4 the size. Gate throughput 91k positions/s vs the teacher's 36k (not a
+     controlled benchmark: batch compositions differ). A 2k gate of the student takes ~17-19 min.
+     Next (owner): flywheel on the student from soft ep35 with 600 sims. scripts/flywheel_turn.sh now
+     reads the trunk shape from the checkpoint (alphatrain/scripts/model_shape.py) and takes SIMS
+     (default 600); value head, fused export, fine-tune and merge smoke-tested on the student.

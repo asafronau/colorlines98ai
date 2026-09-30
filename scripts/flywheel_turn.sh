@@ -8,7 +8,8 @@
 #
 # record_seed: 1,000 fresh seeds for the actor's own games (cap 100k turns) (also a fresh-bank eval of it).
 # mine_seed:   $PROBES (default 3,000) fresh probe seeds for crisis mining. prev_windows_dir: earlier generations'
-# window corpora replayed in the fine-tune.
+# window corpora replayed in the fine-tune. $SIMS (default 600): search sims per crisis move. Any actor size works
+# (the fine-tune reads the trunk shape from the checkpoint).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ACTOR=$1; TAG=$2; RSEED=$3; MSEED=$4; ALPHAS=$5; shift 5; PREV=("$@")
@@ -20,6 +21,8 @@ PROBES=${PROBES:-3000}   # crisis probe seeds; raise as deaths get rare (e.g. PR
 # actor's own deaths get rare as it nears infinite play; epoch-4 deaths teach the same (HISTORY 255).
 PROBE_MODEL=${PROBE_MODEL-data/scratch18b96_lr3e3_ckpts_epoch_4_ts.pt}   # empty = the actor probes itself
 PROBE_SLIP=${PROBE_SLIP:-0}   # per-move mouse-slip probability for the probe player
+SIMS=${SIMS:-600}             # search sims per move in the crisis windows (recovery and prevention)
+SHAPE=$($PY -m alphatrain.scripts.model_shape "$ACTOR")   # fine-tune any actor size (18x96, 9x64 student, ...)
 mkdir -p logs checkpoints/${TAG}_ft $D/greedy_${TAG}_cap100k
 
 echo "=== [1/7] export $TAG ($(date)) ==="
@@ -48,7 +51,7 @@ mv $CPP/data/policy_value_ts.pt $CPP/data/pv_${TAG}_ts.pt
 echo "=== [4/7] fixed-teacher crisis windows, $PROBES probe seeds from $MSEED ($(date)) ==="
 (cd $CPP && ./build/mcts_crisis --run-id ${TAG}_crisis_w45 --model data/${TAG}_ts.pt \
     --value-module data/pv_${TAG}_ts.pt --device mps --seed-start $MSEED --seed-end $((MSEED + PROBES)) \
-    --recovery-turns 15 --recovery-sims 600 --prevention-turns 30 --prevention-sims 600 \
+    --recovery-turns 15 --recovery-sims $SIMS --prevention-turns 30 --prevention-sims $SIMS \
     --c-puct 1.5 --q-weight 2.0 --virtual-mean --dirichlet-weight 0 --continue-turns 45 \
     ${PROBE_MODEL:+--probe-model $PROBE_MODEL} --probe-slip $PROBE_SLIP \
     --policy-max-turns 100000 --threads 14 --out-dir ../../data/${TAG}_crisis_w45) \
@@ -65,13 +68,13 @@ $PY -m alphatrain.scripts.anomaly_checks --tensor $D/${TAG}_crisis_w45.pt --mode
 
 echo "=== [6/7] fine-tune $TAG on the windows ($(date)) ==="
 $PY -m alphatrain.train_path_b --tensor-file $D/${TAG}_crisis_w45.pt --resume "$ACTOR" --warm-start \
-    --freeze-bn --policy-head pair2 --pair-dim 64 --legal-mask-loss --num-blocks 18 --channels 96 \
+    --freeze-bn --policy-head pair2 --pair-dim 64 --legal-mask-loss $SHAPE \
     --epochs 4 --batch-size 1024 --lr 1e-4 --warmup-epochs 0 --target-temperature 0.5 \
     --augment-factor 1 --seed 42 --save-dir checkpoints/${TAG}_ft > logs/${TAG}_ft.log 2>&1
 grep -E 'val:' logs/${TAG}_ft.log | tail -1
 
 echo "=== [7/7] task-arithmetic sweep + gate, alphas $ALPHAS ($(date)) ==="
 scripts/ta_sweep.sh "$ACTOR" checkpoints/${TAG}_ft/epoch_4.pt ta_${TAG}_e4 \
-    "flywheel: $TAG + alpha*($TAG fine-tuned 4ep on its fixed-teacher crisis windows${PREV:+ + ${PREV[*]}}); frozen BN, lr1e-4, T0.5" \
+    "flywheel: $TAG + alpha*($TAG fine-tuned 4ep on its fixed-teacher crisis windows ($SIMS sims)${PREV:+ + ${PREV[*]}}); frozen BN, lr1e-4, T0.5" \
     $ALPHAS
 echo "=== done ($(date)) ==="
