@@ -70,6 +70,7 @@ struct Args {
   double q_weight = 1.0;
   double dirichlet_alpha = 0.3, dirichlet_weight = 0.25;
   int threads = 14;
+  int batch_wait_us = 0;  // phase-2 server batching window (0 = off); see InferenceServer::SetBatchWindow
   bool fp32 = false;
   bool full_record = false;
   bool virtual_mean = false;  // corrected pending-visit placeholder (see mcts.h)
@@ -115,6 +116,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--dirichlet-alpha") a.dirichlet_alpha = std::stod(argv[++i]);
     else if (k == "--dirichlet-weight") a.dirichlet_weight = std::stod(argv[++i]);
     else if (k == "--threads") a.threads = std::stoi(argv[++i]);
+    else if (k == "--batch-wait-us") a.batch_wait_us = std::stoi(argv[++i]);
     else if (k == "--probe-model") a.probe_model = argv[++i];
     else if (k == "--probe-slip") a.probe_slip = std::stod(argv[++i]);
     else if (k == "--anchors-out") a.anchors_out = argv[++i];
@@ -126,7 +128,7 @@ Args ParseArgs(int argc, char** argv) {
   if (a.seed_end <= a.seed_start || a.recovery_sims <= 0 ||
       a.prevention_sims <= 0 || a.continue_turns <= 0 ||
       a.policy_max_turns <= 0 || a.probe_batch <= 0 ||
-      a.batch_size <= 0 || a.top_k <= 0 || a.threads <= 0) {
+      a.batch_size <= 0 || a.top_k <= 0 || a.threads <= 0 || a.batch_wait_us < 0) {
     std::fprintf(stderr, "FATAL: invalid seed/search/batch/turn arguments\n");
     std::exit(2);
   }
@@ -259,15 +261,14 @@ int main(int argc, char** argv) {
     config += ", \"probe_model\": \"" + args.probe_model + "\"";
     config += ", \"probe_slip\": ";
     clines::AppendD(config, args.probe_slip);
-    config += ", \"threads\": " + std::to_string(args.threads) +
-              ", \"full_record\": " +
-              (args.full_record ? std::string("true") : std::string("false")) +
-              "}\n";
+    // --threads is left out on purpose: it sets how many games are in flight (so how large the
+    // shared GPU batch is), not how any game is searched, so a resume may change it.
+    config += std::string(", \"full_record\": ") + (args.full_record ? "true" : "false") + "}\n";
     clines::EnsureRunConfigOrDie(args.out_dir, config);
   }
   const bool nn_value = !args.value_module.empty();
   clines::InferenceServer server(nn_value ? args.value_module : args.model,
-                                 dev, fp16, 10000, nn_value);
+                                 dev, fp16, 2000, nn_value);
   if (nn_value) std::printf("NN value head: %s\n", args.value_module.c_str());
   // Phase-1 probes: the actor's policy (the same server) unless --probe-model names another one.
   std::unique_ptr<clines::InferenceServer> probe_server;
@@ -484,13 +485,19 @@ int main(int argc, char** argv) {
 
   // ============ Phase 2: deep-MCTS replays from the checkpoints ============
   std::atomic<size_t> next_task{0};
+  std::atomic<int> active_workers{0};  // replay threads still searching (the batching target)
   std::atomic<int> games_written{0};
   std::mutex print_mu;
 
   auto replay_worker = [&](int tid) {
     while (true) {
       size_t ti = next_task.fetch_add(1);
-      if (ti >= tasks.size()) return;
+      if (ti >= tasks.size()) {
+        // Out of work: lower the batching target so the last threads don't wait out the window.
+        int left = active_workers.fetch_sub(1) - 1;
+        if (args.batch_wait_us > 0) server.SetBatchWindow(left, args.batch_wait_us);
+        return;
+      }
       const ReplayTask& task = tasks[ti];
       auto tg0 = Clock::now();
 
@@ -623,6 +630,9 @@ int main(int argc, char** argv) {
   };
 
   int T = std::min<int>(args.threads, std::max<int>(1, (int)tasks.size()));
+  active_workers = T;
+  // Every replay thread submits one request per MCTS step: batch the forward over all of them.
+  if (args.batch_wait_us > 0) server.SetBatchWindow(T, args.batch_wait_us);
   std::vector<std::thread> pool;
   for (int t = 0; t < T; ++t) pool.emplace_back(replay_worker, t);
   for (auto& th : pool) th.join();

@@ -64,6 +64,18 @@ class InferenceServer {
   int64_t forwards() const { return fwd_.load(); }
   int64_t evals() const { return evals_.load(); }
 
+  // Batching window (off by default: each forward takes whatever is queued the moment the worker wakes).
+  // With target_requests > 1 and max_wait_us > 0, once a request is queued the worker waits until
+  // target_requests are queued or max_wait_us has passed. Callers whose threads each submit one request per
+  // cycle set target = their thread count: otherwise the first thread back from a forward triggers a
+  // near-empty forward while the rest queue behind it (every forward costs ~3 ms even for a few positions).
+  void SetBatchWindow(int target_requests, int max_wait_us) {
+    std::lock_guard<std::mutex> l(mu_);
+    target_requests_ = target_requests;
+    max_wait_us_ = max_wait_us;
+    cv_.notify_one();  // a lower target may already be met by the queued requests
+  }
+
  private:
   struct Req {
     const float* obs;
@@ -81,6 +93,12 @@ class InferenceServer {
         std::unique_lock<std::mutex> l(mu_);
         cv_.wait(l, [this] { return stop_ || !queue_.empty(); });
         if (stop_ && queue_.empty()) return;
+        if (target_requests_ > 1 && max_wait_us_ > 0) {
+          auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(max_wait_us_);
+          cv_.wait_until(l, deadline, [this] {
+            return stop_ || static_cast<int>(queue_.size()) >= target_requests_;
+          });
+        }
         batch.assign(queue_.begin(), queue_.end());
         queue_.clear();
       }
@@ -145,6 +163,8 @@ class InferenceServer {
   std::deque<Req*> queue_;
   std::atomic<int64_t> fwd_{0}, evals_{0};
   bool stop_ = false;
+  int target_requests_ = 0;  // batching window (SetBatchWindow); 0 = off
+  int max_wait_us_ = 0;
   std::thread worker_;
 };
 

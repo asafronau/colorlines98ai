@@ -5995,3 +5995,33 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Next (owner): flywheel on the student from soft ep35 with 600 sims. scripts/flywheel_turn.sh now
      reads the trunk shape from the checkpoint (alphatrain/scripts/model_shape.py) and takes SIMS
      (default 600); value head, fused export, fine-tune and merge smoke-tested on the student.
+
+260. **Mining 6.1x faster on the 9x64 student: 256 replay threads + a batching window in the GPU server
+     (15,003 -> 91,762 network evals/s). Autonomous student flywheel started.** (2026-09-29)
+     Diagnosis: at 14 threads mining used 0.7 CPU cores; the GPU ran ~55-position forwards of ~3.7 ms
+     each, and a forward costs ~2.8 ms even at that size (build/infer_bench: fused pv_S1, fp16, round
+     trip 2.9 ms at batch 55, 4.3 at 300, 6.4 at 600, 10.5 at 1,200, 19.3 at 2,400; reading back all
+     6,561 logits costs <= 0.5 ms, fp16 readback gains nothing). Fixes: more games in flight
+     (--threads) and InferenceServer::SetBatchWindow: the server fired the moment the first request
+     arrived, so after every forward the first thread back triggered a near-empty forward while the
+     rest queued (average batch 340 of 512 at 64 threads). mcts_crisis --batch-wait-us N now waits until
+     every active replay thread has submitted or N us pass; the target shrinks as threads run out of
+     work. Benchmark (S1 policy + survival head, 600 sims, epoch-4 probes, 400 probe seeds; rate
+     between the last two [GPU] lines):
+       threads  window   evals/s  batch  ms per forward
+          14      -      15,003     55     3.7
+          32      -      24,300    138     5.7
+          64      -      40,516    340     8.4
+          64     3 ms    60,381    504     8.3
+         128     3 ms    73,593  1,008    13.7
+         256     3 ms    91,762  2,019    22.0
+     Each game's search is unchanged (8 leaves per request, same sims); only the fp16 batch composition
+     differs. scripts/flywheel_turn.sh defaults THREADS=256 BATCH_WAIT=3000; --threads left out of the
+     locked run config (an execution setting: a resume may change it); steps 2-3 skip when done, so a
+     stopped turn resumes by rerunning it (S1's mining resumed: 291/3,000 seeds kept).
+     Owner's directive: run the flywheel on the student autonomously; stop when it reaches the 18x96
+     level or a turn gains < 15%. scripts/flywheel_loop.sh: per turn, promote the alpha with the lowest
+     2k death rate (alphatrain/scripts/best_gate.py; the largest swept alpha winning gates one more);
+     stop at rate <= 0.52 (the union teacher's 95% CI upper end) or a death-rate cut < 15%. Running:
+     scripts/flywheel_loop.sh alphatrain/data/scratch9b64_pair2_distill_union_soft_ckpts_epoch_35.pt
+     1.52 S 1 4500000 4600000 (turn k: seeds +500,000 per turn) -> logs/flywheel_loop_S.log.

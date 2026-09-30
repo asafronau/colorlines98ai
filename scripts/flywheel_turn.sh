@@ -22,6 +22,8 @@ PROBES=${PROBES:-3000}   # crisis probe seeds; raise as deaths get rare (e.g. PR
 PROBE_MODEL=${PROBE_MODEL-data/scratch18b96_lr3e3_ckpts_epoch_4_ts.pt}   # empty = the actor probes itself
 PROBE_SLIP=${PROBE_SLIP:-0}   # per-move mouse-slip probability for the probe player
 SIMS=${SIMS:-600}             # search sims per move in the crisis windows (recovery and prevention)
+THREADS=${THREADS:-256}       # crisis games in flight: sets the shared GPU batch, not the search (HISTORY 260)
+BATCH_WAIT=${BATCH_WAIT:-3000}  # us the GPU server waits to batch every thread's request (mcts_crisis --batch-wait-us)
 SHAPE=$($PY -m alphatrain.scripts.model_shape "$ACTOR")   # fine-tune any actor size (18x96, 9x64 student, ...)
 mkdir -p logs checkpoints/${TAG}_ft $D/greedy_${TAG}_cap100k
 
@@ -29,15 +31,20 @@ echo "=== [1/7] export $TAG ($(date)) ==="
 [ -f $CPP/data/${TAG}_ts.pt ] || $PY -m alphatrain.inference_cpp.export_ts --model "$ACTOR" \
     --output $CPP/data/${TAG}_ts.pt > logs/${TAG}_export.log 2>&1
 
+# Steps 2-3 are skipped when their final output exists, so a stopped turn resumes by rerunning the same command
+# (mcts_crisis resumes per seed from its out-dir; steps 5-7 are cheap to redo).
 echo "=== [2/7] record 1,000 own games (cap 100k turns), seeds $RSEED+ ($(date)) ==="
+if [ -f $CPP/data/greedy_${TAG}_record.csv ]; then echo "(done earlier: $CPP/data/greedy_${TAG}_record.csv)"; else
 (cd $CPP && ./build/eval --model data/${TAG}_ts.pt --device mps --batch 500 --seed-start $RSEED \
     --seed-end $((RSEED + 1000)) --max-turns 100000 --record-dir ../../$D/greedy_${TAG}_cap100k --record-every 8 \
     --record-tail 300 --scores-out data/greedy_${TAG}_record.csv) > logs/${TAG}_record.log 2>&1
 $PY -m alphatrain.scripts.eval_log csv --csv $CPP/data/greedy_${TAG}_record.csv --model $TAG \
     --cap 100000 --desc "$TAG own-games recording run (fresh seeds, greedy, cap 100k turns)"
 tail -n 4 logs/${TAG}_record.log
+fi
 
 echo "=== [3/7] survival head on the frozen $TAG backbone ($(date)) ==="
+if [ -f $CPP/data/pv_${TAG}_ts.pt ]; then echo "(done earlier: $CPP/data/pv_${TAG}_ts.pt)"; else
 $PY -m alphatrain.scripts.build_value_targets_from_records --games-dir $D/greedy_${TAG}_cap100k \
     --output $D/value_targets_${TAG}.pt --every 8 --tail 300 > logs/${TAG}_value_targets.log 2>&1
 $PY -m alphatrain.scripts.train_value_head --backbone "$ACTOR" --train-data $D/value_targets_${TAG}.pt \
@@ -47,6 +54,7 @@ tail -n 2 logs/${TAG}_value_head.log
 $PY -m alphatrain.inference_cpp.export_policy_value --model "$ACTOR" --head $D/value_head_${TAG}.pt \
     > logs/${TAG}_export_pv.log 2>&1
 mv $CPP/data/policy_value_ts.pt $CPP/data/pv_${TAG}_ts.pt
+fi
 
 echo "=== [4/7] fixed-teacher crisis windows, $PROBES probe seeds from $MSEED ($(date)) ==="
 (cd $CPP && ./build/mcts_crisis --run-id ${TAG}_crisis_w45 --model data/${TAG}_ts.pt \
@@ -54,7 +62,7 @@ echo "=== [4/7] fixed-teacher crisis windows, $PROBES probe seeds from $MSEED ($
     --recovery-turns 15 --recovery-sims $SIMS --prevention-turns 30 --prevention-sims $SIMS \
     --c-puct 1.5 --q-weight 2.0 --virtual-mean --dirichlet-weight 0 --continue-turns 45 \
     ${PROBE_MODEL:+--probe-model $PROBE_MODEL} --probe-slip $PROBE_SLIP \
-    --policy-max-turns 100000 --threads 14 --out-dir ../../data/${TAG}_crisis_w45) \
+    --policy-max-turns 100000 --threads $THREADS --batch-wait-us $BATCH_WAIT --out-dir ../../data/${TAG}_crisis_w45) \
     > logs/${TAG}_crisis_w45.log 2>&1
 tail -n 1 logs/${TAG}_crisis_w45.log
 files=(data/${TAG}_crisis_w45/game_seed*_prevention_*.json)
