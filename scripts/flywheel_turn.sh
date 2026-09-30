@@ -35,7 +35,7 @@ echo "=== [1/7] export $TAG ($(date)) ==="
 # (mcts_crisis resumes per seed from its out-dir; steps 5-7 are cheap to redo).
 echo "=== [2/7] record 1,000 own games (cap 100k turns), seeds $RSEED+ ($(date)) ==="
 if [ -f $CPP/data/greedy_${TAG}_record.csv ]; then echo "(done earlier: $CPP/data/greedy_${TAG}_record.csv)"; else
-(cd $CPP && ./build/eval --model data/${TAG}_ts.pt --device mps --batch 500 --seed-start $RSEED \
+(cd $CPP && ./build/eval --model data/${TAG}_ts.pt --device mps --batch 1000 --seed-start $RSEED \
     --seed-end $((RSEED + 1000)) --max-turns 100000 --record-dir ../../$D/greedy_${TAG}_cap100k --record-every 8 \
     --record-tail 300 --scores-out data/greedy_${TAG}_record.csv) > logs/${TAG}_record.log 2>&1
 $PY -m alphatrain.scripts.eval_log csv --csv $CPP/data/greedy_${TAG}_record.csv --model $TAG \

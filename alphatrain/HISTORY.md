@@ -6074,3 +6074,22 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      18x96's ceiling. Running: SIMS=800 ALPHAS="0.5 1.0 2.0" MIN_GAIN=0.05 TARGET=0 scripts/flywheel_loop.sh
      alphatrain/data/ta_union_abc_a1.0.pt 0.48 A 5 5000000 5100000 -> logs/flywheel_loop_A.log (A5 := the
      union, best 2k gate 0.48 vs A4 0.49; turn k seeds +500,000; stop when a turn cuts the rate < 5%).
+
+263. **18x96 flywheel turn A5 (actor = the union, 800 sims): 0.48 -> 0.38 deaths per 100k turns (-21%,
+     CIs disjoint). A stronger teacher broke the plateau that 3x the data at 600 sims could not
+     (HISTORY 258). A6 = ta_A5_e4_a2.0.** (2026-09-30) scripts/flywheel_loop.sh (SIMS=800 ALPHAS="0.5 1.0
+     2.0" MIN_GAIN=0.05 TARGET=0) alphatrain/data/ta_union_abc_a1.0.pt 0.48 A 5 5000000 5100000:
+     own games (seeds 5,000,000+, 1k) 0.48 [0.43, 0.53], P1 4,544 / P10 38,601 / 62.4% capped (2,544 s at
+     500 in flight; later turns record all 1,000 at once); survival head 27.6 min, inner-val 0.0147; mining
+     3,000 epoch-4 probes -> 6,000 windows at 800 sims in 5,847 s (33,229 evals/s, 3.6x the 18x96's old
+     ~9.3k); corpus 245,254 rows (anomaly B 0/20,000; C: the actor's move matches its 800-sim search on
+     78.39% of crisis rows vs A1's 86.34% at 600 sims: the stronger teacher corrects more); fine-tune 4 ep
+     (val 1.4953). Gates (2k, cap 100k turns, folded):
+       model          P1     P5     P10     P25      P50      P75      P90      P95   capped  per 100k turns
+       A5 (union)   5,815 23,452  47,413 124,318  203,897  204,276  204,541  204,691  61.7%  0.48 [0.45, 0.52]
+       alpha 0.5    5,568 22,020  47,206 132,202  203,934  204,294  204,518  204,668  64.8%  0.43 [0.40, 0.47]
+       alpha 1.0    4,326 30,176  58,963 145,423  203,944  204,307  204,535  204,705  66.5%  0.41 [0.38, 0.44]
+       alpha 2.0    6,750 25,161  52,397 150,986  203,957  204,273  204,504  204,630  68.1%  0.38 [0.36, 0.42]
+       alpha 3.0    8,200 32,225  57,227 151,921  203,880  204,230  204,452  204,583  67.0%  0.40 [0.37, 0.43]
+     MTBF 207,927 -> 259,857 turns. The loop promoted A6 = ta_A5_e4_a2.0 (alpha 3.0 statistically tied,
+     best tail) and started turn A6 (seeds 5,500,000 / 5,600,000).
