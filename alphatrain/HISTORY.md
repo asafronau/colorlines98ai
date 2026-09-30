@@ -6025,3 +6025,28 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      stop at rate <= 0.52 (the union teacher's 95% CI upper end) or a death-rate cut < 15%. Running:
      scripts/flywheel_loop.sh alphatrain/data/scratch9b64_pair2_distill_union_soft_ckpts_epoch_35.pt
      1.52 S 1 4500000 4600000 (turn k: seeds +500,000 per turn) -> logs/flywheel_loop_S.log.
+
+261. **Student flywheel turn S1 (own search, 600 sims): 1.52 -> 1.36 deaths per 100k turns (-10.5%), under
+     the owner's 15% bar, so the loop stopped. The 9x64 is capacity-limited: on rows it trained on, its top
+     move matches the labels' on ~80.5% of crisis rows vs ~89.6% for the teacher's own single pass.**
+     (2026-09-29) scripts/flywheel_loop.sh <soft ep35> 1.52 S 1 4500000 4600000 -> logs/flywheel_loop_S.log:
+     own games (seeds 4,500,000+, 1k) 1.62 [1.51, 1.74]; survival head (inner-val 0.0310); mining 3,000
+     epoch-4 probes -> 6,000 windows (resumed at 291 seeds; 5,416 mined in 1,879 s, 68,915 evals/s);
+     corpus 241,211 rows (anomaly B 0/20,000; C: eval-mode BN matches target 79.48%, vs A1's 86.34%:
+     the search overrides the student more); fine-tune 4 ep (val 1.4876). Gates (2k, cap 100k, folded):
+       model            P1     P5     P10     P25     P50      P75      P90      P95   capped  per 100k turns
+       S1 actor       2,217  7,461  14,838  38,970   94,584  184,449  204,130  204,331  21.8%  1.52 [1.45, 1.60]
+       S1 alpha 1.0   2,118  7,007  15,860  43,860  106,406  203,595  204,373  204,585  25.4%  1.36 [1.29, 1.43]
+       S1 alpha 2.0   1,441  7,445  15,673  43,117  100,465  203,786  204,534  204,759  25.4%  1.38 [1.31, 1.45]
+       S1 alpha 3.0   1,735  5,919  12,943  34,654   84,509  169,320  204,597  204,880  19.8%  1.65 [1.57, 1.73]
+     Loop: "STOP: gain 0.105 < 0.15. Best actor: alphatrain/data/ta_S1_e4_a1.0.pt (1.36 per 100k turns)".
+     Fit gap (logs/fit_gap_9b64.log; 20k distill_union.pt rows per source; KL(labels || model) over legal
+     moves, nats / top-1 agreement with the label's top move):
+       source               H(labels)  union single pass   9x64 soft ep35    S1 alpha 1.0
+       teacher games          0.642     0.042 / 92.4%      0.121 / 85.6%     0.134 / 84.6%
+       epoch-4 games          0.728     0.065 / 91.4%      0.150 / 83.9%     0.161 / 83.4%
+       crisis (A1,A2,A3,b)    ~0.86     ~0.12 / ~89.6%     ~0.21 / ~80.5%    ~0.22 / ~80.3%
+       crisis offp_c w200     0.767     0.071 / 91.6%      0.154 / 83.4%     0.164 / 83.1%
+     The student sits 7-9 agreement points below the teacher's single pass on every source (most on crisis
+     rows) after 35 epochs on these very rows: a fit (capacity) limit, not generalization. The own-search
+     turn moved S1 slightly away from the union's labels while cutting deaths 10.5%.
