@@ -6050,3 +6050,27 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      The student sits 7-9 agreement points below the teacher's single pass on every source (most on crisis
      rows) after 35 epochs on these very rows: a fit (capacity) limit, not generalization. The own-search
      turn moved S1 slightly away from the union's labels while cutting deaths 10.5%.
+
+262. **9x64 bug hunt: nothing found; the 9x64 is parked and the 18x96 flywheel resumes (autonomous,
+     800 sims).** (2026-09-30) Owner doubted the capacity reading (the 18x96 was called capacity-limited
+     before and then improved ~10x after bug fixes). Checks, all clean:
+     - fp16 / folded export fidelity (logs/fp16_fidelity.log, 20k game + 20k crisis rows, argmax vs fp32):
+       student folded 99.77 / 99.73%, unfolded 99.71 / 99.67%; union folded 99.29 / 98.77%, unfolded
+       99.29 / 98.75%. The student is not hurt by fp16 (its 63 rescaled BN channels vs the union's 550
+       are normal for this architecture).
+     - Recipe: identical to A1's (bs 32768, lr 3e-3, wd 1e-4, warmup 1, 40 ep, augment x8, ~4B samples)
+       except size and soft targets. PolicyNet has no width-dependent constants (policy head 128 ch,
+       pair_dim 64; 9 blocks see the whole board).
+     - Flywheel teacher: S1 value head inner-val 0.0310 / fine-tune val 1.488 vs A2's 0.0270 / 1.686 at
+       similar strength (A2 1.38).
+     - Covariate shift (DAgger potential): 41 of S1's own recorded games labeled with the union's 8-view
+       policy (230,864 rows, logs/own_state_gap_9b64.log): top-1 agreement by balls on board
+       <40 / 40-54 / 55-64 / 65+: student on its OWN states 85.6 / 85.0 / 79.1 / 80.2%, on the teacher's
+       states 85.7 / 85.4 / 78.8 / 79.6% (union single pass ~92 / 92 / 87 / 86-88%). No shift: DAgger
+       would not add information.
+     - Labels: verified in HISTORY 258 (the only bug, sum-vs-mean TTA temperature, fixed before training).
+     The student's gap is a uniform ~7-point imitation deficit on every source and fullness. Decisive
+     capacity test, not run: an 18x96 from scratch on distill_union.pt. Owner: park the 9x64, find the
+     18x96's ceiling. Running: SIMS=800 ALPHAS="0.5 1.0 2.0" MIN_GAIN=0.05 TARGET=0 scripts/flywheel_loop.sh
+     alphatrain/data/ta_union_abc_a1.0.pt 0.48 A 5 5000000 5100000 -> logs/flywheel_loop_A.log (A5 := the
+     union, best 2k gate 0.48 vs A4 0.49; turn k seeds +500,000; stop when a turn cuts the rate < 5%).
