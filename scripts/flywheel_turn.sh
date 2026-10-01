@@ -14,6 +14,8 @@
 # death the two search windows start, CONT_TURNS (default 45) = searched moves per window. HW = leaf-value weights
 # over the survival horizons 25,50,100,200 (default 1.0,0.8,0.5,0.25). RUN (default = tag) names the windows,
 # fine-tune and merges, so an arm with other windows reuses the actor's recorded games and survival head.
+# ANCHORS = an anchors.h file (alphatrain/scripts/death_anchors.py, e.g. the actor's own recorded deaths K moves
+# before death; set PREV_TURNS=K): the miner replays those states instead of probing (mine_seed is then unused).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ACTOR=$1; TAG=$2; RSEED=$3; MSEED=$4; ALPHAS=$5; shift 5; PREV=("$@")
@@ -32,6 +34,7 @@ SHAPE=$($PY -m alphatrain.scripts.model_shape "$ACTOR")   # fine-tune any actor 
 REC_TURNS=${REC_TURNS:-15}; PREV_TURNS=${PREV_TURNS:-30}; CONT_TURNS=${CONT_TURNS:-45}
 HW=${HW:-}
 RUN=${RUN:-$TAG}
+ANCHORS=${ANCHORS:-}
 WIN=${RUN}_crisis_w${CONT_TURNS}
 PV=pv_${TAG}${HW:+_hw$(echo "$HW" | tr ",." "_p")}_ts.pt
 mkdir -p logs checkpoints/${RUN}_ft $D/greedy_${TAG}_cap100k
@@ -72,7 +75,7 @@ echo "=== [4/7] fixed-teacher crisis windows $WIN (start $REC_TURNS / $PREV_TURN
     --value-module data/$PV --device mps --seed-start $MSEED --seed-end $((MSEED + PROBES)) \
     --recovery-turns $REC_TURNS --recovery-sims $SIMS --prevention-turns $PREV_TURNS --prevention-sims $SIMS \
     --c-puct 1.5 --q-weight 2.0 --virtual-mean --dirichlet-weight 0 --continue-turns $CONT_TURNS \
-    ${PROBE_MODEL:+--probe-model $PROBE_MODEL} --probe-slip $PROBE_SLIP \
+    ${ANCHORS:+--anchors-in ../../$ANCHORS} ${PROBE_MODEL:+--probe-model $PROBE_MODEL} --probe-slip $PROBE_SLIP \
     --policy-max-turns 100000 --threads $THREADS --batch-wait-us $BATCH_WAIT --out-dir ../../data/$WIN) \
     > logs/$WIN.log 2>&1
 tail -n 1 logs/$WIN.log

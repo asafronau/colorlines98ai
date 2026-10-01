@@ -39,6 +39,7 @@
 #include <utility>
 #include <vector>
 
+#include "anchors.h"
 #include "feature_value.h"
 #include "game.h"
 #include "game_json.h"
@@ -78,6 +79,9 @@ struct Args {
   // search still does the replays. Empty = the actor probes (the server's own policy).
   std::string probe_model;
   std::string anchors_out;  // write every replay checkpoint as an anchors.h line
+  // Replays from saved states (anchors.h; e.g. the actor's own recorded deaths, HISTORY 265) instead of probing:
+  // each anchor = one prevention-band task, --prevention-turns moves before its death.
+  std::string anchors_in;
   bool probe_only = false;  // stop after phase 1 (with --anchors-out: build escape benchmarks)
   double probe_slip = 0.0;  // per-move probability of a uniformly random legal probe move (mouse slip)
 };
@@ -120,12 +124,13 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--probe-model") a.probe_model = argv[++i];
     else if (k == "--probe-slip") a.probe_slip = std::stod(argv[++i]);
     else if (k == "--anchors-out") a.anchors_out = argv[++i];
+    else if (k == "--anchors-in") a.anchors_in = argv[++i];
     else {
       std::fprintf(stderr, "FATAL: unknown argument %s\n", k.c_str());
       std::exit(2);
     }
   }
-  if (a.seed_end <= a.seed_start || a.recovery_sims <= 0 ||
+  if ((a.anchors_in.empty() && a.seed_end <= a.seed_start) || a.recovery_sims <= 0 ||
       a.prevention_sims <= 0 || a.continue_turns <= 0 ||
       a.policy_max_turns <= 0 || a.probe_batch <= 0 ||
       a.batch_size <= 0 || a.top_k <= 0 || a.threads <= 0 || a.batch_wait_us < 0) {
@@ -259,6 +264,7 @@ int main(int argc, char** argv) {
     config += ", \"dirichlet_weight\": ";
     clines::AppendD(config, args.dirichlet_weight);
     config += ", \"probe_model\": \"" + args.probe_model + "\"";
+    config += ", \"anchors_in\": \"" + args.anchors_in + "\"";
     config += ", \"probe_slip\": ";
     clines::AppendD(config, args.probe_slip);
     // --threads is left out on purpose: it sets how many games are in flight (so how large the
@@ -280,7 +286,8 @@ int main(int argc, char** argv) {
   clines::InferenceServer& probe_eval = probe_server ? *probe_server : server;
 
   std::vector<uint64_t> seeds;
-  for (uint64_t s = args.seed_start; s < args.seed_end; ++s) seeds.push_back(s);
+  if (args.anchors_in.empty())  // with --anchors-in there is no probe phase
+    for (uint64_t s = args.seed_start; s < args.seed_end; ++s) seeds.push_back(s);
   auto t0 = Clock::now();
 
   std::printf("mcts_crisis: %zu probe seeds [%llu,%llu)  recovery=%d@%d "
@@ -350,6 +357,19 @@ int main(int argc, char** argv) {
   }
 
   std::vector<ReplayTask> tasks;
+  if (!args.anchors_in.empty()) {
+    for (const clines::Anchor& an : clines::ReadAnchors(args.anchors_in)) {
+      auto it = rs.done.find(an.seed);
+      if (it != rs.done.end() && (it->second & kPreventionBit)) continue;  // replayed on a previous run
+      Snapshot sn;
+      std::copy(an.board, an.board + 81, sn.board);
+      sn.next_balls = an.next;
+      sn.score = 0;
+      sn.turn = an.turn;
+      tasks.push_back({an.seed, sn, "prevention", args.prevention_turns, args.prevention_sims});
+    }
+    std::printf("anchors-in: %zu replay tasks from %s\n", tasks.size(), args.anchors_in.c_str());
+  }
   std::vector<float> obs_buf, logits_buf;
   std::vector<int> lp_acts(1);
   std::vector<double> lp_pris(1);
