@@ -6115,3 +6115,34 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Pattern: 600 sims gave A2->A3 -58%, A3->A4 -19%, then 3x data ~0; 800 sims gave A5 -21%, A6 -2.6%.
      Each teacher strength buys one or two turns. Running: SIMS=1600 loop from ta_A6_e4_a0.5 as A7
      (seeds 6,000,000 / 6,100,000).
+
+265. **Why the flywheel stalls: the strong actor's deaths are 60-120-move SLIDES from a healthy board, and
+     every crisis window ever mined starts 15/30 moves before death -- past the slide. A slide is a loss of
+     line potential, and the survival head sees it but the leaf value hides it.** (2026-09-30, CPU-only
+     analyses while turn A7 ran; owner: "we can't keep doubling sims ... explore different options")
+     Death anatomy (scratchpad death_anatomy.py, logs/death_anatomy.log; recorded own games, last 300 moves
+     of every death):
+                                         A6 (actor)   A5      A3      epoch-4 (probe player)
+       healthy mid-game balls mean/p99   32.9/47      33.1/48 33.3/48 37.0/56
+       balls 300/150/100/45/15 before    34/38/43/53/63  same   34/38/42/52/62  37/41/44/51/62
+       slide length (moves since <=45)   64 (p75 89)  58      54      52
+       slide length (moves since <=40)   90 (p75 122) 84      77      82
+     The slide lengthens as the actor improves (54 -> 58 -> 64), so a fixed late window sees less of it
+     every turn. mcts_crisis anchors windows at death-15 (recovery) and death-30 (prevention): ~57 balls
+     for A6, beyond the healthiest games' p99 of 47. No experiment so far (incl. the 200-move arm, which
+     kept the late anchors) searched the 40-50-ball slide.
+     Survival head sees slides (scratchpad value_sees_slide.py, A6 head on A6's records, AUC within
+     fullness bins for "dies within H"): 46-50 balls H=100 0.87 / H=200 0.79; 41-45 balls H=200 0.74
+     (P(survive 200) 0.978 doomed vs 0.991 recovering); 36-40 balls H=200 0.68. But the leaf value weights
+     the horizons 25/50/100/200 by 1.0/0.8/0.5/0.25: in a slide P(survive 25/50) ~ 1 for every move, so
+     move-to-move differences are ~0.003 and the search just echoes the prior.
+     What a slide is (scratchpad slide_features.py, 35,933 doomed states 60-150 moves before an A5/A6
+     death vs 1.07M recovering states >300 moves from death, AUC within fullness bins): same-colour runs
+     of >= 3 AUC 0.19-0.22 (doomed 1.0-1.3 vs 1.5-1.8), longest run 0.18 (3.1 vs 3.5); empty-space
+     fragments 0.40, movable balls 0.39-0.42, legal moves / colour mix ~0.5. Doomed boards have lost
+     their partial lines: no setups -> no clears -> the board fills.
+     Tooling: export_policy_value --horizon-weights (leaf value weights); scripts/flywheel_turn.sh takes
+     REC_TURNS / PREV_TURNS / CONT_TURNS (window starts before death and length), HW (leaf weights) and
+     RUN (arm name: windows, fine-tune and merges), reusing the actor's recorded games and survival head.
+     Defaults reproduce the old turn exactly. Next GPU slot (after turn A7): slide arm on the same actor
+     and probe deaths: RUN=A7s REC_TURNS=60 PREV_TURNS=120 CONT_TURNS=75 HW=0.1,0.2,1.0,1.25 SIMS=800.

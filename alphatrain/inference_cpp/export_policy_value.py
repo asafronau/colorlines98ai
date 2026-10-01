@@ -42,6 +42,9 @@ def main():
     p.add_argument('--head', default='alphatrain/data/value_head_small128.pt')
     p.add_argument('--state-tensor', default='alphatrain/data/distill_states.pt')
     p.add_argument('--outdir', default='alphatrain/inference_cpp/data')
+    p.add_argument('--horizon-weights', default=None,
+                   help='leaf value = sum_h w_h * P(survive h) over horizons (25, 50, 100, 200); comma-separated, '
+                        'default 1.0,0.8,0.5,0.25 (tactical). Long-horizon weights let the search see slow slides.')
     a = p.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
 
@@ -51,9 +54,10 @@ def main():
         f'expected survival ValueHead, got {head_type}/{ckpt.get("target_type")}'
     head.train(False)
     net.train(False)
-    hw = torch.tensor(vh.SURVIVAL_WEIGHTS
-                      if hasattr(vh, 'SURVIVAL_WEIGHTS') else [1.0, 0.8, 0.5, 0.25],
-                      dtype=torch.float32)
+    weights = [float(x) for x in a.horizon_weights.split(',')] if a.horizon_weights else list(vh.DEFAULT_HORIZON_WEIGHTS)
+    assert len(weights) == vh.NUM_HORIZONS, f'--horizon-weights needs {vh.NUM_HORIZONS} values, got {weights}'
+    hw = torch.tensor(weights, dtype=torch.float32)
+    print(f'leaf value weights over horizons {vh.SURVIVAL_HORIZONS}: {weights}')
     module = PolicyValue(net, head, hw)
     module.train(False)
 
