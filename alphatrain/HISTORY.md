@@ -6200,3 +6200,21 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      alphatrain/scripts/merge_task_vectors.py) yet their sum is no better than either: no stacking at 1+1.
      Next: does the slide lever repeat? Turn A8 slide-only at 800 sims from ta_A7_e4_a1.0, anchors pooled
      from the A5-A8 own deaths.
+
+268. **The slide lever does not repeat: turn A8s (slide-only, 800 sims) on A8 = ta_A7_e4_a1.0 gives 0.36 /
+     0.31 / 0.35 at alpha 0.5 / 1.0 / 1.5 vs the actor's 0.32.** (2026-10-01) RUN=A8s SLIDE_DEATHS=<A5-A7
+     records> PREV_TURNS=120 CONT_TURNS=120 HW=0.1,0.2,1.0,1.25 SIMS=800 scripts/flywheel_turn.sh
+     alphatrain/data/ta_A7_e4_a1.0.pt A8 6500000 6600000 "0.5 1.0 1.5": own games (seeds 6,500,000+, 1k)
+     0.34 [0.30, 0.38], P1 10,740, 70.9% capped; 1,279 own-death anchors (A5-A8); 1,279 windows in 3,632 s;
+     corpus 153,112 rows (C: actor matches search 88.83%); fine-tune val 1.1106. Gates (2k, cap 100k):
+       model            P1     P5     P10     P25      P50      P75      P90      P95   capped  per 100k turns
+       A8 actor       5,500 30,081  63,906 178,216  204,047  204,339  204,555  204,698  72.5%  0.32 [0.30, 0.35]
+       A8s alpha 0.5  5,684 27,931  57,707 159,418  204,003  204,308  204,571  204,706  69.9%  0.36 [0.33, 0.39]
+       A8s alpha 1.0  5,532 31,021  68,315 191,028  204,019  204,302  204,533  204,651  73.6%  0.31 [0.28, 0.34]
+       A8s alpha 1.5  6,228 28,385  62,131 164,657  203,967  204,271  204,509  204,638  70.5%  0.35 [0.32, 0.38]
+     With "no stacking" (HISTORY 267) this says the crisis (1,600 sims) and slide (800 sims) corrections
+     fix the same marginal deaths: once A8 holds one, the other adds nothing. Both teachers share one
+     judge of danger: the survival head, trained on the current actor's ~300 own deaths. Next: does a
+     head trained on pooled own deaths (A3-A7, every 32nd state + full death tails;
+     build_value_targets_from_records now takes several --games-dir) separate danger better on A8's games
+     than A8's own head?

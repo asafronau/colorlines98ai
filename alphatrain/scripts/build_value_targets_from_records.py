@@ -9,10 +9,10 @@ from alphatrain.value_head import SURVIVAL_HORIZONS
 
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument('--games-dir', required=True); p.add_argument('--output', required=True)
+    p = argparse.ArgumentParser(); p.add_argument('--games-dir', required=True, nargs='+', help='one or more record dirs (pooled)'); p.add_argument('--output', required=True)
     p.add_argument('--every', type=int, default=4); p.add_argument('--tail', type=int, default=300); p.add_argument('--val-frac', type=float, default=0.1)
     a = p.parse_args(); rng = np.random.default_rng(0)
-    files = sorted(glob.glob(os.path.join(a.games_dir, 'game_seed*.json')))
+    files = sorted(f for d in a.games_dir for f in glob.glob(os.path.join(d, 'game_seed*.json')))
     B, NP, NC, NN, L, M, TR = [], [], [], [], [], [], []
     for fi, f in enumerate(files):
         g = json.load(open(f)); st = g['states']; T = g['final_turns']; capped = not g['died']
