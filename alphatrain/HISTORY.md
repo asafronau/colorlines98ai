@@ -6176,3 +6176,27 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      stopped it within seconds, removed A8's export and records, and launched the slide arm A7s on the A7
      actor: 988 own-death anchors 120 moves before death, 120 searched moves, leaf weights 0.1,0.2,1.0,1.25,
      800 sims -> logs/slide_arm_A7s.log.
+
+267. **Slide arm A7s (own deaths, 800 sims) matches the 1,600-sim turn for ~1/4 the mining: 0.37 -> 0.33
+     deaths per 100k turns (A7 at 1,600 sims: 0.32). Summing both task vectors does not stack (0.34).**
+     (2026-10-01) RUN=A7s ANCHORS=alphatrain/data/slide_anchors_A5A6A7_k120.txt PREV_TURNS=120
+     CONT_TURNS=120 HW=0.1,0.2,1.0,1.25 SIMS=800 scripts/flywheel_turn.sh alphatrain/data/ta_A6_e4_a0.5.pt A7
+     6000000 6100000 "0.5 1.0 2.0" (A7's actor, recorded games and survival head; pv exported with the slide
+     weights): 988 own-death anchors, 120 moves before death, 120 searched moves -> 988 windows in 2,632 s
+     (35,955 evals/s; A7's 6,000 crisis windows at 1,600 sims took 11,552 s); corpus 118,171 rows (B 0/20,000;
+     C: the actor's move matches its slide search on 88.55% of rows, BN eval/train agreement 83.91%);
+     fine-tune val 1.1459. Search escaped 984 of 988 slides (120 moves); the no-search control from the
+     same anchors with the same replay spawns (anchor_search --search-turns 0, CPU, pv module) escaped 979:
+     slides are not doomed positions (the original deaths needed bad spawns too) but they carry ~24x the
+     actor's hazard (9 deaths in ~118k turns = ~7.6 per 100k turns; search: 4, ~3.4). Gates (2k, cap 100k):
+       model                 P1     P5     P10     P25      P50      P75      P90      P95   capped  per 100k turns
+       A7 actor            5,588 27,986  56,355 155,380  203,976  204,273  204,519  204,667  69.1%  0.37 [0.34, 0.40]
+       A7s alpha 0.5       8,064 31,314  69,098 171,094  203,984  204,293  204,539  204,702  70.3%  0.35 [0.32, 0.38]
+       A7s alpha 1.0       8,309 29,804  67,520 171,179  203,982  204,303  204,527  204,671  71.7%  0.33 [0.31, 0.36]
+       A7s alpha 2.0       5,711 28,782  53,566 146,466  203,921  204,234  204,490  204,607  67.5%  0.39 [0.36, 0.42]
+       A7 alpha 1.0        5,500 30,081  63,906 178,216  204,047  204,339  204,555  204,698  72.5%  0.32 [0.30, 0.35]
+       A7 + A7s, 1.0+1.0   9,270 34,243  64,444 172,227  204,018  204,328  204,564  204,684  71.4%  0.34 [0.31, 0.37]
+     The crisis (A7) and slide (A7s) task vectors are nearly orthogonal (cosine 0.09, norms 3.58 / 2.36;
+     alphatrain/scripts/merge_task_vectors.py) yet their sum is no better than either: no stacking at 1+1.
+     Next: does the slide lever repeat? Turn A8 slide-only at 800 sims from ta_A7_e4_a1.0, anchors pooled
+     from the A5-A8 own deaths.
