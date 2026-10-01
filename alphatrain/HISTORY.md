@@ -6159,3 +6159,20 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
        runs>=3 of that choice - policy's    +0.16                       +0.26
      The head separates moves ~10x more in slides than in recovering states, the slide weights triple
      that, and where it disagrees with the policy it keeps more partial lines. (1-ply, 4 futures: noisy.)
+
+266. **Turn A7 at 1,600 sims (one-off experiment): 0.37 -> 0.32 deaths per 100k turns (-13.5%). Owner: no
+     further sim doubling ("we won't get to infinite play if we have to keep doubling sims"); the slide arm
+     (same actor, 800 sims) runs next for comparison.** (2026-09-30..10-01) Loop turn A7 from
+     ta_A6_e4_a0.5 (seeds 6,000,000 / 6,100,000): own games 0.36 [0.32, 0.41] (P1 5,608, 69.5% capped);
+     survival head inner-val 0.0106; mining 6,000 windows at 1,600 sims in 11,552 s (33,829 evals/s);
+     corpus 247,143 rows (B 0/20,000; C: actor matches its 1,600-sim search on 75.47% of crisis rows).
+     Gates (2k, cap 100k turns, folded):
+       model          P1     P5     P10     P25      P50      P75      P90      P95   capped  per 100k turns
+       A7 actor     5,588 27,986  56,355 155,380  203,976  204,273  204,519  204,667  69.1%  0.37 [0.34, 0.40]
+       alpha 0.5    8,747 33,983  69,153 174,996  204,029  204,334  204,572  204,676  71.8%  0.33 [0.30, 0.36]
+       alpha 1.0    5,500 30,081  63,906 178,216  204,047  204,339  204,555  204,698  72.5%  0.32 [0.30, 0.35]
+       alpha 2.0    4,395 28,917  66,709 176,101  204,072  204,354  204,594  204,735  70.8%  0.34 [0.32, 0.37]
+     The loop promoted ta_A7_e4_a1.0 (A8 candidate) and started turn A8; scratchpad after_A7_slide_arm.sh
+     stopped it within seconds, removed A8's export and records, and launched the slide arm A7s on the A7
+     actor: 988 own-death anchors 120 moves before death, 120 searched moves, leaf weights 0.1,0.2,1.0,1.25,
+     800 sims -> logs/slide_arm_A7s.log.
