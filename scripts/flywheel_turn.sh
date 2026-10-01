@@ -16,6 +16,8 @@
 # fine-tune and merges, so an arm with other windows reuses the actor's recorded games and survival head.
 # ANCHORS = an anchors.h file (alphatrain/scripts/death_anchors.py, e.g. the actor's own recorded deaths K moves
 # before death; set PREV_TURNS=K): the miner replays those states instead of probing (mine_seed is then unused).
+# SLIDE_DEATHS = record dirs (e.g. "alphatrain/data/greedy_A6_cap100k alphatrain/data/greedy_A7_cap100k"): before
+# mining, anchors are rebuilt from their deaths PLUS this turn's own recorded deaths, PREV_TURNS moves before death.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ACTOR=$1; TAG=$2; RSEED=$3; MSEED=$4; ALPHAS=$5; shift 5; PREV=("$@")
@@ -35,6 +37,7 @@ REC_TURNS=${REC_TURNS:-15}; PREV_TURNS=${PREV_TURNS:-30}; CONT_TURNS=${CONT_TURN
 HW=${HW:-}
 RUN=${RUN:-$TAG}
 ANCHORS=${ANCHORS:-}
+SLIDE_DEATHS=${SLIDE_DEATHS:-}
 WIN=${RUN}_crisis_w${CONT_TURNS}
 PV=pv_${TAG}${HW:+_hw$(echo "$HW" | tr ",." "_p")}_ts.pt
 mkdir -p logs checkpoints/${RUN}_ft $D/greedy_${TAG}_cap100k
@@ -70,6 +73,10 @@ $PY -m alphatrain.inference_cpp.export_policy_value --model "$ACTOR" --head $D/v
 mv $CPP/data/policy_value_ts.pt $CPP/data/$PV
 fi
 
+if [ -n "$SLIDE_DEATHS" ]; then
+  ANCHORS=$D/${RUN}_anchors_k${PREV_TURNS}.txt
+  $PY -m alphatrain.scripts.death_anchors --before $PREV_TURNS --out $ANCHORS $SLIDE_DEATHS $D/greedy_${TAG}_cap100k
+fi
 echo "=== [4/7] fixed-teacher crisis windows $WIN (start $REC_TURNS / $PREV_TURNS moves before death, $CONT_TURNS searched), $PROBES probe seeds from $MSEED ($(date)) ==="
 (cd $CPP && ./build/mcts_crisis --run-id $WIN --model data/${TAG}_ts.pt \
     --value-module data/$PV --device mps --seed-start $MSEED --seed-end $((MSEED + PROBES)) \
