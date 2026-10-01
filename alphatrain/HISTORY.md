@@ -6146,3 +6146,16 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      RUN (arm name: windows, fine-tune and merges), reusing the actor's recorded games and survival head.
      Defaults reproduce the old turn exactly. Next GPU slot (after turn A7): slide arm on the same actor
      and probe deaths: RUN=A7s REC_TURNS=60 PREV_TURNS=120 CONT_TURNS=75 HW=0.1,0.2,1.0,1.25 SIMS=800.
+     Own-death slide anchors: alphatrain/scripts/death_anchors.py --before 120 over greedy_A5/A6/A7_cap100k
+     -> alphatrain/data/slide_anchors_A5A6A7_k120.txt (988 anchors, 40.7 balls mean, p10 31, p90 51);
+     mcts_crisis --anchors-in replays them (flywheel_turn.sh ANCHORS=...), tested on CPU in both modes.
+     1-ply preview (scratchpad one_ply_preview.py, logs/one_ply_preview_A6.log; A6 policy top-5 x 4 random
+     spawn futures, afterstates scored by the A6 survival head; 800 slide states 60-150 moves before an
+     own death vs 800 recovering states, 38-52 balls):
+                                            slide (doomed)        recovering
+       value spread over top-5, default     median 0.0076 (p90 0.104)   0.0008 (p90 0.009)
+       value spread over top-5, slide W     median 0.0225 (p90 0.198)   0.0030 (p90 0.027)
+       best afterstate != policy's move     59% (both weightings)       57%
+       runs>=3 of that choice - policy's    +0.16                       +0.26
+     The head separates moves ~10x more in slides than in recovering states, the slide weights triple
+     that, and where it disagrees with the policy it keeps more partial lines. (1-ply, 4 futures: noisy.)
