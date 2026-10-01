@@ -6093,3 +6093,25 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
        alpha 3.0    8,200 32,225  57,227 151,921  203,880  204,230  204,452  204,583  67.0%  0.40 [0.37, 0.43]
      MTBF 207,927 -> 259,857 turns. The loop promoted A6 = ta_A5_e4_a2.0 (alpha 3.0 statistically tied,
      best tail) and started turn A6 (seeds 5,500,000 / 5,600,000).
+
+264. **Turn A6 (800 sims again) stalls: best alpha 0.5 = 0.37 vs the actor's 0.38 (-2.6%); alpha 2.0, the
+     winner of turn A5, is worse (0.52). Same teacher strength twice -> the second turn finds nothing,
+     as at 600 sims. Next: 1,600 sims.** (2026-09-30) Loop turn A6 from ta_A5_e4_a2.0 (seeds 5,500,000 /
+     5,600,000): own games 0.37 [0.33, 0.41] (P1 4,974, 69.2% capped); survival head inner-val 0.0082;
+     mining 6,000 windows in 5,806 s (32,769 evals/s); corpus 241,570 rows (B 0/20,000; C: actor matches
+     its search on 76.82% of crisis rows); fine-tune train 1.2327 / val 1.5328 (A5: 1.1719 / 1.4960, the
+     corrections are harder to fit). Gates (2k, cap 100k, folded):
+       model          P1     P5     P10     P25      P50      P75      P90      P95   capped  per 100k turns
+       A6 actor     6,750 25,161  52,397 150,986  203,957  204,273  204,504  204,630  68.1%  0.38 [0.36, 0.42]
+       alpha 0.5    5,588 27,986  56,355 155,380  203,976  204,273  204,519  204,667  69.1%  0.37 [0.34, 0.40]
+       alpha 1.0    6,947 29,348  59,616 156,701  203,997  204,311  204,532  204,662  68.7%  0.37 [0.35, 0.41]
+       alpha 2.0    3,491 19,274  40,489 110,320  204,582  204,963  205,244  205,417  59.7%  0.52 [0.48, 0.56]
+     Loop: "STOP: gain 0.026 < 0.05. Best actor: alphatrain/data/ta_A6_e4_a0.5.pt".
+     Fine-tune anatomy (scratchpad task_vector_anatomy.py): the largest element of BOTH turns' task
+     vectors is 0.0415 = pair_dbias/pair_sbias, scalar biases that add one constant to every logit
+     (softmax-invariant, no effect on play); a near-zero gradient of constant sign is normalized by
+     Adam into a full step every update (sum of lr over the run). Otherwise A5 and A6 move the same
+     tensors (last trunk blocks + head; norms 3.54 vs 3.86): no pipeline anomaly.
+     Pattern: 600 sims gave A2->A3 -58%, A3->A4 -19%, then 3x data ~0; 800 sims gave A5 -21%, A6 -2.6%.
+     Each teacher strength buys one or two turns. Running: SIMS=1600 loop from ta_A6_e4_a0.5 as A7
+     (seeds 6,000,000 / 6,100,000).
