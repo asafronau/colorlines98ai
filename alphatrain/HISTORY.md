@@ -6268,3 +6268,15 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      alpha 2.0 gate stopped (extrapolates the harmful direction). The ensemble's 38% headroom (HISTORY 270)
      stays on the table; the route that captured an ensemble before is born-again (HISTORY 241: a
      from-scratch PAIR2 18x96 on 8-view labels beat its teacher's single pass by 44%).
+
+272. **Born-again corpus for a from-scratch 18x96 on the best actor's 8-view policy: 12,906,096 rows,
+     Colab notebook ready.** (2026-10-02) scripts/prep_born_again.sh alphatrain/data/ta_A7_e4_a1.0.pt
+     alphatrain/data/tta8_A8t.pt A8 <A5/A6/A7 crisis w45, A7s/A8s slide w120, distill_union_ep4>: own
+     recorded games 10,733,498 (from HISTORY 271), crisis 733,967, slide 271,283, epoch-4 (human-level)
+     game states 1,167,348, all relabeled with the actor's 8-view average (relabel_tta_tensor, mean logits,
+     top-5 soft) -> alphatrain/data/born_again_A8.pt (2,064,979,169 B; .gz 873,544,987 B). Checks
+     (logs/born_again_A8_check.log): top move legal 100% on every source, 5 moves per target, top-share
+     0.765 own / 0.633 crisis / 0.726 slide / 0.711 epoch-4. Notebook
+     alphatrain/train_scratch18b96_pair2_born_again_A8_colab.ipynb (tarball colorlines_pillar3d_v8.tar.gz;
+     A1 recipe, 40 ep, bs 32768, lr 3e-3, PAIR2 + legal mask; TARGET soft (recommended: soft beat hard for
+     the 9x64) or hard). Target: the ensemble's 0.21 deaths per 100k turns in a single pass.
