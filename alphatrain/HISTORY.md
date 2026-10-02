@@ -6235,3 +6235,22 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      luck). Survival is too rare an event to learn more from. Next: a DENSE danger target -- P(the board
      stays below ~55 balls for H moves) -- slides are ~100x more frequent than deaths; same 4-output head,
      so the fused export and the C++ search take it unchanged.
+
+270. **The 8-view ensemble of the best actor dies 38% less than its single pass (0.21 vs 0.34 deaths per
+     100k turns): a search-free teacher that renews with every actor. Calm (slide-risk) head: no better at
+     predicting death. Status since A4: 0.49 -> 0.32 deaths per 100k turns (-35%).** (2026-10-01)
+     Calm head (alphatrain/scripts/build_calm_targets_from_records.py --calm-balls 50: label = survive H
+     AND stay below 50 balls; 3-6x denser than death) on A8's backbone, death AUC on A8's games (same
+     sample as HISTORY 269) H=200: 0.709 / 0.764 / 0.698 / 0.731 / 0.698 over the fullness bins (survival
+     head 0.701 / 0.765 / 0.717 / 0.783 / 0.810): no better. Three heads (own, pooled deaths, calm) hit the
+     same ~0.7-0.85 ceiling; danger 100-200 moves ahead is mostly spawn luck.
+     TTA headroom: eval_log run --model alphatrain/data/ta_A7_e4_a1.0.pt --tta 8 --max-turns 25000 (2k,
+     seeds 2,600,000-2,601,999, folded): 102 deaths, 0.21 [0.17, 0.25] per 100k turns, MTBF 476,883,
+     94.9% reach 25k; the single pass on the same seeds over its first 25k turns (survival_stats --cap
+     25000 on the 100k gate CSV): 164 deaths, 0.34, MTBF 292,257. -38%, CIs disjoint.
+     Best model: alphatrain/data/ta_A7_e4_a1.0.pt, 0.32 [0.30, 0.35] (MTBF 309,782, 72.5% capped; fresh
+     seeds 0.34 [0.30, 0.38]) vs A4 0.49 [0.46, 0.53] (MTBF 202,343, 61.1%): P5 20,184 -> 30,081, P10
+     41,715 -> 63,906, P25 118,015 -> 178,216.
+     Running: scripts/tta_distill_turn.sh alphatrain/data/ta_A7_e4_a1.0.pt alphatrain/data/greedy_A8_cap100k
+     A8t "0.5 1.0 2.0" (8-view labels of the actor's own recorded states, frozen-BN soft-CE fine-tune at lr
+     3e-5 for 1 epoch, bs 4096, then the alpha sweep) -> logs/tta_distill_A8t.log.
