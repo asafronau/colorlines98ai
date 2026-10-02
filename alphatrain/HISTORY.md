@@ -6254,3 +6254,17 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Running: scripts/tta_distill_turn.sh alphatrain/data/ta_A7_e4_a1.0.pt alphatrain/data/greedy_A8_cap100k
      A8t "0.5 1.0 2.0" (8-view labels of the actor's own recorded states, frozen-BN soft-CE fine-tune at lr
      3e-5 for 1 epoch, bs 4096, then the alpha sweep) -> logs/tta_distill_A8t.log.
+
+271. **Warm-start 8-view self-distillation hurts (0.37 / 0.38 vs the actor's 0.32), as in HISTORY 239-240:
+     fine-tuning a sharp model on its own ensemble drifts it more than it teaches.** (2026-10-02)
+     scripts/tta_distill_turn.sh alphatrain/data/ta_A7_e4_a1.0.pt alphatrain/data/greedy_A8_cap100k A8t:
+     10,733,498 own states labeled with the actor's 8-view average (alphatrain/data/tta8_A8t.pt; the
+     ensemble's move differs from the recorded single-pass move on 7.7%), frozen-BN soft-CE fine-tune lr 3e-5,
+     1 epoch, bs 4096 (val 0.6376). Gates (2k, cap 100k):
+       model          P1     P5     P10     P25      P50      P75      P90      P95   capped  per 100k turns
+       actor          5,500 30,081  63,906 178,216  204,047  204,339  204,555  204,698  72.5%  0.32 [0.30, 0.35]
+       alpha 0.5      6,103 30,563  55,308 162,595  203,982  204,304  204,552  204,664  69.2%  0.37 [0.34, 0.40]
+       alpha 1.0      4,436 22,765  52,688 156,793  203,927  204,257  204,483  204,642  68.5%  0.38 [0.35, 0.41]
+     alpha 2.0 gate stopped (extrapolates the harmful direction). The ensemble's 38% headroom (HISTORY 270)
+     stays on the table; the route that captured an ensemble before is born-again (HISTORY 241: a
+     from-scratch PAIR2 18x96 on 8-view labels beat its teacher's single pass by 44%).
