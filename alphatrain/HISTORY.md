@@ -6218,3 +6218,20 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      head trained on pooled own deaths (A3-A7, every 32nd state + full death tails;
      build_value_targets_from_records now takes several --games-dir) separate danger better on A8's games
      than A8's own head?
+
+269. **More death data does not sharpen the survival head: a head trained on 4,000 pooled own games (A3-A7,
+     every 32nd state + all death tails; 11.2M states) separates doomed from recovering boards on A8's games
+     exactly as well as A8's own head trained on those very games.** (2026-10-01) value_head_A8_pooledA3A7.pt
+     (train_value_head on ta_A7_e4_a1.0, 5 ep, inner-val 0.0340) vs value_head_A8.pt; scratchpad
+     value_sees_slide.py on greedy_A8_cap100k (same 60k-state sample), AUC within fullness bins:
+       balls     H=200 own / pooled     H=100 own / pooled
+       36-40     0.701 / 0.694          -
+       41-45     0.765 / 0.761          0.826 / 0.821
+       46-50     0.717 / 0.725          0.830 / 0.836
+       51-55     0.783 / 0.778          0.835 / 0.828
+       56-62     0.810 / 0.817          0.847 / 0.862
+     ~0.7-0.85 looks like the predictability of death 100-200 moves ahead from the board (with HISTORY
+     267's control: 99% of slide positions survive under fresh spawns, so which ones die is mostly spawn
+     luck). Survival is too rare an event to learn more from. Next: a DENSE danger target -- P(the board
+     stays below ~55 balls for H moves) -- slides are ~100x more frequent than deaths; same 4-output head,
+     so the fused export and the C++ search take it unchanged.
