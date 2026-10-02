@@ -6280,3 +6280,29 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      alphatrain/train_scratch18b96_pair2_born_again_A8_colab.ipynb (tarball colorlines_pillar3d_v8.tar.gz;
      A1 recipe, 40 ep, bs 32768, lr 3e-3, PAIR2 + legal mask; TARGET soft (recommended: soft beat hard for
      the 9x64) or hard). Target: the ensemble's 0.21 deaths per 100k turns in a single pass.
+
+273. **Sims scaling saturates: a 2,400-sim turn on A8 (itself the 1,600-sim product) gives 0.318 / 0.317 /
+     0.314 deaths per 100k turns at alpha 0.5 / 1.0 / 1.5 vs the actor's 0.323 (-3% at best). 800 sims gave
+     -21%, 1,600 -13.5%, 2,400 ~-3%. The death rate stays the right gate: the hazard is flat in every model.**
+     (2026-10-02; owner: "do 1600 or 2400 sims ... better understanding if increasing sims helps")
+     RUN=A8c SIMS=2400 scripts/flywheel_turn.sh alphatrain/data/ta_A7_e4_a1.0.pt A8 6500000 6700000
+     "0.5 1.0 1.5" (A8's records + value head reused; pv_A8_ts.pt default weights): mining 6,000 windows
+     in 16,671 s (35,200 evals/s); corpus 247,644 rows (B 0/20,000; C: the actor matches its 2,400-sim
+     search on 74.56% of crisis rows: 800 sims 78.39%, 1,600 75.47%); fine-tune val 1.5554. Gates (2k, cap 100k):
+       model          P1     P5     P10     P25      P50      P75      P90      P95   capped  per 100k turns
+       A8 actor     5,500 30,081  63,906 178,216  204,047  204,339  204,555  204,698  72.5%  0.323 [0.296, 0.351]
+       alpha 0.5    6,647 35,133  69,046 185,845  204,013  204,308  204,522  204,655  72.8%  0.318 [0.292, 0.346]
+       alpha 1.0    4,824 36,498  76,040 182,551  204,012  204,300  204,536  204,662  72.8%  0.317 [0.290, 0.344]
+       alpha 1.5    9,350 35,226  71,274 187,645  203,958  204,242  204,467  204,585  73.0%  0.314 [0.288, 0.341]
+     Metric check (owner: "is the death rate the right metric?"; scratchpad hazard_bands.py, deaths per
+     100k turns by game age 0-5k / 5-20k / 20-50k / 50-100k): A4 0.46/0.53/0.48/0.49, A7 actor
+     0.38/0.38/0.38/0.36, A8 actor 0.36/0.33/0.34/0.30, alpha 1.0 0.34/0.28/0.29/0.34, alpha 1.5
+     0.24/0.34/0.30/0.32 -- flat within every model (all bands inside each other's CIs). Under a flat
+     hazard the rate fixes the whole survival curve (S(100k) = e^-0.32 = 72.6% vs 72.5-73.0% observed;
+     P5 = -ln 0.95 / rate ~ 32k points, P10 ~ 67k vs observed 30-36k / 64-76k), and uses all ~550
+     deaths (CI +-8%) where P10 rests on the 200th-worst game (SE ~7%), P5 ~10%, P1 ~25%. The +10-20%
+     at P5/P10 above is a lower 5-50k hazard offset by a higher 50-100k one, each within its band's CI
+     (and the actor's own gate sits below its predicted P5): noise around one rate. Per-band hazards
+     will accompany gate reports so a real age-dependent change is not pooled away; 4k seeds (a second
+     2k bank, 2,602,000-2,603,999) for close calls -- not needed for this verdict (a 2% difference).
+     Born-again (HISTORY 272) epoch 20 copied from Colab (val 0.6837; training continues): gating.
