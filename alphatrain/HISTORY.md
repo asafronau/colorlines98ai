@@ -6369,3 +6369,17 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      (alpha 1.5 gate stopped: the trend worsens with alpha). Concentrating the gradient on decisive search
      states makes play worse, not better; the flat-state soft targets carry useful information.
      Running: 4k confirmation of born-again ep35 vs the actor (bank 2 = seeds 2,602,000-2,603,999).
+
+277. **4k confirmation: born-again ep35 = the actor (0.318 vs 0.321 deaths per 100k turns). A from-scratch
+     student of the 8-view ensemble reproduces the teacher's SINGLE pass, not the ensemble (0.21), as the
+     review predicted.** (2026-10-03) Second gate bank (seeds 2,602,000-2,603,999), pooled with the first
+     (scratchpad pooled_rate.py):
+       model                 games  deaths  per 100k turns         MTBF      capped
+       actor ta_A7_e4_a1.0   4,000   1,094  0.321 [0.302, 0.341]   311,557   72.7%
+       born-again ep35       4,000   1,087  0.318 [0.299, 0.337]   314,629   72.8%
+     Born-again ep35 by bank: 0.301 / 0.335 (bank 1 was lucky); the actor 0.323 / 0.319, with P5 30,081 /
+     35,522 and P10 63,906 / 69,193 across the banks at an identical rate -- percentile swings of 15-18% from
+     seeds alone (HISTORY 273's metric point). Best single-pass model unchanged: ta_A7_e4_a1.0. Tested since
+     HISTORY 265 without a single-pass gain: slide windows (once, not repeatable), 2,400 sims, four value
+     heads, warm-start and born-again 8-view distillation, decisiveness weighting, checkpoint averaging.
+     The one large gap left is the model's own 8-view ensemble (0.21, HISTORY 270).
