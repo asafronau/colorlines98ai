@@ -6333,3 +6333,21 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      horizontal from vertical lines -- true equivariance needs group convolutions. Next: SpatialValueHead on
      the pooled A3-A7 targets, death AUC on A8's games vs the GAP heads (queued after the epoch-30 gate);
      decisiveness-weighted fine-tune on mined corpora; checkpoint-averaged born-again once 35/40 land.
+
+275. **Born-again stays at the actor's level (ep30 0.344); a SPATIAL value head does not break the danger
+     ceiling either (Gemini's GAP-head hypothesis falsified on the frozen backbone).** (2026-10-02)
+     Born-again gates (2k, cap 100k, folded): ep20 0.324 [0.298, 0.352], ep25 0.457 [0.425, 0.492] (hazard
+     up in every age band: mid-schedule checkpoint), ep30 0.344 [0.317, 0.373] (P1 6,548, P5 35,595, P10
+     67,217, P25 171,361, 70.8% capped; hazard by age 0.35/0.29/0.37/0.35). Owner stopped Colab at ep35
+     (val 0.6731); gating ep35 and a 30+35 weight average with BN re-estimated (average_checkpoints.py
+     --recalib-tensor born_again_A8.pt).
+     SpatialValueHead (train_value_head --arch spatial, 162,756 params: 1x1 conv + two 3x3 residual blocks
+     + mean/max pool + MLP) on the pooled A3-A7 survival targets, A8 backbone: best inner-val 0.0346 (GAP
+     pooled head 0.0340; later epochs overfit: train 0.019, inner-val 0.054). Death AUC on A8's games
+     (same 60k sample; scratchpad value_sees_slide.py), H=200 / H=100 by balls 36-40, 41-45, 46-50, 51-55,
+     56-62: spatial 0.677/0.755/0.722/0.783/0.823 and -/0.812/0.825/0.836/0.854 vs the GAP own head
+     0.701/0.765/0.717/0.783/0.810 and 0.826/0.830/0.835/0.847 and the GAP pooled head
+     0.694/0.761/0.725/0.778/0.817 and 0.821/0.836/0.828/0.862 -- all within +-0.02 (32-65 doomed states
+     per bin). Head size, death data and target density all leave danger detection unchanged on the frozen
+     policy backbone; untested: an end-to-end value network. Queued: decisiveness-weighted fine-tune A/B
+     (same A8c corpus, --decisiveness-power 2.0 --blend-alpha 0.5; scratchpad decisive_ab.sh).
