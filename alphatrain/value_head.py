@@ -196,15 +196,17 @@ class SpatialValueHead(nn.Module):
 
 
 def save_spatial(head, path, *, backbone_path, train_args=None,
-                 val_metrics=None):
-    """Serialize a SpatialValueHead checkpoint."""
+                 val_metrics=None, target_type='pairwise_ranking', horizons=None):
+    """Serialize a SpatialValueHead checkpoint (pairwise ranking, or a survival head when
+    target_type='survival' with its horizons)."""
     torch.save({
         'head_type': 'spatial',
         'state_dict': head.state_dict(),
         'in_channels': head.in_channels,
         'mid_channels': head.mid_channels,
         'num_outputs': head.num_outputs,
-        'target_type': 'pairwise_ranking',
+        'target_type': target_type,
+        'horizons': list(horizons) if horizons is not None else None,
         'backbone_path': backbone_path,
         'train_args': train_args,
         'val_metrics': val_metrics,

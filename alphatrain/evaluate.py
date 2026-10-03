@@ -63,6 +63,9 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
 
     opts = []
     if fp16 and device.type in ('mps', 'cuda'):
+        # BatchNorm running_var above 65,504 becomes inf in fp16 (an old e40 hit 100,447): rescale exactly first.
+        from alphatrain.inference_cpp.export_ts import fp16_safe_batchnorm
+        fp16_safe_batchnorm(net)
         net = net.half()
         opts.append('fp16')
     if jit_trace:

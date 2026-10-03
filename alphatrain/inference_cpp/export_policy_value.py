@@ -50,8 +50,8 @@ def main():
 
     net, _ = load_model(a.model, torch.device('cpu'), fp16=False)
     head, ckpt, head_type = vh.load_any(a.head, torch.device('cpu'))
-    assert head_type == 'value_head' and ckpt.get('target_type') == 'survival', \
-        f'expected survival ValueHead, got {head_type}/{ckpt.get("target_type")}'
+    assert head_type in ('value_head', 'spatial') and ckpt.get('target_type') == 'survival', \
+        f'expected a survival value head (gap or spatial), got {head_type}/{ckpt.get("target_type")}'
     head.train(False)
     net.train(False)
     weights = [float(x) for x in a.horizon_weights.split(',')] if a.horizon_weights else list(vh.DEFAULT_HORIZON_WEIGHTS)
@@ -60,6 +60,10 @@ def main():
     print(f'leaf value weights over horizons {vh.SURVIVAL_HORIZONS}: {weights}')
     module = PolicyValue(net, head, hw)
     module.train(False)
+    # The C++ InferenceServer casts this module to fp16: rescale BatchNorm channels whose running_var
+    # would overflow (exact reparameterization; export_ts does the same for policy-only exports).
+    from alphatrain.inference_cpp.export_ts import fp16_safe_batchnorm
+    print(f'fp16-safe BN: rescaled {fp16_safe_batchnorm(module)} channel(s)')
 
     ds = TensorDatasetGPU(a.state_tensor, augment=False, color_augment=False,
                           augment_factor=1, device='cpu')

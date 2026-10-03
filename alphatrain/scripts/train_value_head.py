@@ -30,8 +30,8 @@ import torch.nn.functional as F
 
 from alphatrain.evaluate import load_model
 from alphatrain.value_head import (
-    ValueHead, SURVIVAL_HORIZONS, NUM_HORIZONS,
-    DEFAULT_HORIZON_WEIGHTS, save as save_value_head,
+    ValueHead, SpatialValueHead, SURVIVAL_HORIZONS, NUM_HORIZONS,
+    DEFAULT_HORIZON_WEIGHTS, save as save_value_head, save_spatial,
 )
 
 
@@ -186,6 +186,10 @@ def main():
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--hidden', type=int, default=32,
                    help='ValueHead hidden width')
+    p.add_argument('--arch', choices=['gap', 'spatial'], default='gap',
+                   help='gap: 1x1 conv + global average pool + linear (~3k params); spatial: SpatialValueHead '
+                        '(1x1 conv + two 3x3 residual blocks + mean/max pool + MLP), which keeps the board geometry')
+    p.add_argument('--spatial-mid', type=int, default=64, help='SpatialValueHead width')
     p.add_argument('--device', default=None)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--limit-states', type=int, default=0,
@@ -239,11 +243,15 @@ def main():
         raise ValueError(f"Unknown target_type: {target_type}")
 
     # ── Build value head (sized by target type) ──
-    head = ValueHead(in_channels=backbone_channels, hidden=args.hidden,
-                     num_outputs=num_outputs)
+    if args.arch == 'spatial':
+        head = SpatialValueHead(in_channels=backbone_channels, mid_channels=args.spatial_mid,
+                                num_outputs=num_outputs)
+    else:
+        head = ValueHead(in_channels=backbone_channels, hidden=args.hidden,
+                         num_outputs=num_outputs)
     head = head.to(device)
     n_head_params = sum(p.numel() for p in head.parameters())
-    print(f"ValueHead: {n_head_params:,} params, hidden={args.hidden}, "
+    print(f"{type(head).__name__}: {n_head_params:,} params, hidden={args.hidden}, "
           f"num_outputs={num_outputs}, horizons={horizons}", flush=True)
 
     # Train/val split (val here is just for loss tracking — calibration
@@ -291,7 +299,7 @@ def main():
                 boards[slc], npos[slc], ncol[slc], nn_arr[slc], device)
             obs_t = torch.from_numpy(obs_np).to(device=device,
                                                  dtype=torch.float16 if fp16 else torch.float32)
-            with torch.inference_mode():
+            with torch.no_grad():  # not inference_mode: on CPU fp32, .float() would hand the head an inference tensor
                 feats = net.backbone_features(obs_t)
 
             feats = feats.float().detach()  # detach: backbone is frozen
@@ -369,15 +377,15 @@ def main():
 
         if iv_loss < best_val_loss:
             best_val_loss = iv_loss
-            save_value_head(
-                head, args.out, backbone_path=args.backbone,
-                train_args=vars(args), horizons=horizons,
-                target_type=target_type,
-                val_metrics={
-                    'inner_val_loss': iv_loss,
-                    'calibration': cal_metrics,
-                    'epoch': epoch + 1,
-                })
+            metrics = {'inner_val_loss': iv_loss, 'calibration': cal_metrics, 'epoch': epoch + 1}
+            if args.arch == 'spatial':
+                save_spatial(head, args.out, backbone_path=args.backbone, train_args=vars(args),
+                             val_metrics=metrics, target_type=target_type, horizons=horizons)
+            else:
+                save_value_head(
+                    head, args.out, backbone_path=args.backbone,
+                    train_args=vars(args), horizons=horizons,
+                    target_type=target_type, val_metrics=metrics)
             print(f"  ** New best, saved to {args.out} **", flush=True)
 
     print(f"\nDone in {(time.time()-t0)/60:.1f}m. Best inner-val loss: "
