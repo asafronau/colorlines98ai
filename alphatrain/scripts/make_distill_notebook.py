@@ -3,7 +3,8 @@
     python -m alphatrain.scripts.make_distill_notebook --tag A4 --blocks 9 --channels 64 \
         --corpus alphatrain/data/distill_A4.pt --tarball colorlines_pillar3d_v8.tar.gz \
         --out alphatrain/train_scratch9b64_pair2_distill_colab.ipynb
---trunk p4m writes the D4-equivariant variant (HISTORY 278): soft targets only, two width arms in the CONFIG cell.
+--trunk p4m writes the D4-equivariant variant (HISTORY 278), --trunk c7 the color-equivariant one (HISTORY 279):
+soft targets only, width arms in the CONFIG cell.
 The notebook asserts the exact sizes of the uploaded .pt.gz and .pt, so a truncated upload fails fast.
 """
 import argparse
@@ -28,15 +29,34 @@ def main():
     ap.add_argument('--corpus', required=True)
     ap.add_argument('--tarball', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--trunk', choices=['standard', 'p4m'], default='standard')
+    ap.add_argument('--trunk', choices=['standard', 'p4m', 'c7'], default='standard')
+    ap.add_argument('--c7-arms', default='k24s48:24:48,k16s48:16:48',
+                    help='c7 width arms NAME:SLOT:SHARED (the first is the default)')
+    ap.add_argument('--c7-batch', type=int, default=32768)
+    ap.add_argument('--c7-lr', type=float, default=3e-3)
     a = ap.parse_args()
     p4m = a.trunk == 'p4m'
+    c7 = a.trunk == 'c7'
+    arms = [x.split(':') for x in a.c7_arms.split(',')]
     pt_size = os.path.getsize(a.corpus)
     gz_size = os.path.getsize(a.corpus + '.gz')
     rows = torch.load(a.corpus, map_location='cpu', weights_only=False)['boards'].shape[0]
     corpus = os.path.basename(a.corpus)
     shape = f'{a.blocks}b{a.channels}'
-    if p4m:
+    if c7:
+        arm_text = ' or '.join(f'`ARM = "{n}"` ({k} channels per color slot x 7 + {sh} shared)' for n, k, sh in arms)
+        intro = (f'# c7_{a.blocks}_pair2_born_again_{a.tag}\n\n'
+                 f'From-scratch **color-equivariant (c7) {a.blocks}-block** student (+ legal-mask loss, A1 recipe) on the '
+                 f'same corpus as the 18x96 born-again run: {rows:,} states labeled with teacher **{a.tag}**\'s '
+                 f'8-symmetry-averaged policy (top-5 soft). HISTORY 279. One feature slot per color with shared '
+                 f'weights (renaming the colors only permutes the slots) and a head that reads the moving ball\'s own '
+                 f'color slot: the policy is exactly invariant to renaming the colors. Tiny-model probe (same data and '
+                 f'recipe): 3x fewer deaths per 100k turns than a standard net of the same conv width with 6x the '
+                 f'parameters.\n\n'
+                 f'Width arms (CONFIG cell): {arm_text}.\n\n'
+                 f'Drive files (MyDrive/alphatrain/): `{a.tarball}` (new) + `{corpus}.gz` (already uploaded for the '
+                 f'18x96 run).')
+    elif p4m:
         intro = (f'# p4m{a.blocks}_pair2_born_again_{a.tag}\n\n'
                  f'From-scratch **D4-equivariant (p4m) {a.blocks}-block** PAIR2 student (+ legal-mask loss, A1 recipe) on '
                  f'the same corpus as the 18x96 born-again run: {rows:,} states labeled with teacher **{a.tag}**\'s '
@@ -59,7 +79,26 @@ def main():
                  f'Drive files (MyDrive/alphatrain/): `{a.tarball}` + `{corpus}.gz`.')
     check = ("\nimport os.path as _p\nassert _p.exists('/content/alphatrain/model_p4m.py') and '--trunk' in _tp, "
              "'STALE CODE TARBALL (no p4m trunk)'" if p4m else '')
-    if p4m:
+    if c7:
+        check = ("\nimport os.path as _p\nassert _p.exists('/content/alphatrain/model_c7.py') and \"'c7'\" in _tp, "
+                 "'STALE CODE TARBALL (no c7 trunk)'")
+        arm_map = ', '.join(f'"{n}": ({k}, {sh})' for n, k, sh in arms)
+        config = f"""# ===== CONFIG =====
+ARM        = "{arms[0][0]}"
+SLOT_CH, SHARED_CH = {{{arm_map}}}[ARM]
+NUM_BLOCKS = {a.blocks}
+EPOCHS     = 40
+BATCH      = {a.c7_batch}
+LR         = {a.c7_lr:g}
+SEED       = 42
+SAVE_STEPS = 1000
+COMPILE    = "--compile"   # if torch.compile fails on this runtime: COMPILE = ""
+RUN        = f"c7_{{NUM_BLOCKS}}_{{ARM}}_pair2_born_again_{a.tag}"
+print(f'RUN={{RUN}} slot={{SLOT_CH}} shared={{SHARED_CH}} ep={{EPOCHS}} bs={{BATCH}} lr={{LR}}')"""
+        model_args = ('--trunk c7 --num-blocks {NUM_BLOCKS} --slot-channels {SLOT_CH} --shared-channels {SHARED_CH} '
+                      '--seed {SEED} --amp {COMPILE}')
+        blend = '1.0'
+    elif p4m:
         config = f"""# ===== CONFIG =====
 ARM        = "g16"    # "g16": 16 group channels (x8 = 128 conv channels); "g12": 12 (x8 = 96, the 18x96's cost)
 GROUP_CH, EXPAND = {{"g16": (16, 64), "g12": (12, 48)}}[ARM]
@@ -142,7 +181,7 @@ Download epochs as they land (e.g. 7 / 14 / 20 / 27 / 33 / 40) into `alphatrain/
 (folded export, 2,000 games, cap 100k, logged to EVAL.md with the death rate):
 
 ```bash
-python -m alphatrain.scripts.eval_log run --model alphatrain/data/<run>_ckpts_epoch_N.pt --desc "{'p4m ' + str(a.blocks) + 'b' if p4m else shape} student of {a.tag}, epoch N"
+python -m alphatrain.scripts.eval_log run --model alphatrain/data/<run>_ckpts_epoch_N.pt --desc "{('p4m ' if p4m else 'c7 ') + str(a.blocks) + 'b' if (p4m or c7) else shape} student of {a.tag}, epoch N"
 ```
 
 Compare the death rate (deaths per 100k turns, 95% CI) with the teacher's; the teacher's 8-view-averaged

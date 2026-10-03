@@ -33,30 +33,15 @@ def load_model(path, device, dtype, fold_bn=False):
     """Rebuild PolicyNet from a checkpoint, inferring arch from the weights."""
     ck = torch.load(path, map_location='cpu', weights_only=False)
     st = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
-    if any(k.startswith('_orig_mod.') for k in st):
-        st = {k.replace('_orig_mod.', ''): v for k, v in st.items()}
-    from alphatrain.model import head_kwargs_from_state
-    from alphatrain.model_p4m import PolicyNetP4M, is_p4m_state, p4m_kwargs_from_state
-    if is_p4m_state(st):
-        kw = p4m_kwargs_from_state(st)
-        nblocks, ch = kw['num_blocks'], f"p4m {kw['group_channels']}g/{kw['expand']}e "
-        m = PolicyNetP4M(**kw)
-        m.load_state_dict(st)
-        m.train(False)
-        m.freeze()      # plain CNN with the expanded group weights: traceable and BN-foldable like PolicyNet
-    else:
-        ch = st['stem.0.weight'].shape[0]
-        nblocks = sum(1 for k in st if k.endswith('.conv1.weight') and k.startswith('blocks.'))
-        m = PolicyNet(num_blocks=nblocks, channels=ch, **head_kwargs_from_state(st))
-        m.load_state_dict(st)
-        m.train(False)  # eval mode: BatchNorm uses running stats (important!)
+    from alphatrain.model_variants import net_from_state
+    m, desc, flags = net_from_state(st)   # eval mode; a p4m trunk comes back frozen (plain convs, BN-foldable)
     n_fix = fp16_safe_batchnorm(m)
     if n_fix:
         print(f'fp16-safe BN: rescaled {n_fix} channel(s) with running_var > {FP16_SAFE_VAR:g}')
     if fold_bn:
         print(f'folded {fold_batchnorm(m)} BatchNorm layers into the preceding convolutions')
     m.to(device=device, dtype=dtype)
-    return m, nblocks, ch
+    return m, desc, flags
 
 
 
@@ -66,6 +51,8 @@ def fold_batchnorm(m):
     bn1 (pre-activation, before a ReLU) and backbone_bn (after the residual sum) cannot fold.
     Removes ~half the per-position elementwise passes (HISTORY 257)."""
     from torch.nn.utils.fusion import fuse_conv_bn_eval
+    if hasattr(m, 'slot_stem'):         # c7 slot trunk: folds into its sums of convolutions itself
+        return m.fold_batchnorm()
     if hasattr(m, 'gblocks'):           # frozen p4m trunk (PolicyNetP4M.freeze): stem, blocks, 1x1 expand
         m.stem_lift = fuse_conv_bn_eval(m.stem_lift, m.stem_bn)
         m.stem_bn = torch.nn.Identity()
@@ -181,7 +168,7 @@ def main():
     if device.type == 'cpu' and dtype == torch.float16:
         raise ValueError('fp16 export verification requires mps or cuda')
 
-    m, nblocks, ch = load_model(a.model, device, dtype, fold_bn=a.fold_bn)
+    m, desc, _ = load_model(a.model, device, dtype, fold_bn=a.fold_bn)
     obs, legal = load_or_build_fixture(a, device, dtype)
 
     with torch.no_grad():
@@ -206,7 +193,7 @@ def main():
     legal.float().cpu().numpy().astype('<f4').tofile(
         f'{a.outdir}/example_legal.f32')
 
-    print(f'arch: {nblocks}b x {ch}ch; verify={device} {a.precision}')
+    print(f'arch: {desc}; verify={device} {a.precision}')
     print(f'traced vs eager max|diff| = {max_diff:.2e}  '
           f'({"OK" if max_diff < 1e-4 else "WARN"})')
     print(f'raw argmax move = {int(eager[0].argmax())}  |  '

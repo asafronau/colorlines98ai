@@ -14,15 +14,8 @@ def main():
     a = ap.parse_args()
     ck = torch.load(a.checkpoint, map_location='cpu', weights_only=False)
     st = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
-    st = {k.replace('_orig_mod.', ''): v for k, v in st.items()}
-    from alphatrain.model_p4m import is_p4m_state, p4m_kwargs_from_state
-    if is_p4m_state(st):
-        kw = p4m_kwargs_from_state(st)
-        print(f"--trunk p4m --num-blocks {kw['num_blocks']} --group-channels {kw['group_channels']} "
-              f"--p4m-expand {kw['expand']}")
-        return
-    blocks = sum(1 for k in st if k.startswith('blocks.') and k.endswith('.conv1.weight'))
-    print(f"--num-blocks {blocks} --channels {st['stem.0.weight'].shape[0]}")
+    from alphatrain.model_variants import net_from_state
+    print(net_from_state(st)[2])
 
 
 if __name__ == '__main__':

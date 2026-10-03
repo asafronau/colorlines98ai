@@ -38,6 +38,10 @@ struct Args {
   long max_turns = 1000000;
   bool fp32 = false;  // default: fp16 on MPS (like eval_policy.py)
   int tta = 1;  // 1 = plain greedy; 8 = average logits over the 8 exact board symmetries (D4)
+  // Color relabelings averaged per position (combines with --tta: tta x color_tta views): the K cyclic
+  // shifts c -> (c - 1 + k) % 7 + 1, k = 0..K-1, of the board and preview colors. Moves are unchanged
+  // by a relabeling, so the logits are averaged without remapping. 1 = off.
+  int color_tta = 1;
   bool canon = false;  // feed the net the canonical form (D4 x color relabel), map logits back
   bool verbose_games = false;  // opt-in per-game + every-500-turn traces
   int progress_every = 100;    // compact aggregate progress by default
@@ -136,13 +140,15 @@ using clines::D4Maps;
 
 // Observation of view v of `g`, built from the transformed board + preview so
 // every derived channel (components, line potentials) is computed natively.
-void BuildViewObs(const Game& g, const D4Maps& d4, int v, float* out) {
+// Observation of D4 view v of the position with colors cyclically shifted by `shift` (0 = as is).
+void BuildViewObs(const Game& g, const D4Maps& d4, int v, float* out, int shift = 0) {
+  auto relabel = [shift](int c) { return c == 0 ? 0 : (c - 1 + shift) % 7 + 1; };
   int8_t b[81];
-  for (int i = 0; i < 81; ++i) b[d4.cell[v][i]] = g.board()[i];
+  for (int i = 0; i < 81; ++i) b[d4.cell[v][i]] = (int8_t)relabel(g.board()[i]);
   std::vector<clines::NextBall> nb;
   for (const auto& x : g.next_balls()) {
     const int t = d4.cell[v][x.r * 9 + x.c];
-    nb.push_back({t / 9, t % 9, x.color});
+    nb.push_back({t / 9, t % 9, relabel(x.color)});
   }
   Game tmp(0);
   tmp.SetState(b, nb, g.score(), g.turns());
@@ -159,6 +165,7 @@ Args ParseArgs(int argc, char** argv) {
     if (i + 1 >= argc) { std::fprintf(stderr, "FATAL: missing value for %s\n", k.c_str()); std::exit(2); }
     if (k == "--model") a.model = argv[++i];
     else if (k == "--tta") a.tta = std::stoi(argv[++i]);
+    else if (k == "--color-tta") a.color_tta = std::stoi(argv[++i]);
     else if (k == "--device") a.device = argv[++i];
     else if (k == "--seed-start") a.seed_start = std::stoull(argv[++i]);
     else if (k == "--seed-end") a.seed_end = std::stoull(argv[++i]);
@@ -229,7 +236,15 @@ int main(int argc, char** argv) {
                                            {8, clines::kActions}, torch::kLong)
                               .slice(0, 0, args.tta).clone().to(dev);
   if (args.tta > 1) std::printf("TTA: averaging logits over %d board symmetries\n", args.tta);
-  if (args.canon && args.tta != 1) { std::printf("--canon and --tta are exclusive\n"); return 2; }
+  if (args.color_tta < 1 || args.color_tta > 7) { std::printf("--color-tta must be 1..7\n"); return 2; }
+  if (args.color_tta > 1)
+    std::printf("COLOR TTA: averaging logits over %d color relabelings (cyclic shifts)\n", args.color_tta);
+  if (args.canon && (args.tta != 1 || args.color_tta != 1)) {
+    std::printf("--canon and --tta / --color-tta are exclusive\n");
+    return 2;
+  }
+  // View j = v * color_tta + k: D4 view v, color shift k; the action map depends on v only.
+  act_idx = act_idx.repeat_interleave(args.color_tta, 0);
   if (args.canon) std::printf("CANON: net sees the canonical form (D4 x color relabel) of every position\n");
   torch::Tensor act_all = torch::from_blob(const_cast<int64_t*>(d4.act.data()),
                                            {8, clines::kActions}, torch::kLong).clone().to(dev);
@@ -318,7 +333,7 @@ int main(int argc, char** argv) {
 
   while (!slots.empty()) {
     int n = (int)slots.size();
-    const int V = args.tta;
+    const int V = args.tta * args.color_tta;
     canon_view.assign(n, 0);
     obs_buf.resize((size_t)n * V * 18 * clines::kNN);
     legal_buf.resize((size_t)n * clines::kActions);
@@ -342,9 +357,9 @@ int main(int argc, char** argv) {
         } else if (V == 1) {
           slots[i].game.BuildObs(obs_buf.data() + (size_t)i * 18 * clines::kNN, lab);
         } else {
-          for (int v = 0; v < V; ++v)
-            BuildViewObs(slots[i].game, d4, v,
-                         obs_buf.data() + ((size_t)i * V + v) * 18 * clines::kNN);
+          for (int j = 0; j < V; ++j)
+            BuildViewObs(slots[i].game, d4, j / args.color_tta,
+                         obs_buf.data() + ((size_t)i * V + j) * 18 * clines::kNN, j % args.color_tta);
         }
         legal_count[i] = slots[i].game.LegalMaskU8(
             legal_buf.data() + (size_t)i * clines::kActions, lab);

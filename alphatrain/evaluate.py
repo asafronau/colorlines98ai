@@ -41,29 +41,9 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
             f"Model not found: {model_path}\n"
             f"  Download from Drive or specify --model path")
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
-    state = ckpt['model']
-    if any(k.startswith('_orig_mod.') for k in state):
-        state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
-    # Filter dead value-head keys from old dual-head checkpoints.
-    state = {k: v for k, v in state.items() if not k.startswith('value_')}
-
-    from alphatrain.model import head_kwargs_from_state
-    from alphatrain.model_p4m import PolicyNetP4M, is_p4m_state, p4m_kwargs_from_state
-    if is_p4m_state(state):
-        kw = p4m_kwargs_from_state(state)
-        in_ch, nb, ch = kw['in_channels'], kw['num_blocks'], f"p4m {kw['group_channels']}g/{kw['expand']}e "
-        net = PolicyNetP4M(**kw).to(device)
-        net.load_state_dict(state)
-        net.train(False)
-        net.freeze()            # inference form: plain convs with the expanded weights (same function, faster)
-    else:
-        in_ch = state['stem.0.weight'].shape[1]
-        nb = sum(1 for k in state if k.endswith('.conv1.weight')
-                 and k.startswith('blocks.'))
-        ch = state['stem.0.weight'].shape[0]
-        net = PolicyNet(in_channels=in_ch, num_blocks=nb, channels=ch, **head_kwargs_from_state(state)).to(device)
-        net.load_state_dict(state)
-        net.train(False)
+    from alphatrain.model_variants import net_from_state
+    net, desc, _ = net_from_state(ckpt['model'])   # standard / p4m (frozen) / c7 trunk, eval mode
+    net = net.to(device)
 
     max_score = float(ckpt.get('max_score', 30000.0))
     epoch = ckpt.get('epoch', '?')
@@ -80,12 +60,12 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
         dtype = (torch.float16
                  if fp16 and device.type in ('mps', 'cuda')
                  else torch.float32)
-        dummy = torch.randn(1, in_ch, 9, 9, device=device, dtype=dtype)
+        dummy = torch.randn(1, 18, 9, 9, device=device, dtype=dtype)
         net = torch.jit.trace(net, dummy)
         opts.append('jit')
 
     opt_str = f" [{'+'.join(opts)}]" if opts else ""
-    print(f"Loaded {model_path}: {nb}b x {ch}ch, epoch={epoch}, "
+    print(f"Loaded {model_path}: {desc}, epoch={epoch}, "
           f"max_score={max_score:.0f}"
           + (f", val_loss={val_loss:.4f}" if val_loss else "")
           + opt_str, flush=True)

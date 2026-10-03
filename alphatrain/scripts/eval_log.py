@@ -62,7 +62,7 @@ def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest='cmd', required=True)
     r = sub.add_parser('run'); r.add_argument('--model', required=True); r.add_argument('--desc', default='')
     r.add_argument('--seed-start', type=int, default=2600000); r.add_argument('--seed-end', type=int, default=2602000)
-    r.add_argument('--max-turns', type=int, default=100000); r.add_argument('--batch', type=int, default=0); r.add_argument('--no-fold', action='store_true'); r.add_argument('--fp32', action='store_true'); r.add_argument('--canon', action='store_true'); r.add_argument('--tta', type=int, default=1)
+    r.add_argument('--max-turns', type=int, default=100000); r.add_argument('--batch', type=int, default=0); r.add_argument('--no-fold', action='store_true'); r.add_argument('--fp32', action='store_true'); r.add_argument('--canon', action='store_true'); r.add_argument('--tta', type=int, default=1); r.add_argument('--color-tta', type=int, default=1)
     c = sub.add_parser('csv'); c.add_argument('--csv', required=True); c.add_argument('--model', required=True); c.add_argument('--desc', default='')
     c.add_argument('--cap', default='100000')
     a = p.parse_args()
@@ -79,15 +79,15 @@ def main():
                        + (['--fold-bn'] if fold else []), cwd=ROOT, check=True)
     # Throughput is flat in batch size (GPU-bound), so keep every game in flight: no refill tail.
     batch = a.batch or min(a.seed_end - a.seed_start, 4000)
-    tag = ('uncapped' if a.max_turns >= 1000000 else f'cap{a.max_turns}') + ('_fp32' if a.fp32 else '') + ('_canon' if a.canon else '') + (f'_tta{a.tta}' if a.tta > 1 else '') + ('_fold' if fold else '')
+    tag = ('uncapped' if a.max_turns >= 1000000 else f'cap{a.max_turns}') + ('_fp32' if a.fp32 else '') + ('_canon' if a.canon else '') + (f'_tta{a.tta}' if a.tta > 1 else '') + (f'_ctta{a.color_tta}' if a.color_tta > 1 else '') + ('_fold' if fold else '')
     out = os.path.join(CPP, 'data', f'{name}_{tag}_{a.seed_start}_{a.seed_end - a.seed_start}.csv')
     cmd = ['caffeinate', '-is', './build/eval', '--model', os.path.relpath(ts, CPP), '--device', 'mps', '--batch', str(batch),
-           '--seed-start', str(a.seed_start), '--seed-end', str(a.seed_end), '--max-turns', str(a.max_turns), '--scores-out', os.path.relpath(out, CPP)] + (['--fp32'] if a.fp32 else []) + (['--canon'] if a.canon else []) + (['--tta', str(a.tta)] if a.tta > 1 else [])
+           '--seed-start', str(a.seed_start), '--seed-end', str(a.seed_end), '--max-turns', str(a.max_turns), '--scores-out', os.path.relpath(out, CPP)] + (['--fp32'] if a.fp32 else []) + (['--canon'] if a.canon else []) + (['--tta', str(a.tta)] if a.tta > 1 else []) + (['--color-tta', str(a.color_tta)] if a.color_tta > 1 else [])
     res = subprocess.run(cmd, cwd=CPP, capture_output=True, text=True)
     print('\n'.join(l for l in res.stdout.splitlines() if l.startswith(('done', 'scores', '  P1', '  <500', '  mean turns'))))
     if res.returncode != 0: print(res.stderr[-2000:]); sys.exit(res.returncode)
     scores, capped, turns, _ = load_csv(out)
-    append_row(name + (' [fp32]' if a.fp32 else '') + (' [CANON]' if a.canon else '') + (f' [TTA-{a.tta}]' if a.tta > 1 else '') + (' [fold]' if fold else ''), a.desc, f'{a.seed_start}-{a.seed_end}', str(a.max_turns), stats(scores, capped, turns), os.path.relpath(out, ROOT))
+    append_row(name + (' [fp32]' if a.fp32 else '') + (' [CANON]' if a.canon else '') + (f' [TTA-{a.tta}]' if a.tta > 1 else '') + (f' [cTTA-{a.color_tta}]' if a.color_tta > 1 else '') + (' [fold]' if fold else ''), a.desc, f'{a.seed_start}-{a.seed_end}', str(a.max_turns), stats(scores, capped, turns), os.path.relpath(out, ROOT))
 
 
 if __name__ == '__main__':

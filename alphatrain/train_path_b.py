@@ -617,9 +617,14 @@ def main():
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
-    p.add_argument('--trunk', choices=['standard', 'p4m'], default='standard',
+    p.add_argument('--trunk', choices=['standard', 'p4m', 'c7'], default='standard',
                    help='p4m = D4 group-equivariant trunk (alphatrain/model_p4m.py, HISTORY 278); '
-                        'uses --group-channels / --p4m-expand instead of --channels')
+                        'uses --group-channels / --p4m-expand instead of --channels. c7 = color-equivariant '
+                        'slot trunk + color-selecting PAIR2 head (alphatrain/model_c7.py, HISTORY 279); uses '
+                        '--slot-channels / --shared-channels')
+    p.add_argument('--device', default=None, help='cuda / mps / cpu (default: the best available)')
+    p.add_argument('--slot-channels', type=int, default=24, help='c7: channels per color slot (x7 colors)')
+    p.add_argument('--shared-channels', type=int, default=48, help='c7: color-free shared channels')
     p.add_argument('--group-channels', type=int, default=16,
                    help='p4m: group channels per block (x8 orientations = actual conv width)')
     p.add_argument('--p4m-expand', type=int, default=64,
@@ -750,7 +755,9 @@ def main():
         print(f"Seeded: {args.seed}", flush=True)
 
     # Device
-    if torch.cuda.is_available():
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
         device = torch.device('cuda')
     elif torch.backends.mps.is_available():
         device = torch.device('mps')
@@ -823,13 +830,20 @@ def main():
         model = PolicyNetP4M(num_blocks=args.num_blocks, group_channels=args.group_channels,
                              expand=args.p4m_expand, head=args.policy_head, pair_dim=args.pair_dim).to(device)
         arch = f"p4m {args.num_blocks}b x {args.group_channels}g (x8 = {8 * args.group_channels}ch) -> {args.p4m_expand}e"
+    elif args.trunk == 'c7':
+        from alphatrain.model_c7 import PolicyNetC7
+        if args.policy_head != 'pair2':
+            raise SystemExit('--trunk c7 has its own color-selecting PAIR2 head: pass --policy-head pair2')
+        model = PolicyNetC7(num_blocks=args.num_blocks, slot_channels=args.slot_channels,
+                            shared_channels=args.shared_channels, pair_dim=args.pair_dim).to(device)
+        arch = f"c7 {args.num_blocks}b x {args.slot_channels}k per color (x7) + {args.shared_channels}s shared"
     else:
         model = AlphaTrainNet(num_blocks=args.num_blocks,
                               channels=args.channels, head=args.policy_head,
                               pair_dim=args.pair_dim).to(device)
         arch = f"{args.num_blocks}b x {args.channels}ch"
     n_params = count_parameters(model)
-    if device.type == 'cuda' and args.trunk != 'p4m':      # p4m's free weights are 5-D (rank-4 only)
+    if device.type == 'cuda' and args.trunk == 'standard':  # p4m's free weights are 5-D (rank-4 only)
         model = model.to(memory_format=torch.channels_last)
     print(f"Model: {arch}, {n_params:,} params", flush=True)
 

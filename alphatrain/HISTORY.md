@@ -6415,3 +6415,49 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      g16 (default) and g12 (the 18x96's cost); est. ~38 / ~29 min per epoch from the 18x96 run's ~25.
      Unrelated pre-existing failure noted: test_inference_server::test_server_matches_local_game_scores
      fails on unmodified HEAD too (fp16 batched MCTS divergence).
+
+279. **Colors: a color-equivariant net (alphatrain/model_c7.py) learns far more efficiently -- tiny probe at equal
+     conv width: 409 vs 1,214 deaths per 100k turns with 6x fewer parameters. Averaging an existing net over
+     color renamings helps little (0.297 vs 0.342, -13%); rotation equivariance did not help the tiny probes.**
+     (2026-10-03; owner: "utilize the fact that rotation and different colors don't matter ... can the model be
+     more efficient if it knew?")
+     How much the best actor (A8 = ta_A7_e4_a1.0) already "knows" (alphatrain/scripts/color_tta_check.py on 2,016
+     recorded states): a D4 view keeps its move 87.7-89.7% (all 8 agree 73.8%), a cyclic color renaming 92.1-93.6%
+     (all 7 agree 84.3%). Tools: eval --color-tta K (K cyclic color shifts, logits averaged; combines with --tta 8;
+     --color-tta 1 reproduces plain and D4-TTA play bit for bit; fp32 Python reference == C++ moves 99.70% /
+     99.71%), eval_log run --color-tta K. Gate (seeds 2,600,000-2,601,999, cap 25k, folded):
+       A8 single pass, first 25k turns (100k-cap CSV)   164 deaths  0.342 [0.292, 0.399]
+       A8 8-view D4 average (HISTORY 270)               102 deaths  0.210 [0.171, 0.255]
+       A8 7-relabeling color average                    143 deaths  0.297 [0.250, 0.350]  (P1 6,966, P5 36,274,
+                                                                                          P10 50,718, 92.8% capped)
+     The 8 D4 x 3 color (24-view) gate (scripts/color_tta_gates.sh, second command) was not run: deprioritized.
+     model_c7.py: one feature slot per color with SHARED weights (DeepSets: h'_c = A*h_c + B*mean(h) + C*z, z' = D*z
+     + E*mean(h), the general linear map commuting with color renamings) plus a color-free stream; the slot planes
+     (board==c, preview of color c decoded from the color/7 channels, share of color c) come from the unchanged
+     18-channel observation, so the C++ engine is untouched. The PAIR2-shaped head reads the MOVING ball's own color
+     slot at the source and at every destination. Exactly invariant (tests/test_model_c7.py: random color
+     permutations in eval and train mode, index convention, dense == DeepSets reference, freeze + BN fold + trace).
+     Each layer runs as ONE dense convolution of width 7K + S with an assembled weight: per-slot convolutions + slot
+     means + broadcasts ran 4-10x slower on MPS than their FLOPs (a mean over a 5-D middle dim is 20x slower than
+     on a 3-D view; a stride-0 broadcast add 2.2x slower than repeat + add). Loaders: alphatrain/model_variants.py
+     (net_from_state for standard / p4m / c7; evaluate, export_ts, model_shape use it; standard exports
+     byte-identical); train_path_b --trunk c7 --slot-channels --shared-channels, --device; torch.compile matches
+     eager (gradient diff 5e-7).
+     Efficiency probe (same data ba_A8_A8s_crisis_w120.pt, recipe lr 2e-3 bs 1024, 3 CPU epochs, seed 42, legal-
+     mask soft CE; play = 2k games on seeds 2,600,000-2,601,999, all in EVAL.md as effprobe_*):
+       tiny model             free params  conv width  held-out loss ep1/2/3   deaths per 100k turns  P50 score
+       standard 4b x 32ch        109k          32       3.12 / 2.68 / 2.55            1,586               70
+       standard 4b x 72ch        421k          72       2.79 / 2.48 / 2.28            1,214              105
+       p4m 4b x 4g                40k          32       3.91 / 3.38 / 3.13            2,656               20
+       p4m 4b x 8g                69k          64       3.45 / 2.89 / 2.66            1,860               50
+       c7 4b k8/s16               66k          72       1.93 / 1.75 / 1.67              409              387
+     A plain CNN cannot easily tell that two cells hold the SAME color (it needs a detector per color, and the
+     preview colors come as color/7 numbers); in the slot net "same color" is free. Caveat: the tiny p4m nets have
+     only 4-8 independent filters per layer; the full-size Colab p4m run (HISTORY 278) is the real test there.
+     Full size: c7 18 blocks k12/s24 = 504,674 free params (18x96: 3,071,170); MPS training 4,837 vs 7,361
+     samples/s; inference (frozen + folded, fp16) 32 us/position in Python, 43 in C++ (18x96: 19); 1 MPS epoch on
+     the probe corpus (bs 2048, lr 1e-3): held-out 2.06 vs p4m g16's 4.48 at identical settings; export folds 21
+     BatchNorms, traced == eager, C++ eval runs. Colab: alphatrain/train_c7_18_pair2_born_again_A8_colab.ipynb
+     (make_distill_notebook --trunk c7; tarball colorlines_pillar3d_v10.tar.gz; born_again_A8.pt.gz as before;
+     identical recipe to the 18x96 born-again 0.318), arms k12s24 (default, 108 conv channels) and k8s24 (80, about
+     the 18x96's inference cost).
