@@ -617,6 +617,13 @@ def main():
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--num-blocks', type=int, default=10)
     p.add_argument('--channels', type=int, default=256)
+    p.add_argument('--trunk', choices=['standard', 'p4m'], default='standard',
+                   help='p4m = D4 group-equivariant trunk (alphatrain/model_p4m.py, HISTORY 278); '
+                        'uses --group-channels / --p4m-expand instead of --channels')
+    p.add_argument('--group-channels', type=int, default=16,
+                   help='p4m: group channels per block (x8 orientations = actual conv width)')
+    p.add_argument('--p4m-expand', type=int, default=64,
+                   help='p4m: group channels before orientation pooling (head input = 2x this)')
     p.add_argument('--val-split', type=float, default=0.05)
     # Augmentation defaults: BOTH ON. Color permutation (7! symmetry) was
     # the +4% lift in Path B v1 (HISTORY 143). Dihedral 8× is standard.
@@ -811,14 +818,20 @@ def main():
               f"(train {len(mix_train):,}, val {len(mix_val):,})", flush=True)
 
     # Model
-    model = AlphaTrainNet(num_blocks=args.num_blocks,
-                          channels=args.channels, head=args.policy_head,
-                          pair_dim=args.pair_dim).to(device)
+    if args.trunk == 'p4m':
+        from alphatrain.model_p4m import PolicyNetP4M
+        model = PolicyNetP4M(num_blocks=args.num_blocks, group_channels=args.group_channels,
+                             expand=args.p4m_expand, head=args.policy_head, pair_dim=args.pair_dim).to(device)
+        arch = f"p4m {args.num_blocks}b x {args.group_channels}g (x8 = {8 * args.group_channels}ch) -> {args.p4m_expand}e"
+    else:
+        model = AlphaTrainNet(num_blocks=args.num_blocks,
+                              channels=args.channels, head=args.policy_head,
+                              pair_dim=args.pair_dim).to(device)
+        arch = f"{args.num_blocks}b x {args.channels}ch"
     n_params = count_parameters(model)
-    if device.type == 'cuda':
+    if device.type == 'cuda' and args.trunk != 'p4m':      # p4m's free weights are 5-D (rank-4 only)
         model = model.to(memory_format=torch.channels_last)
-    print(f"Model: {args.num_blocks}b x {args.channels}ch, "
-          f"{n_params:,} params", flush=True)
+    print(f"Model: {arch}, {n_params:,} params", flush=True)
 
     # Resume / warm start (load BEFORE compile to avoid prefix issues)
     start_epoch = 0

@@ -44,18 +44,26 @@ def load_model(model_path, device, fp16=False, jit_trace=False):
     state = ckpt['model']
     if any(k.startswith('_orig_mod.') for k in state):
         state = {k.replace('_orig_mod.', ''): v for k, v in state.items()}
-    in_ch = state['stem.0.weight'].shape[1]
-    nb = sum(1 for k in state if k.endswith('.conv1.weight')
-             and k.startswith('blocks.'))
-    ch = state['stem.0.weight'].shape[0]
-
     # Filter dead value-head keys from old dual-head checkpoints.
     state = {k: v for k, v in state.items() if not k.startswith('value_')}
 
     from alphatrain.model import head_kwargs_from_state
-    net = PolicyNet(in_channels=in_ch, num_blocks=nb, channels=ch, **head_kwargs_from_state(state)).to(device)
-    net.load_state_dict(state)
-    net.train(False)
+    from alphatrain.model_p4m import PolicyNetP4M, is_p4m_state, p4m_kwargs_from_state
+    if is_p4m_state(state):
+        kw = p4m_kwargs_from_state(state)
+        in_ch, nb, ch = kw['in_channels'], kw['num_blocks'], f"p4m {kw['group_channels']}g/{kw['expand']}e "
+        net = PolicyNetP4M(**kw).to(device)
+        net.load_state_dict(state)
+        net.train(False)
+        net.freeze()            # inference form: plain convs with the expanded weights (same function, faster)
+    else:
+        in_ch = state['stem.0.weight'].shape[1]
+        nb = sum(1 for k in state if k.endswith('.conv1.weight')
+                 and k.startswith('blocks.'))
+        ch = state['stem.0.weight'].shape[0]
+        net = PolicyNet(in_channels=in_ch, num_blocks=nb, channels=ch, **head_kwargs_from_state(state)).to(device)
+        net.load_state_dict(state)
+        net.train(False)
 
     max_score = float(ckpt.get('max_score', 30000.0))
     epoch = ckpt.get('epoch', '?')

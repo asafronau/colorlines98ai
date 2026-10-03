@@ -6383,3 +6383,35 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      HISTORY 265 without a single-pass gain: slide windows (once, not repeatable), 2,400 sims, four value
      heads, warm-start and born-again 8-view distillation, decisiveness weighting, checkpoint averaging.
      The one large gap left is the model's own 8-view ensemble (0.21, HISTORY 270).
+
+278. **p4m (D4-equivariant) trunk built and verified exact; Colab notebook ready. Goal: the 8-view
+     ensemble's 0.21 deaths per 100k turns in ONE forward pass (the 18x96 born-again student: 0.318).**
+     (2026-10-03; owner: "Let's try 2" = Gemini's equivariant-trunk option.) alphatrain/model_p4m.py: group
+     convolutions over the 8 board symmetries (Cohen & Welling 2016). Lifting conv (the four line-direction
+     input channels 13-16 swap under the symmetries; the permutation is derived numerically from
+     observation.py), 3x3 group convs (each filter learned once, applied in 8 orientations; the expanded
+     weight is a precomputed gather, one op per conv), BN statistics shared across orientations,
+     pre-activation residual blocks as in model.py, a 1x1 group expand, then mean+max pooling over the
+     orientations -> invariant per-cell features -> the unchanged PAIR2 head (1x1 convs + D4-invariant
+     gates, so the whole policy is exactly equivariant).
+     Verified (alphatrain/tests/test_model_p4m.py, 6 tests): group tables; input permutation (a quarter
+     turn swaps H<->V and D1<->D2); whole-policy equivariance on real observations of all 8 views, eval and
+     train mode (max logit deviation 1.6e-7; a standard net on the same check: 0.16); freeze() + BN fold +
+     trace equal the group net; state-dict round trip. Integration: train_path_b --trunk p4m
+     --group-channels --p4m-expand (channels_last module conversion skipped: the free weights are 5-D, it
+     would crash on Colab); evaluate.load_model / export_ts.load_model detect stem_lift.weight and freeze()
+     the net into a plain CNN (expanded weights, per-orientation BN), so fold_batchnorm (21 layers),
+     fp16-safe BN and TorchScript work unchanged; model_shape prints the p4m flags. torch.compile (inductor,
+     CPU) and channels_last inputs match eager (gradient diff 1e-6). Smoke: 1 epoch on
+     ba_A8_A8s_crisis_w120.pt -> folded export (traced = eager) -> C++ eval of 2,000 games runs.
+     Cost, C++ MPS fp16 at batch 4000 (us per position): 18x96 19.1; p4m g12 (12 group channels = 96 conv
+     channels, 443k params) 19.9; p4m g16 (128 conv channels, 742k params) 31.3. Found and fixed on the way:
+     orientation pooling over a 5-D view ran 20x slower on MPS (4.3 vs 0.22 us), now a 4-D view. Training
+     throughput vs the 18x96 (MPS fp16): g12 0.86x, g16 0.66x; activation memory 1.08x / 1.43x.
+     Notebook alphatrain/train_p4m18_pair2_born_again_A8_colab.ipynb (make_distill_notebook --trunk p4m;
+     code tarball colorlines_pillar3d_v9.tar.gz; corpus born_again_A8.pt.gz, already on Drive): the 18x96
+     born-again recipe unchanged (40 ep, bs 32768, lr 3e-3, warmup 1, soft top-5, PAIR2 + legal mask, D4 +
+     color augmentation; D4 is a no-op for an equivariant net), so the trunk is the only difference. Arms
+     g16 (default) and g12 (the 18x96's cost); est. ~38 / ~29 min per epoch from the 18x96 run's ~25.
+     Unrelated pre-existing failure noted: test_inference_server::test_server_matches_local_game_scores
+     fails on unmodified HEAD too (fp16 batched MCTS divergence).

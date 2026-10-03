@@ -35,12 +35,21 @@ def load_model(path, device, dtype, fold_bn=False):
     st = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
     if any(k.startswith('_orig_mod.') for k in st):
         st = {k.replace('_orig_mod.', ''): v for k, v in st.items()}
-    ch = st['stem.0.weight'].shape[0]
-    nblocks = sum(1 for k in st if k.endswith('.conv1.weight') and k.startswith('blocks.'))
     from alphatrain.model import head_kwargs_from_state
-    m = PolicyNet(num_blocks=nblocks, channels=ch, **head_kwargs_from_state(st))
-    m.load_state_dict(st)
-    m.train(False)  # eval mode: BatchNorm uses running stats (important!)
+    from alphatrain.model_p4m import PolicyNetP4M, is_p4m_state, p4m_kwargs_from_state
+    if is_p4m_state(st):
+        kw = p4m_kwargs_from_state(st)
+        nblocks, ch = kw['num_blocks'], f"p4m {kw['group_channels']}g/{kw['expand']}e "
+        m = PolicyNetP4M(**kw)
+        m.load_state_dict(st)
+        m.train(False)
+        m.freeze()      # plain CNN with the expanded group weights: traceable and BN-foldable like PolicyNet
+    else:
+        ch = st['stem.0.weight'].shape[0]
+        nblocks = sum(1 for k in st if k.endswith('.conv1.weight') and k.startswith('blocks.'))
+        m = PolicyNet(num_blocks=nblocks, channels=ch, **head_kwargs_from_state(st))
+        m.load_state_dict(st)
+        m.train(False)  # eval mode: BatchNorm uses running stats (important!)
     n_fix = fp16_safe_batchnorm(m)
     if n_fix:
         print(f'fp16-safe BN: rescaled {n_fix} channel(s) with running_var > {FP16_SAFE_VAR:g}')
@@ -57,14 +66,24 @@ def fold_batchnorm(m):
     bn1 (pre-activation, before a ReLU) and backbone_bn (after the residual sum) cannot fold.
     Removes ~half the per-position elementwise passes (HISTORY 257)."""
     from torch.nn.utils.fusion import fuse_conv_bn_eval
-    m.stem[0] = fuse_conv_bn_eval(m.stem[0], m.stem[1])
-    m.stem[1] = torch.nn.Identity()
-    for blk in m.blocks:
+    if hasattr(m, 'gblocks'):           # frozen p4m trunk (PolicyNetP4M.freeze): stem, blocks, 1x1 expand
+        m.stem_lift = fuse_conv_bn_eval(m.stem_lift, m.stem_bn)
+        m.stem_bn = torch.nn.Identity()
+        blocks = m.gblocks
+        m.expand_conv = fuse_conv_bn_eval(m.expand_conv, m.expand_bn)
+        m.expand_bn = torch.nn.Identity()
+        n = 1
+    else:
+        m.stem[0] = fuse_conv_bn_eval(m.stem[0], m.stem[1])
+        m.stem[1] = torch.nn.Identity()
+        blocks = m.blocks
+        n = 0
+    for blk in blocks:
         blk.conv1 = fuse_conv_bn_eval(blk.conv1, blk.bn2)
         blk.bn2 = torch.nn.Identity()
     m.policy_conv1 = fuse_conv_bn_eval(m.policy_conv1, m.policy_bn)
     m.policy_bn = torch.nn.Identity()
-    return len(m.blocks) + 2
+    return len(blocks) + 2 + n
 
 FP16_SAFE_VAR = 1e3
 
