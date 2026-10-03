@@ -6351,3 +6351,10 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      per bin). Head size, death data and target density all leave danger detection unchanged on the frozen
      policy backbone; untested: an end-to-end value network. Queued: decisiveness-weighted fine-tune A/B
      (same A8c corpus, --decisiveness-power 2.0 --blend-alpha 0.5; scratchpad decisive_ab.sh).
+     Born-again final (2026-10-03): ep35 (val 0.6731; owner stopped Colab here) P1 8,116, P5 36,435, P10
+     74,442, P25 197,602, 74.0% capped, 0.301 [0.276, 0.328] per 100k turns (MTBF 332,259; by age
+     0.28/0.30/0.32/0.29) -- the lowest rate measured, -7% vs the actor, inside the CIs at 2k. Uniform
+     average of ep30+35 with BN re-estimated on born_again_A8.pt (augmented): 0.333 [0.307, 0.362], early
+     hazard 0.54 (53 deaths in 0-5k turns vs ep35's 28) -- BN re-estimation hurts again (as HISTORY 239).
+     The late, low-LR epochs improved the run (ep30 0.344 -> ep35 0.301): run Colab arms to the end.
+     Next: confirm ep35 vs the actor on a second 2k bank (seeds 2,602,000-2,603,999 -> 4k each).
