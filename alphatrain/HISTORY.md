@@ -6306,3 +6306,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      will accompany gate reports so a real age-dependent change is not pooled away; 4k seeds (a second
      2k bank, 2,602,000-2,603,999) for close calls -- not needed for this verdict (a 2% difference).
      Born-again (HISTORY 272) epoch 20 copied from Colab (val 0.6837; training continues): gating.
+     Born-again epoch 20 (2k, cap 100k, folded): P1 8,691, P5 34,781, P10 65,500, P25 178,421, 72.2% capped,
+     0.324 [0.298, 0.352] per 100k turns = the actor's single pass (0.323) at half training; hazard by age
+     0.28/0.34/0.31/0.34 (flat). First 25k turns of the same games: actor 0.342 (164 deaths), born-again
+     0.316 (152), the 8-view ensemble 0.210 (102). Later epochs pending from Colab.
