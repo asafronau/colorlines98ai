@@ -6358,3 +6358,14 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      hazard 0.54 (53 deaths in 0-5k turns vs ep35's 28) -- BN re-estimation hurts again (as HISTORY 239).
      The late, low-LR epochs improved the run (ep30 0.344 -> ep35 0.301): run Colab arms to the end.
      Next: confirm ep35 vs the actor on a second 2k bank (seeds 2,602,000-2,603,999 -> 4k each).
+
+276. **Decisiveness-weighted crisis fine-tune (Gemini Step 2) hurts: same 2,400-sim corpus and recipe as turn
+     A8c, only the loss changed (--decisiveness-power 2.0 --blend-alpha 0.5): 0.350 / 0.380 at alpha 0.5 /
+     1.0 vs the unweighted 0.318 / 0.317.** (2026-10-03) scratchpad decisive_ab.sh: A8 fine-tuned 4 ep on
+     alphatrain/data/A8c_crisis_w45.pt (frozen BN, lr 1e-4, T 0.5, augment 1; val 1.6803), ta_sweep:
+       model          P1     P5     P10     P25      P50      P75      P90      P95   capped  per 100k turns
+       A8d alpha 0.5  9,061 28,968  60,471 166,450  203,993  204,283  204,535  204,662  70.5%  0.350 [0.323, 0.380]
+       A8d alpha 1.0  5,961 28,795  50,788 149,008  203,878  204,204  204,450  204,587  68.8%  0.380 [0.35, 0.41]
+     (alpha 1.5 gate stopped: the trend worsens with alpha). Concentrating the gradient on decisive search
+     states makes play worse, not better; the flat-state soft targets carry useful information.
+     Running: 4k confirmation of born-again ep35 vs the actor (bank 2 = seeds 2,602,000-2,603,999).
