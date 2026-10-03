@@ -6310,3 +6310,26 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      0.324 [0.298, 0.352] per 100k turns = the actor's single pass (0.323) at half training; hazard by age
      0.28/0.34/0.31/0.34 (flat). First 25k turns of the same games: actor 0.342 (164 deaths), born-again
      0.316 (152), the 8-view ensemble 0.210 (102). Later epochs pending from Colab.
+
+274. **Gemini review (owner-shared, 2026-10-02): verified points, corrections, fixes.** Corrections to my
+     claims: (1) HISTORY 241 does not show born-again capturing an ensemble: the same-head born-again
+     control lost 17% (10,361 vs 12,437 at ep27); the +44% came from the PAIR2 head. (2) "danger is
+     ~70-80% predictable (spawn luck)" (HISTORY 269-270) was premature: all three heads compared were the
+     same 3,268-param ValueHead (1x1 conv 96->32, global average pool, linear) -- the head, not luck, is
+     the first suspect. (3) prep_born_again relabeled the crisis rows with the search-free ensemble,
+     discarding the MCTS labels, in a corpus that is 83% quiet own states. Verified in code: ValueHead
+     GAP (value_head.py:42-73); SpatialValueHead (3x3 residual blocks + mean/max pool) existed but
+     train_value_head hard-coded ValueHead; export_policy_value skipped fp16_safe_batchnorm (A8 max
+     backbone_bn running_var 59,666 of fp16's 65,504; e40 once hit 100,447); MCTS min-max Q normalization
+     with q_range_floor 0 (mcts.cc:187, mcts.h:40); --decisiveness-power / --set-loss-on-mask / --ema-decay
+     exist in train_path_b; preview balls encoded as color/7 in three ordered channels (observation.py:147).
+     Fixed (commit 991fa0f): fp16-safe BatchNorm in export_policy_value and evaluate.load_model;
+     train_value_head --arch spatial (save_spatial records the survival target + horizons; frozen features
+     under no_grad -- inference tensors broke CPU training for either head); the export takes spatial
+     survival heads. Smoke-tested on CPU; 53 tests pass. Reservations: a q_range_floor only acts when all
+     leaves agree, so it does not address noise extremes stretching the range; 8-view averaging inside the
+     teacher costs 8x the network compute (like the sims scaling the owner ruled out); "D4-equivariance by
+     averaging each 3x3 kernel over D4" makes every filter isotropic (3 free weights), unable to tell
+     horizontal from vertical lines -- true equivariance needs group convolutions. Next: SpatialValueHead on
+     the pooled A3-A7 targets, death AUC on A8's games vs the GAP heads (queued after the epoch-30 gate);
+     decisiveness-weighted fine-tune on mined corpora; checkpoint-averaged born-again once 35/40 land.
