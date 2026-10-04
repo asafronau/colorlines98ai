@@ -6461,3 +6461,17 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      (make_distill_notebook --trunk c7; tarball colorlines_pillar3d_v10.tar.gz; born_again_A8.pt.gz as before;
      identical recipe to the 18x96 born-again 0.318), arms k12s24 (default, 108 conv channels) and k8s24 (80, about
      the 18x96's inference cost).
+
+280. **p4m stopped: at equal epochs both D4-equivariant arms are far behind the plain 18x96 on the same corpus and
+     recipe; the two Colab runtimes now train the color-equivariant c7 (k12s24, k8s24).** (2026-10-03; owner
+     stopped both p4m runs on this evidence.) Held-out loss on the identical validation split (born_again_A8.pt,
+     seed 42) and play (2k games, seeds 2,600,000-2,601,999, cap 25k, folded):
+       checkpoint                           held-out  deaths per 100k turns   P1     P5      P10    capped
+       18x96 born-again, epoch 8              0.705    0.44 [0.38, 0.50]      5,365  23,333  49,037  89.6%
+       p4m g16 (742k params), epoch 7         0.767    0.77 [0.69, 0.86]      2,839  13,686  29,436  82.5%
+       p4m g12 (443k params), epoch 8         0.814    1.64 [1.52, 1.77]      1,683   6,898  13,281  66.4%
+     (the 18x96 went on to 0.684 at epoch 20 and 0.673 at 35). Colab speed: g16 2,761 s per epoch, g12 2,246 s.
+     Full-size A/B on the small corpus (ba_A8_A8s_crisis_w120.pt; 3 MPS epochs, bs 2048, lr 1e-3, no warmup,
+     seed 42; held-out loss per epoch): 18x96 4.53 / 2.86 / 2.52; p4m g16 4.51 / 3.75 / 3.13; c7 k12s24 (505k
+     params) 2.06 / 1.77 / 1.68. Exact D4 equivariance by weight sharing costs this net more (fewer free filters,
+     slower learning) than it saves; colors are where the efficiency is (HISTORY 279).
