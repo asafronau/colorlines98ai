@@ -6489,3 +6489,25 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      data -- but the play advantage does at k12s24 (CIs just separate; one checkpoint). Width matters for c7 on this
      corpus (k8 -> k12: 1.00 -> 0.62). Next: epoch-10 gates of all three; if k12s24 stays ahead at equal epochs,
      replace k8s24 with a wider c7 (k16s32, ~0.9M params).
+
+282. **c7 falls behind the plain net after its fast start: at epochs 10 / 15, c7 k12s24 0.55 / 0.49 and k8s24
+     0.82 / 0.67 deaths per 100k turns vs the 18x96's 0.44 at epoch 8 and 0.32 at epoch 20. Neither built-in
+     symmetry (p4m, HISTORY 280; c7) beats the plain 18x96 on the full born-again corpus at comparable size.**
+     (2026-10-04) Gates: 2k games, seeds 2,600,000-2,601,999, cap 25k, folded (the 18x96 rows past epoch 8 = the
+     first 25k turns of its 100k-cap gates, scratchpad cap_rate.py):
+       epoch   18x96 (3.07M)        c7 k12s24 (505k)      c7 k8s24 (389k)
+         5     0.78 [0.70, 0.87]    0.62 [0.55, 0.69]     1.00 [0.91, 1.09]
+         8     0.44 [0.38, 0.50]
+        10                          0.55 [0.48, 0.62]     0.82 [0.74, 0.91]
+        15                          0.49 [0.43, 0.56]     0.67 [0.60, 0.75]
+        20     0.32 [0.27, 0.37]
+        25     0.47 [0.41, 0.53]    (mid-schedule dip, HISTORY 275)
+        30     0.32 [0.27, 0.37]
+        35     0.29 [0.25, 0.35]
+     Percentiles, epoch 15: k12s24 P1 5,338, P5 23,128, P10 42,849, 88.4% capped; k8s24 P1 3,840, P5 17,794, P10
+     33,510, 84.5%. Held-out loss: c7 k12s24 0.748 / 0.726 / 0.719, k8s24 0.776 / 0.754 / 0.746 at epochs 5 / 10 /
+     15 vs the 18x96's 0.728 (5), 0.705 (8), 0.684 (20). Reading: the color-invariant inductive bias wins early
+     and on small data (HISTORY 279), then capacity binds -- k8 -> k12 is a large gain, and the color-free shared
+     stream (24 channels) is narrow next to the plain net's 96 for spatial reasoning. Recommendation to the owner:
+     stop both c7 runs; next Colab candidate = a wider plain born-again student (18x128 on born_again_A8.pt) to
+     test whether student capacity is what keeps the 8-view ensemble (0.21) out of reach.
