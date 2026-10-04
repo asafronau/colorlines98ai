@@ -6475,3 +6475,17 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      seed 42; held-out loss per epoch): 18x96 4.53 / 2.86 / 2.52; p4m g16 4.51 / 3.75 / 3.13; c7 k12s24 (505k
      params) 2.06 / 1.77 / 1.68. Exact D4 equivariance by weight sharing costs this net more (fewer free filters,
      slower learning) than it saves; colors are where the efficiency is (HISTORY 279).
+
+281. **Full-size c7 on the real corpus: at equal epoch 5, c7 k12s24 (505k params) PLAYS better than the plain 18x96
+     (0.62 vs 0.78 deaths per 100k turns, -21%) despite a slightly worse held-out loss; k8s24 (389k) is behind
+     (1.00).** (2026-10-03; Colab, same corpus/recipe as the 18x96 born-again: born_again_A8.pt, 40-epoch cosine,
+     bs 32768, lr 3e-3, PAIR2 + legal mask, soft top-5.) Gates: 2k games, seeds 2,600,000-2,601,999, cap 25k, folded:
+       epoch 5                 free params  held-out  deaths per 100k turns   P1     P5      P10     capped
+       18x96 born-again           3.07M      0.728    0.78 [0.70, 0.87]      2,879  16,022  28,774   82.2%
+       c7 k12s24                  505k       0.748    0.62 [0.55, 0.69]      4,098  17,770  34,229   85.7%
+       c7 k8s24                   389k       0.776    1.00 [0.91, 1.09]      2,368  11,429  20,563   78.0%
+     (the 18x96 at epoch 8: held-out 0.705, 0.44 [0.38, 0.50]). The small-data probe's held-out advantage (HISTORY
+     279) does not carry to 12.9M states x 8 augmentations -- the plain net learns color invariance from that much
+     data -- but the play advantage does at k12s24 (CIs just separate; one checkpoint). Width matters for c7 on this
+     corpus (k8 -> k12: 1.00 -> 0.62). Next: epoch-10 gates of all three; if k12s24 stays ahead at equal epochs,
+     replace k8s24 with a wider c7 (k16s32, ~0.9M params).
