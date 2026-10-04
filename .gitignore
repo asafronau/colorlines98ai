@@ -46,3 +46,6 @@ logs/
 # Local-only notes, session transcripts, review briefs (never pushed)
 private/
 /*.jsonl
+
+# Local handoff notes (not committed)
+STATUS.md
