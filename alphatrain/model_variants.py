@@ -32,9 +32,11 @@ def net_from_state(state):
         net.load_state_dict(state)
         net.train(False)
         net.freeze()
-        return (net, f"c7 {kw['num_blocks']}b x {kw['slot_channels']}k/{kw['shared_channels']}s",
+        smax_tag = '+smax' if kw.get('use_smax') else ''
+        smax_flag = ' --c7-smax' if kw.get('use_smax') else ''
+        return (net, f"c7 {kw['num_blocks']}b x {kw['slot_channels']}k/{kw['shared_channels']}s{smax_tag}",
                 f"--trunk c7 --num-blocks {kw['num_blocks']} --slot-channels {kw['slot_channels']} "
-                f"--shared-channels {kw['shared_channels']}")
+                f"--shared-channels {kw['shared_channels']}{smax_flag}")
     ch = state['stem.0.weight'].shape[0]
     nb = sum(1 for k in state if k.endswith('.conv1.weight') and k.startswith('blocks.'))
     net = PolicyNet(in_channels=state['stem.0.weight'].shape[1], num_blocks=nb, channels=ch,

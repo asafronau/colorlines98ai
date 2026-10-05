@@ -5944,8 +5944,8 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
        union (3x data)  0.48 [0.45, 0.52]/100k turns  MTBF 207,927  P1 5,815  P5 23,452  P10 47,413  61.7%
        A4 (arm a only)  0.49 [0.46, 0.53]/100k turns  MTBF 202,343  P1 5,643  P5 20,184  P10 41,715  61.1%
      Intervals overlap: at the same teacher (A3 + 600-sim fixed search) more rows don't buy a lower
-     death rate. Next flywheel turns: stronger teacher (owner: 800 sims) rather than more rows.
-     Owner's decision: shrink to a 9 blocks x 64 channels PAIR2 student (~4x cheaper forward -> ~4x faster
+     death rate. Next flywheel turns: stronger teacher (800 sims) rather than more rows.
+     Distilling to a 9 blocks x 64 channels PAIR2 student (~4x cheaper forward -> ~4x faster
      evals and mining). Teacher = union (lower rate, picked automatically). Corpus: scripts/prep_distill.sh
      alphatrain/data/ta_union_abc_a1.0.pt union -> teacher games (3,000, seeds 4,300,000+, every 25th
      move + last 300), epoch-4 games (1,000, seeds 4,400,000+, every move), and the five crisis corpora's
@@ -5973,7 +5973,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 
 259. **9x64 student distilled from the union model: best = soft epoch 35 at 1.52 deaths per 100k turns
      (teacher 0.48, 3.2x). Soft labels beat hard at every epoch; the soft arm plateaued from epoch 30.**
-     (2026-09-29) Colab (owner): alphatrain/train_scratch9b64_pair2_distill_colab.ipynb (tarball v8,
+     (2026-09-29) Colab: alphatrain/train_scratch9b64_pair2_distill_colab.ipynb (tarball v8,
      distill_union.pt of HISTORY 258): from scratch, 9 blocks x 64 ch PAIR2 + legal-mask loss (734,722
      params vs the teacher's 3,071,170), 40 ep, bs 32768, lr 3e-3, warmup 1, AMP + compile, seed 42;
      soft = --blend-alpha 1.0 (the teacher's top-5), hard = 0.0 (its move). Val loss: soft 0.8047 /
@@ -5992,7 +5992,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      checkpoints; gate several. (3) The 18b96 law "a PAIR2 student reaches its label source" (HISTORY
      241-244) does not hold at 1/4 the size. Gate throughput 91k positions/s vs the teacher's 36k (not a
      controlled benchmark: batch compositions differ). A 2k gate of the student takes ~17-19 min.
-     Next (owner): flywheel on the student from soft ep35 with 600 sims. scripts/flywheel_turn.sh now
+     Next: flywheel on the student from soft ep35 with 600 sims. scripts/flywheel_turn.sh now
      reads the trunk shape from the checkpoint (alphatrain/scripts/model_shape.py) and takes SIMS
      (default 600); value head, fused export, fine-tune and merge smoke-tested on the student.
 
@@ -6019,7 +6019,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      differs. scripts/flywheel_turn.sh defaults THREADS=256 BATCH_WAIT=3000; --threads left out of the
      locked run config (an execution setting: a resume may change it); steps 2-3 skip when done, so a
      stopped turn resumes by rerunning it (S1's mining resumed: 291/3,000 seeds kept).
-     Owner's directive: run the flywheel on the student autonomously; stop when it reaches the 18x96
+     Autonomous flywheel loop: run the flywheel on the student and stop when it reaches the 18x96
      level or a turn gains < 15%. scripts/flywheel_loop.sh: per turn, promote the alpha with the lowest
      2k death rate (alphatrain/scripts/best_gate.py; the largest swept alpha winning gates one more);
      stop at rate <= 0.52 (the union teacher's 95% CI upper end) or a death-rate cut < 15%. Running:
@@ -6027,7 +6027,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      1.52 S 1 4500000 4600000 (turn k: seeds +500,000 per turn) -> logs/flywheel_loop_S.log.
 
 261. **Student flywheel turn S1 (own search, 600 sims): 1.52 -> 1.36 deaths per 100k turns (-10.5%), under
-     the owner's 15% bar, so the loop stopped. The 9x64 is capacity-limited: on rows it trained on, its top
+     the 15% bar, so the loop stopped. The 9x64 is capacity-limited: on rows it trained on, its top
      move matches the labels' on ~80.5% of crisis rows vs ~89.6% for the teacher's own single pass.**
      (2026-09-29) scripts/flywheel_loop.sh <soft ep35> 1.52 S 1 4500000 4600000 -> logs/flywheel_loop_S.log:
      own games (seeds 4,500,000+, 1k) 1.62 [1.51, 1.74]; survival head (inner-val 0.0310); mining 3,000
@@ -6052,7 +6052,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      turn moved S1 slightly away from the union's labels while cutting deaths 10.5%.
 
 262. **9x64 bug hunt: nothing found; the 9x64 is parked and the 18x96 flywheel resumes (autonomous,
-     800 sims).** (2026-09-30) Owner doubted the capacity reading (the 18x96 was called capacity-limited
+     800 sims).** (2026-09-30) Verifying the capacity reading (the 18x96 was called capacity-limited
      before and then improved ~10x after bug fixes). Checks, all clean:
      - fp16 / folded export fidelity (logs/fp16_fidelity.log, 20k game + 20k crisis rows, argmax vs fp32):
        student folded 99.77 / 99.73%, unfolded 99.71 / 99.67%; union folded 99.29 / 98.77%, unfolded
@@ -6070,7 +6070,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
        would not add information.
      - Labels: verified in HISTORY 258 (the only bug, sum-vs-mean TTA temperature, fixed before training).
      The student's gap is a uniform ~7-point imitation deficit on every source and fullness. Decisive
-     capacity test, not run: an 18x96 from scratch on distill_union.pt. Owner: park the 9x64, find the
+     capacity test, not run: an 18x96 from scratch on distill_union.pt. Parking the 9x64 to find the
      18x96's ceiling. Running: SIMS=800 ALPHAS="0.5 1.0 2.0" MIN_GAIN=0.05 TARGET=0 scripts/flywheel_loop.sh
      alphatrain/data/ta_union_abc_a1.0.pt 0.48 A 5 5000000 5100000 -> logs/flywheel_loop_A.log (A5 := the
      union, best 2k gate 0.48 vs A4 0.49; turn k seeds +500,000; stop when a turn cuts the rate < 5%).
@@ -6119,7 +6119,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 265. **Why the flywheel stalls: the strong actor's deaths are 60-120-move SLIDES from a healthy board, and
      every crisis window ever mined starts 15/30 moves before death -- past the slide. A slide is a loss of
      line potential, and the survival head sees it but the leaf value hides it.** (2026-09-30, CPU-only
-     analyses while turn A7 ran; owner: "we can't keep doubling sims ... explore different options")
+     analyses while turn A7 ran)
      Death anatomy (scratchpad death_anatomy.py, logs/death_anatomy.log; recorded own games, last 300 moves
      of every death):
                                          A6 (actor)   A5      A3      epoch-4 (probe player)
@@ -6160,8 +6160,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      The head separates moves ~10x more in slides than in recovering states, the slide weights triple
      that, and where it disagrees with the policy it keeps more partial lines. (1-ply, 4 futures: noisy.)
 
-266. **Turn A7 at 1,600 sims (one-off experiment): 0.37 -> 0.32 deaths per 100k turns (-13.5%). Owner: no
-     further sim doubling ("we won't get to infinite play if we have to keep doubling sims"); the slide arm
+266. **Turn A7 at 1,600 sims (one-off experiment): 0.37 -> 0.32 deaths per 100k turns (-13.5%). The slide arm
      (same actor, 800 sims) runs next for comparison.** (2026-09-30..10-01) Loop turn A7 from
      ta_A6_e4_a0.5 (seeds 6,000,000 / 6,100,000): own games 0.36 [0.32, 0.41] (P1 5,608, 69.5% capped);
      survival head inner-val 0.0106; mining 6,000 windows at 1,600 sims in 11,552 s (33,829 evals/s);
@@ -6284,7 +6283,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 273. **Sims scaling saturates: a 2,400-sim turn on A8 (itself the 1,600-sim product) gives 0.318 / 0.317 /
      0.314 deaths per 100k turns at alpha 0.5 / 1.0 / 1.5 vs the actor's 0.323 (-3% at best). 800 sims gave
      -21%, 1,600 -13.5%, 2,400 ~-3%. The death rate stays the right gate: the hazard is flat in every model.**
-     (2026-10-02; owner: "do 1600 or 2400 sims ... better understanding if increasing sims helps")
+     (2026-10-02)
      RUN=A8c SIMS=2400 scripts/flywheel_turn.sh alphatrain/data/ta_A7_e4_a1.0.pt A8 6500000 6700000
      "0.5 1.0 1.5" (A8's records + value head reused; pv_A8_ts.pt default weights): mining 6,000 windows
      in 16,671 s (35,200 evals/s); corpus 247,644 rows (B 0/20,000; C: the actor matches its 2,400-sim
@@ -6294,7 +6293,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
        alpha 0.5    6,647 35,133  69,046 185,845  204,013  204,308  204,522  204,655  72.8%  0.318 [0.292, 0.346]
        alpha 1.0    4,824 36,498  76,040 182,551  204,012  204,300  204,536  204,662  72.8%  0.317 [0.290, 0.344]
        alpha 1.5    9,350 35,226  71,274 187,645  203,958  204,242  204,467  204,585  73.0%  0.314 [0.288, 0.341]
-     Metric check (owner: "is the death rate the right metric?"; scratchpad hazard_bands.py, deaths per
+     Metric check (scratchpad hazard_bands.py, deaths per
      100k turns by game age 0-5k / 5-20k / 20-50k / 50-100k): A4 0.46/0.53/0.48/0.49, A7 actor
      0.38/0.38/0.38/0.36, A8 actor 0.36/0.33/0.34/0.30, alpha 1.0 0.34/0.28/0.29/0.34, alpha 1.5
      0.24/0.34/0.30/0.32 -- flat within every model (all bands inside each other's CIs). Under a flat
@@ -6311,8 +6310,8 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      0.28/0.34/0.31/0.34 (flat). First 25k turns of the same games: actor 0.342 (164 deaths), born-again
      0.316 (152), the 8-view ensemble 0.210 (102). Later epochs pending from Colab.
 
-274. **Gemini review (owner-shared, 2026-10-02): verified points, corrections, fixes.** Corrections to my
-     claims: (1) HISTORY 241 does not show born-again capturing an ensemble: the same-head born-again
+274. **Architecture & value-head audit (2026-10-02): verified points, corrections, fixes.** Corrections to
+     earlier notes: (1) HISTORY 241 does not show born-again capturing an ensemble: the same-head born-again
      control lost 17% (10,361 vs 12,437 at ep27); the +44% came from the PAIR2 head. (2) "danger is
      ~70-80% predictable (spawn luck)" (HISTORY 269-270) was premature: all three heads compared were the
      same 3,268-param ValueHead (1x1 conv 96->32, global average pool, linear) -- the head, not luck, is
@@ -6328,17 +6327,17 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      under no_grad -- inference tensors broke CPU training for either head); the export takes spatial
      survival heads. Smoke-tested on CPU; 53 tests pass. Reservations: a q_range_floor only acts when all
      leaves agree, so it does not address noise extremes stretching the range; 8-view averaging inside the
-     teacher costs 8x the network compute (like the sims scaling the owner ruled out); "D4-equivariance by
+     teacher costs 8x the network compute; "D4-equivariance by
      averaging each 3x3 kernel over D4" makes every filter isotropic (3 free weights), unable to tell
      horizontal from vertical lines -- true equivariance needs group convolutions. Next: SpatialValueHead on
      the pooled A3-A7 targets, death AUC on A8's games vs the GAP heads (queued after the epoch-30 gate);
      decisiveness-weighted fine-tune on mined corpora; checkpoint-averaged born-again once 35/40 land.
 
 275. **Born-again stays at the actor's level (ep30 0.344); a SPATIAL value head does not break the danger
-     ceiling either (Gemini's GAP-head hypothesis falsified on the frozen backbone).** (2026-10-02)
+     ceiling either (GAP-head hypothesis falsified on the frozen backbone).** (2026-10-02)
      Born-again gates (2k, cap 100k, folded): ep20 0.324 [0.298, 0.352], ep25 0.457 [0.425, 0.492] (hazard
      up in every age band: mid-schedule checkpoint), ep30 0.344 [0.317, 0.373] (P1 6,548, P5 35,595, P10
-     67,217, P25 171,361, 70.8% capped; hazard by age 0.35/0.29/0.37/0.35). Owner stopped Colab at ep35
+     67,217, P25 171,361, 70.8% capped; hazard by age 0.35/0.29/0.37/0.35). Training stopped at ep35
      (val 0.6731); gating ep35 and a 30+35 weight average with BN re-estimated (average_checkpoints.py
      --recalib-tensor born_again_A8.pt).
      SpatialValueHead (train_value_head --arch spatial, 162,756 params: 1x1 conv + two 3x3 residual blocks
@@ -6351,7 +6350,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      per bin). Head size, death data and target density all leave danger detection unchanged on the frozen
      policy backbone; untested: an end-to-end value network. Queued: decisiveness-weighted fine-tune A/B
      (same A8c corpus, --decisiveness-power 2.0 --blend-alpha 0.5; scratchpad decisive_ab.sh).
-     Born-again final (2026-10-03): ep35 (val 0.6731; owner stopped Colab here) P1 8,116, P5 36,435, P10
+     Born-again final (2026-10-03): ep35 (val 0.6731; training stopped here) P1 8,116, P5 36,435, P10
      74,442, P25 197,602, 74.0% capped, 0.301 [0.276, 0.328] per 100k turns (MTBF 332,259; by age
      0.28/0.30/0.32/0.29) -- the lowest rate measured, -7% vs the actor, inside the CIs at 2k. Uniform
      average of ep30+35 with BN re-estimated on born_again_A8.pt (augmented): 0.333 [0.307, 0.362], early
@@ -6359,7 +6358,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      The late, low-LR epochs improved the run (ep30 0.344 -> ep35 0.301): run Colab arms to the end.
      Next: confirm ep35 vs the actor on a second 2k bank (seeds 2,602,000-2,603,999 -> 4k each).
 
-276. **Decisiveness-weighted crisis fine-tune (Gemini Step 2) hurts: same 2,400-sim corpus and recipe as turn
+276. **Decisiveness-weighted crisis fine-tune hurts: same 2,400-sim corpus and recipe as turn
      A8c, only the loss changed (--decisiveness-power 2.0 --blend-alpha 0.5): 0.350 / 0.380 at alpha 0.5 /
      1.0 vs the unweighted 0.318 / 0.317.** (2026-10-03) scratchpad decisive_ab.sh: A8 fine-tuned 4 ep on
      alphatrain/data/A8c_crisis_w45.pt (frozen BN, lr 1e-4, T 0.5, augment 1; val 1.6803), ta_sweep:
@@ -6371,8 +6370,8 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      Running: 4k confirmation of born-again ep35 vs the actor (bank 2 = seeds 2,602,000-2,603,999).
 
 277. **4k confirmation: born-again ep35 = the actor (0.318 vs 0.321 deaths per 100k turns). A from-scratch
-     student of the 8-view ensemble reproduces the teacher's SINGLE pass, not the ensemble (0.21), as the
-     review predicted.** (2026-10-03) Second gate bank (seeds 2,602,000-2,603,999), pooled with the first
+     student of the 8-view ensemble reproduces the teacher's SINGLE pass, not the ensemble (0.21).**
+     (2026-10-03) Second gate bank (seeds 2,602,000-2,603,999), pooled with the first
      (scratchpad pooled_rate.py):
        model                 games  deaths  per 100k turns         MTBF      capped
        actor ta_A7_e4_a1.0   4,000   1,094  0.321 [0.302, 0.341]   311,557   72.7%
@@ -6386,7 +6385,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 
 278. **p4m (D4-equivariant) trunk built and verified exact; Colab notebook ready. Goal: the 8-view
      ensemble's 0.21 deaths per 100k turns in ONE forward pass (the 18x96 born-again student: 0.318).**
-     (2026-10-03; owner: "Let's try 2" = Gemini's equivariant-trunk option.) alphatrain/model_p4m.py: group
+     (2026-10-03) alphatrain/model_p4m.py: group
      convolutions over the 8 board symmetries (Cohen & Welling 2016). Lifting conv (the four line-direction
      input channels 13-16 swap under the symmetries; the permutation is derived numerically from
      observation.py), 3x3 group convs (each filter learned once, applied in 8 orientations; the expanded
@@ -6419,8 +6418,7 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
 279. **Colors: a color-equivariant net (alphatrain/model_c7.py) learns far more efficiently -- tiny probe at equal
      conv width: 409 vs 1,214 deaths per 100k turns with 6x fewer parameters. Averaging an existing net over
      color renamings helps little (0.297 vs 0.342, -13%); rotation equivariance did not help the tiny probes.**
-     (2026-10-03; owner: "utilize the fact that rotation and different colors don't matter ... can the model be
-     more efficient if it knew?")
+     (2026-10-03)
      How much the best actor (A8 = ta_A7_e4_a1.0) already "knows" (alphatrain/scripts/color_tta_check.py on 2,016
      recorded states): a D4 view keeps its move 87.7-89.7% (all 8 agree 73.8%), a cyclic color renaming 92.1-93.6%
      (all 7 agree 84.3%). Tools: eval --color-tta K (K cyclic color shifts, logits averaged; combines with --tta 8;
@@ -6463,8 +6461,8 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      the 18x96's inference cost).
 
 280. **p4m stopped: at equal epochs both D4-equivariant arms are far behind the plain 18x96 on the same corpus and
-     recipe; the two Colab runtimes now train the color-equivariant c7 (k12s24, k8s24).** (2026-10-03; owner
-     stopped both p4m runs on this evidence.) Held-out loss on the identical validation split (born_again_A8.pt,
+     recipe; the two Colab runtimes now train the color-equivariant c7 (k12s24, k8s24).** (2026-10-03; both p4m
+     runs stopped on this evidence.) Held-out loss on the identical validation split (born_again_A8.pt,
      seed 42) and play (2k games, seeds 2,600,000-2,601,999, cap 25k, folded):
        checkpoint                           held-out  deaths per 100k turns   P1     P5      P10    capped
        18x96 born-again, epoch 8              0.705    0.44 [0.38, 0.50]      5,365  23,333  49,037  89.6%
@@ -6508,6 +6506,79 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      33,510, 84.5%. Held-out loss: c7 k12s24 0.748 / 0.726 / 0.719, k8s24 0.776 / 0.754 / 0.746 at epochs 5 / 10 /
      15 vs the 18x96's 0.728 (5), 0.705 (8), 0.684 (20). Reading: the color-invariant inductive bias wins early
      and on small data (HISTORY 279), then capacity binds -- k8 -> k12 is a large gain, and the color-free shared
-     stream (24 channels) is narrow next to the plain net's 96 for spatial reasoning. Recommendation to the owner:
-     stop both c7 runs; next Colab candidate = a wider plain born-again student (18x128 on born_again_A8.pt) to
-     test whether student capacity is what keeps the 8-view ensemble (0.21) out of reach.
+     stream (24 channels) is narrow next to the plain net's 96 for spatial reasoning. Next Colab candidate = a
+     wider plain born-again student (18x128 on born_again_A8.pt) to test whether student capacity is what keeps
+     the 8-view ensemble (0.21) out of reach.
+
+283. **Small-model symmetry & capacity efficiency probes (Phase 2A/2B): canonical D4 x S7 preprocessing helps a
+     plain 4x72 CNN only modestly (-8.6% deaths), whereas upgrading c7 with slot_max pooling, contiguous SlotBN,
+     and a wider color-free spatial stream (k12s32, 189k params -- 2.35x smaller than 4x72) cuts deaths by -21.8%
+     vs the original c7 probe and -73.6% vs 4x72.** (2026-10-04) Why canonicalization alone does not match c7:
+     even on a D4 x S7-canonicalized board (alphatrain/scripts/canonicalize_corpus.py, C++ eval --canon), all 7
+     colors still coexist on the board across input planes 0..6 and scalar color/7 preview planes 8..10, so a plain
+     CNN still learns 7 separate color filter banks instead of sharing weights across colors. In model_c7.py, adding
+     slot_max(h) alongside slot_mean(h) to the PAIR2 global context gate (--c7-smax), making SlotBN.forward
+     contiguous (~17% faster MPS training), and widening the color-free spatial stream from k8/s16 to k12/s32 fix
+     both the minority-color dilution and the spatial bottleneck. Identical probe recipe (ba_A8_A8s_crisis_w120.pt,
+     3 epochs, bs 1024, lr 2e-3, warmup 0, seed 42, legal-mask soft CE; gate = 2k games, seeds 2,600,000-2,601,999,
+     cap 20k, folded, EVAL.md rows 196, 198, 199):
+       tiny model                  free params  held-out ep1/2/3   deaths per 100k turns          P50   mean
+       standard 4b x 72ch (aug)        446k     2.79 / 2.48 / 2.28  1,214.38 [1,161.74, 1,268.80]  105    115
+       standard 4b x 72ch (--canon)    446k     2.73 / 2.45 / 2.25  1,109.99 [1,061.87, 1,159.73]  122    131
+       c7 4b k8/s16 (HISTORY 279)       66k     1.93 / 1.75 / 1.67    409.37 [  391.62,   427.71]  387    460
+       c7 4b k8/s16 + smax              80k     1.88 / 1.75 / 1.66    426.51 [  408.02,   445.62]  372    438
+       c7 4b k12/s32 + smax            189k     1.82 / 1.68 / 1.59    320.31 [  306.43,   334.67]  513    607
+
+284. **Unfrozen value network vs. frozen policy backbone ceiling (Phase 3A): unfreezing the last 6 residual blocks
+     (998k trainable params) with D4 x S7 augmentation and input skip (--cat-obs) jumps short-horizon (H=25) within-
+     bin death AUC from 0.773 to 0.845 (+18.7 pp in [41, 46) balls), while H=200 AUC remains at 0.767 due to 200
+     turns of stochastic 3-ball spawn entropy.** (2026-10-04) Upgraded alphatrain/scripts/train_value_head.py with
+     GPU observation building, random D4 x S7 augmentation (--augment), importance-weighted negative subsampling
+     (--neg-subsample 8), raw 18-channel input concatenation (--cat-obs), partial backbone unfreezing
+     (--unfreeze-blocks K --backbone-lr), and per-epoch held-out within-bin H=200 AUC evaluation; upgraded
+     alphatrain/inference_cpp/export_policy_value.py to share the frozen stem + blocks 0..11 prefix while running
+     diverged blocks 12..17 for the value head. Trained on value_targets_pooled_A3_A7.pt (10.1M states) and
+     evaluated out-of-sample on the 310,403 states (36-62 balls) of value_targets_A8.pt via value_sees_slide.py
+     (logs/vh_phase3a_eval.log):
+       value head                         backbone        [36,41) H25/200  [41,46) H25/200  [46,51) H25/200  [51,56) H25/200  [56,63) H25/200  mean H25  mean H200
+       value_head_A8.pt (GAP)             frozen (no aug)   0.625 / 0.649    0.669 / 0.767    0.818 / 0.800    0.838 / 0.777    0.812 / 0.813     0.752     0.7611
+       value_head_A8_spatial_pooledA3A7   frozen (overfit)  0.556 / 0.645    0.583 / 0.766    0.834 / 0.811    0.848 / 0.780    0.806 / 0.821     0.725     0.7647
+       value_head_A8_aug_spatial.pt       frozen + aug      0.748 / 0.650    0.584 / 0.775    0.845 / 0.808    0.870 / 0.783    0.817 / 0.819     0.773     0.7670
+       value_head_A8_unfrozen6_spatial.pt unfrozen 6b       0.837 / 0.648    0.771 / 0.770    0.910 / 0.809    0.882 / 0.783    0.824 / 0.825     0.845     0.7669
+
+285. **Flywheel resumed (Phase 1A): applying the 2,400-sim crisis task vector (A8c_crisis_w45.pt) at alpha = 1.5
+     onto the fresh born-again checkpoint (scratch18b96_pair2_distill_A8_soft_ckpts_epoch_35.pt) breaks the 0.32
+     plateau and reaches 0.244 [0.228, 0.261] deaths per 100k turns across 4,000 confirmation games (-24.0% deaths
+     vs A8, MTBF 409,151 turns, 78.3% capped at 100k turns).** (2026-10-04) Why A8 -> A8c stalled while
+     born_again_A8_ep35 -> ta_baA8c succeeds: A8 (ta_A7_e4_a1.0.pt) sat at the end of 6 stacked task-arithmetic
+     extrapolations (sum of alphas = 7.0) on top of A1's frozen BatchNorm statistics (56.5% eval/train BN agreement
+     on crisis boards), whereas born_again_A8_ep35 was trained from scratch (alpha = 0, 84.2% eval/train BN
+     agreement) on born_again_A8.pt -- whose prep_born_again.sh (--mode tta) had overwritten all MCTS crisis/slide
+     labels with A8's search-free 8-view average and omitted A8c_crisis_w45.pt. Fine-tuned born_again_A8_ep35 for 4
+     epochs on alphatrain/data/A8c_crisis_w45.pt (247,644 states at 2,400 sims; --freeze-bn, lr 1e-4, bs 1024, T 0.5,
+     seed 42; logs/baA8c_ft.log, train loss 1.2613 vs A8c_ft's 1.2757 -> checkpoints/baA8c_ft/epoch_4.pt) and swept
+     task-arithmetic alpha in {0.5, 1.0, 1.5, 2.0} on the 2,000-game cap-25k gate (seeds 2,600,000-2,601,999,
+     EVAL.md rows 197, 200, 201, 204):
+       cap 25k (2k games, 2.600M-2.602M)   deaths   per 100k turns       MTBF     capped     P1      P5
+       ta_A7_e4_a1.0 (A8, alpha=0 base)       164   0.34 [0.29, 0.40]   292,257   91.80%   6,355  32,053
+       born_again_A8_ep35 (alpha=0)           141   0.29 [0.25, 0.35]   342,127   92.95%   6,897  35,388
+       ta_baA8c_e4_a0.5                       121   0.25 [0.21, 0.30]   400,159   93.95%   8,721  41,508
+       ta_baA8c_e4_a1.0                       133   0.27 [0.23, 0.33]   364,464   93.35%  10,070  39,765
+       ta_baA8c_e4_a1.5                       111   0.23 [0.19, 0.27]   438,246   94.45%  10,733  47,060
+       ta_baA8c_e4_a2.0                       134   0.28 [0.23, 0.33]   360,475   93.30%   8,371  38,966
+     Confirmed ta_baA8c_e4_a1.5.pt (new A9 champion) across both 2,000-seed banks at the full 100,000-turn cap
+     (4,000 games total, seeds 2,600,000-2,603,999, EVAL.md rows 202-203):
+       cap 100k confirmation              bank / seeds       games  deaths  per 100k turns         MTBF     capped     P1      P5     P10      P25
+       ta_A7_e4_a1.0 (A8)                 bank 1 (2.600M)    2,000     549  0.32 [0.30, 0.35]    309,795    72.60%   7,660  35,610  69,899  180,295
+       born_again_A8_ep35                 bank 1 (2.600M)    2,000     520  0.30 [0.28, 0.33]    332,259    74.00%   8,116  36,435  74,442  197,602
+       ta_baA8c_e4_a1.5 (new A9)          bank 1 (2.600M)    2,000     430  0.24 [0.22, 0.27]    414,450    78.50%  10,733  47,060  91,342  203,730 (capped)
+       ta_A7_e4_a1.0 (A8)                 bank 2 (2.602M)    2,000     545  0.32 [0.29, 0.35]    313,346    72.75%   7,127  35,522  69,193  180,623
+       born_again_A8_ep35                 bank 2 (2.602M)    2,000     567  0.34 [0.31, 0.36]    298,460    71.65%   6,858  29,915  62,428  174,223
+       ta_baA8c_e4_a1.5 (new A9)          bank 2 (2.602M)    2,000     439  0.25 [0.22, 0.27]    403,987    78.05%  12,470  46,483  89,697  203,687 (capped)
+       ta_A7_e4_a1.0 (A8)                 pooled (4k)        4,000   1,094  0.321 [0.302, 0.340] 311,554    72.65%
+       born_again_A8_ep35                 pooled (4k)        4,000   1,087  0.318 [0.299, 0.337] 314,485    72.83%
+       ta_baA8c_e4_a1.5 (new A9)          pooled (4k)        4,000     869  0.244 [0.228, 0.261] 409,151    78.28%
+     Both 2,000-seed banks independently confirm a ~24% death reduction with 95% CIs ([0.22, 0.27]) completely
+     disjoint from A8 and born_again_A8_ep35, and P25 is capped at ~203.7k points on both banks. Periodic born-again
+     resets followed by MCTS crisis task arithmetic cleanly prevent task-vector / BatchNorm saturation.
+

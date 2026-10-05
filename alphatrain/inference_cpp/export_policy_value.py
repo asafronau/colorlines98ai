@@ -23,14 +23,34 @@ from alphatrain import value_head as vh
 
 
 class PolicyValue(nn.Module):
-    def __init__(self, net, head, horizon_weights):
+    def __init__(self, net, head, horizon_weights, cat_obs=False, val_net=None, split_block=0):
         super().__init__()
         self.net = net
         self.head = head
+        self.cat_obs = bool(cat_obs)
+        self.val_net = val_net
+        self.split_block = int(split_block)
         self.register_buffer('hw', horizon_weights)
 
     def forward(self, obs):
-        pol, feats = self.net.forward_with_features(obs)
+        if self.val_net is not None:
+            x = self.net.stem(obs)
+            for i in range(self.split_block):
+                x = self.net.blocks[i](x)
+            pol_x = x
+            for i in range(self.split_block, len(self.net.blocks)):
+                pol_x = self.net.blocks[i](pol_x)
+            pol_feats = torch.relu(self.net.backbone_bn(pol_x))
+            pol = self.net._policy_from_features(pol_feats)
+
+            val_x = x
+            for i in range(self.split_block, len(self.val_net.blocks)):
+                val_x = self.val_net.blocks[i](val_x)
+            feats = torch.relu(self.val_net.backbone_bn(val_x))
+        else:
+            pol, feats = self.net.forward_with_features(obs)
+        if self.cat_obs:
+            feats = torch.cat([feats, obs], dim=1)
         out = self.head(feats)  # runs in module dtype (fp16-safe on MPS)
         v = (torch.sigmoid(out) * self.hw).sum(dim=-1)  # survival_to_scalar
         return pol, v
@@ -42,23 +62,47 @@ def main():
     p.add_argument('--head', default='alphatrain/data/value_head_small128.pt')
     p.add_argument('--state-tensor', default='alphatrain/data/distill_states.pt')
     p.add_argument('--outdir', default='alphatrain/inference_cpp/data')
+    p.add_argument('--output', default=None,
+                   help='Optional explicit output path (default: <outdir>/policy_value_ts.pt)')
     p.add_argument('--horizon-weights', default=None,
                    help='leaf value = sum_h w_h * P(survive h) over horizons (25, 50, 100, 200); comma-separated, '
                         'default 1.0,0.8,0.5,0.25 (tactical). Long-horizon weights let the search see slow slides.')
     a = p.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
+    out_path = a.output or f'{a.outdir}/policy_value_ts.pt'
 
+    from alphatrain.inference_cpp.export_ts import fp16_safe_batchnorm
     net, _ = load_model(a.model, torch.device('cpu'), fp16=False)
+    fp16_safe_batchnorm(net)
     head, ckpt, head_type = vh.load_any(a.head, torch.device('cpu'))
     assert head_type in ('value_head', 'spatial') and ckpt.get('target_type') == 'survival', \
         f'expected a survival value head (gap or spatial), got {head_type}/{ckpt.get("target_type")}'
     head.train(False)
     net.train(False)
+    cat_obs = bool(ckpt.get('cat_obs', False))
+    val_net = None
+    split_block = 0
+    if 'backbone_state_dict' in ckpt and ckpt['backbone_state_dict'] is not None:
+        val_backbone_path = ckpt.get('backbone_path') or a.model
+        val_net, _ = load_model(val_backbone_path, torch.device('cpu'), fp16=False)
+        val_net.load_state_dict(ckpt['backbone_state_dict'])
+        val_net.train(False)
+        # Share identical prefix blocks if net and val_net have the same stem and prefix
+        if hasattr(net, 'stem') and hasattr(val_net, 'stem') and len(net.blocks) == len(val_net.blocks):
+            stem_same = all(torch.allclose(p1, p2, atol=1e-6) for p1, p2 in zip(net.stem.parameters(), val_net.stem.parameters()))
+            if stem_same:
+                for bi in range(len(net.blocks)):
+                    if all(torch.allclose(p1, p2, atol=1e-6) for p1, p2 in zip(net.blocks[bi].parameters(), val_net.blocks[bi].parameters())):
+                        split_block = bi + 1
+                    else:
+                        break
+        print(f'loaded unfrozen value backbone (sharing prefix blocks 0..{split_block - 1} of {len(net.blocks)})')
+
     weights = [float(x) for x in a.horizon_weights.split(',')] if a.horizon_weights else list(vh.DEFAULT_HORIZON_WEIGHTS)
     assert len(weights) == vh.NUM_HORIZONS, f'--horizon-weights needs {vh.NUM_HORIZONS} values, got {weights}'
     hw = torch.tensor(weights, dtype=torch.float32)
-    print(f'leaf value weights over horizons {vh.SURVIVAL_HORIZONS}: {weights}')
-    module = PolicyValue(net, head, hw)
+    print(f'leaf value weights over horizons {vh.SURVIVAL_HORIZONS}: {weights} (cat_obs={cat_obs})')
+    module = PolicyValue(net, head, hw, cat_obs=cat_obs, val_net=val_net, split_block=split_block)
     module.train(False)
     # The C++ InferenceServer casts this module to fp16: rescale BatchNorm channels whose running_var
     # would overflow (exact reparameterization; export_ts does the same for policy-only exports).
@@ -80,11 +124,11 @@ def main():
     print(f'traced vs eager: pol {dp:.2e}  value {dv:.2e}')
     assert dp < 1e-4 and dv < 1e-5
 
-    ts.save(f'{a.outdir}/policy_value_ts.pt')
+    ts.save(out_path)
     obs.numpy().astype('<f4').tofile(f'{a.outdir}/pv_example_obs.f32')
     pol_e.numpy().astype('<f4').tofile(f'{a.outdir}/pv_example_logits.f32')
     v_e.numpy().astype('<f4').tofile(f'{a.outdir}/pv_example_values.f32')
-    print(f'wrote {a.outdir}/policy_value_ts.pt (+ pv_example obs/logits/values, B=4)')
+    print(f'wrote {out_path} (+ pv_example obs/logits/values, B=4)')
     print(f'values sample: {[round(float(x), 4) for x in v_e]}')
 
 

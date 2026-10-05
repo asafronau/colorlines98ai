@@ -6,25 +6,36 @@ An AlphaZero-inspired AI for [Color Lines 98](https://en.wikipedia.org/wiki/Line
 
 ## Current results
 
-The current model is a **3M-parameter ResNet (18 blocks × 96 channels)** that plays greedily: one forward pass per move, no search. Games are played in the C++ engine on a fixed bank of 1,000 seeds (2,600,000–2,600,999) and stopped at 100,000 turns. Games are getting long, so results are judged by percentiles and by the share of games that survive to the cap, not by the mean:
+The current model is a **3M-parameter ResNet (18 blocks × 96 channels)** that plays greedily: one forward pass per move, no search. Games are played in the C++ engine on fixed seed banks (2,600,000–2,603,999, 2,000–4,000 games) and stopped at 100,000 turns (~204,000 points). Because hazard is flat with game age (`~0.24–0.32` deaths per 100k turns across 0–5k, 5–20k, 20–50k, and 50–100k turns), models are judged by **deaths per 100,000 turns** (with 95% Poisson confidence intervals), **mean turns between failures (MTBF)**, the share of games surviving to the 100,000-turn cap, and lower-tail percentiles (`P1`, `P5`, `P10`, `P25`):
 
-| Player | P10 | P25 | Median | P75 | Reach 100k turns | Games < 1,000 |
-|---|---:|---:|---:|---:|---:|---:|
-| 18b96 e40 (old policy head) | 1,806 | 4,500 | 9,948 | 19,710 | 0.0% | 4.4% |
-| 18b96 e40, averaged over the 8 board symmetries | 2,449 | 6,168 | 14,778 | 32,317 | 0.0% | 3.3% |
-| A1: 18b96 + PAIR2 policy head + legal-move mask | 4,552 | 12,468 | 28,442 | 56,904 | 1.0% | 0.9% |
-| A2: A1 + first flywheel turn (fixed-teacher crisis corrections) | 16,085 | 43,272 | 102,938 | 203,505 | 25.3% | 0.1% |
-| **A3: A2 + second flywheel turn** | **39,270** | **107,085** | **at the cap** | **at the cap** | **55.4%** | **0.2%** |
+| Player | P1 | P5 | P10 | P25 | Median | Reach 100k turns | Deaths / 100k turns [95% CI] | MTBF (turns) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 18b96 e40 (old policy head) | 712 | 1,246 | 1,806 | 4,500 | 9,948 | 0.0% | ~10.0 | ~10,000 |
+| A1: 18b96 + PAIR2 policy head + legal-move mask | 1,182 | 2,844 | 4,552 | 12,468 | 28,442 | 1.0% | ~3.5 | ~28,500 |
+| A2: A1 + turn 1 (600-sim crisis corrections) | 1,924 | 8,426 | 16,085 | 43,272 | 102,938 | 25.3% | ~1.35 | ~74,000 |
+| A3: A2 + turn 2 (600 sims) | 4,478 | 20,256 | 39,270 | 107,085 | at the cap | 55.4% | 0.59 [0.54, 0.64] | 170,000 |
+| A4: A3 + turn 3 (600 sims) | 4,548 | 20,184 | 41,715 | 118,015 | at the cap | 61.1% | 0.49 [0.46, 0.53] | 202,343 |
+| A6: A4 + turns 4–5 (800 sims) | 5,588 | 27,986 | 56,355 | 155,380 | at the cap | 69.1% | 0.37 [0.34, 0.40] | 269,759 |
+| A8: A6 + turn 6 (1,600 sims, 4k games) | 7,127 | 35,522 | 69,193 | 180,295 | at the cap | 72.7% | 0.321 [0.302, 0.340] | 311,554 |
+| Born-again A8 (from scratch on A8 8-view labels, 4k games) | 8,116 | 36,435 | 74,442 | 197,602 | at the cap | 72.8% | 0.318 [0.299, 0.337] | 314,485 |
+| **A9: Born-again A8 + 2,400-sim crisis turn (4k games)** | **10,733** | **47,060** | **91,342** | **at the cap** | **at the cap** | **78.3%** | **0.244 [0.228, 0.261]** | **409,151** |
 
-A2 held up on two more banks: seeds 3,000,000–3,000,999 (P10 15,884 / median 104,629 / 24.9% reaching 100k turns, against A1's 4,785 / 30,387 / 0.9%) and 3,400,000–3,400,999 (16,470 / 104,883 / 27.0%). A3 is confirmed on seeds 3,000,000–3,000,999: P1 5,236 / P10 31,404 / 56.3% reaching 100k turns (A2: 1,434 / 15,884 / 24.9%). More than half of A3's games survive 100,000 turns, so its median now sits at the cap and the share of games reaching the cap, P10 and P25 are the numbers to watch. For reference, the 4× larger 256-channel pillar3k model had a median of 31,016 (5,000 other seeds).
+Across 4,000 confirmation games (seeds 2,600,000–2,603,999, capped at 100,000 turns), **A9** (`ta_baA8c_e4_a1.5`) cuts total deaths from `1,094` (`A8`) to **`869` (`-24.0%`)**, raises MTBF to **409,151 turns (~820,000 points)**, and reaches the 100,000-turn cap in **78.3%** of games — pushing **P25 to the 100k-turn cap** (~203,700 points) on both 2,000-seed banks.
 
-Every evaluation is logged in [`alphatrain/EVAL.md`](alphatrain/EVAL.md), and every experiment in [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) (252 entries).
+Every evaluation is logged in [`alphatrain/EVAL.md`](alphatrain/EVAL.md), and every experiment in [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) (285 entries).
 
-### The first flywheel turn: A1 → A2
+### The crisis-mining flywheel and why born-again resets unlock further turns
 
-A1's own search (600 simulations, its survival head as leaf value) replayed each of A1's deaths from 15 and 30 moves earlier, and the first 45 searched moves of each replay became training labels: 194k positions. A1 was fine-tuned on them for 4 epochs with BatchNorm statistics frozen, and A2 moves 2.5× as far as that fine-tune did, **A2 = A1 + 2.5 · (fine-tuned − A1)**. The fine-tune points in the right direction but stops short; the gain keeps growing up to 2.5–3× before it flattens.
+Each flywheel turn replays deaths from 15 and 30 moves earlier using PUCT MCTS (with a neural survival head as leaf evaluator), extracts the first 45 searched moves of each replay (`~200k–250k` states), fine-tunes the current actor for 4 epochs with BatchNorm running statistics frozen (`--freeze-bn`), and extrapolates along the task vector:
 
-It only worked after finding a bug. For two months the crisis-mining tool had loaded the survival head but searched with an older 27-feature value estimate, while its output files claimed otherwise. Replayed from the same states with the same spawns, the buggy search escaped 60% of A1's deaths against 55% for A1 alone; the fixed search escaped 72%. Every way of training on the buggy labels (weight blending, continuous training, correction-only fine-tunes) came out even with A1. The same recipe on the fixed labels tripled the median.
+$$\theta_{\text{next}} = \theta_{\text{base}} + \alpha \cdot (\theta_{\text{ft}} - \theta_{\text{base}})$$
+
+1. **Fixing the leaf evaluator (`A1 → A2 → A4`):** For two months the crisis-mining tool had loaded the survival head but searched with an older 27-feature heuristic value estimate. Fixing the C++ search to evaluate leaves with the neural survival head immediately unlocked the flywheel, taking the 100k-cap survival share from `1.0%` (`A1`) to `25.3%` (`A2`), `55.4%` (`A3`), and `61.1%` (`A4`, `0.49` deaths/100k turns).
+2. **Scaling GPU batching and teacher simulations (`A4 → A8`):** Rewriting the C++ inference server to wait for all 256 worker threads (`--batch-wait-us 3000`) sped up crisis mining by `6.1×` (`~34,000` neural evaluations/s on one Mac). Stepping MCTS from 600 to 800 and 1,600 simulations drove the death rate down to `0.38` (`A5`), `0.37` (`A6`), and `0.321` (`A8`, `72.7%` capped).
+3. **Why `A8` stalled — and how `Born-again A8 → A9` broke through (`0.321 → 0.244`):**
+   - By `A8`, the actor sat at the end of **6 stacked task-arithmetic extrapolations** ($\sum \alpha = 7.0$) on top of `A1`'s frozen BatchNorm statistics (`56.5%` eval/train BN agreement on crisis boards). Applying a 7th task vector (`A8c`, 2,400 sims) or a 120-move slide-window turn (`A8s`) on top of `A8` produced zero gain (`0.32`).
+   - Training a fresh 18×96 network from scratch (`born_again_A8_ep35`) on 12.9M states labeled by `A8`'s 8-symmetry ensemble reproduced `A8`'s single-pass death rate (`0.318` vs `0.321`), because the born-again corpus relabeled crisis states with search-free 8-view averages instead of MCTS search targets. However, it reset the weights to a clean $\alpha = 0$ checkpoint with fresh BatchNorm statistics (`84.2%` eval/train BN agreement).
+   - Fine-tuning `born_again_A8_ep35` on the 2,400-sim `A8c` crisis corpus and applying task arithmetic at $\alpha = 1.5$ (**`A9`**) immediately dropped deaths per 100k turns from `0.321` to **`0.244` (`-24.0%`)** across 4,000 games.
 
 ### What changed: the policy head
 
@@ -40,59 +51,57 @@ logit(s → d) = u(s)·w(d)/√k + a(s) + b(d)
 
 It is exactly equivariant under the 8 board symmetries and still outputs 81 × 81 = 6,561 move logits, so the C++ engine didn't need changes. It was trained from scratch with the same recipe on the same 12.5M search-labeled positions, plus a loss that masks illegal moves. The result is **2.9× the old head's score** at the same size, on par with the 4× larger 256-channel model.
 
-### Other lessons from the latest round
+### Symmetry, capacity, and value-head lessons
 
-- **Symmetry.** Averaging the old model over the 8 board symmetries at inference gave +50% with no training, so the model had not learned the symmetry. The training code's D4 augmentation rotated the board planes but not the 4 line-direction input channels, which made 6 of 8 views wrong. Fixed.
-- **A student reaches its labels' strength.** Students trained on the symmetry-averaged e40's moves plateau at ~21k, which is that teacher's own level. The original search labels take the same student to 42k. The next gain has to come from stronger labels.
-- **Fine-tuning a converged model is learning-rate drift.** Fine-tuning e40 on its *own* moves loses 9.6% at lr 5e-5, 5% at 2e-5, and nothing at 5e-6. Retraining from scratch works better.
-- **Search overrides are noisy.** A single 400-simulation search sometimes overrides the policy; an independent re-search reproduces only 37% of those overrides. Distilling them one by one churns more good moves than it fixes.
-- **Two silent bugs.**
-  - BatchNorm running variances above 65,504 overflowed to `inf` in the fp16 export. The exporter now rescales them exactly.
+- **8-view symmetry ensemble (`--tta 8`).** Averaging `A8`'s policy over the 8 $D_4$ board symmetries at inference cuts deaths by **38%** (`0.21` vs `0.34` deaths/100k turns over 25k turns) with no training. Earlier $D_4$ training augmentation rotated the board planes but not the 4 line-direction input channels (making 6 of 8 views wrong); fixing that LUT bug and adding $S_7$ color-permutation augmentation closed most of the gap.
+- **Built-in equivariance (`p4m` and `c7`) vs. standard ResNet (`18×96`).**
+  - **Color-equivariant slot networks (`alphatrain/model_c7.py`):** Maintaining 7 per-color feature slots with shared weights (DeepSets-style `slot_mean` + `slot_max` pooling) plus a color-free spatial stream dramatically outperforms plain CNNs in small-data/small-model regimes: a 4-block `c7` (`k12/s32 + smax`, `189k` params) achieves **`320` deaths/100k turns (`P50 = 513`)** after 3 epochs on 153k states, compared to **`1,214` deaths/100k (`P50 = 105`)** for a `446k`-param standard `4×72` CNN and **`1,110` (`P50 = 122`)** with exact $D_4 \times S_7$ input canonicalization (`--canon`). On the full 12.9M-state corpus with $8\times D_4 \times 5,040\times S_7$ augmentation, the plain `18×96` ResNet (`3.07M` params) overtakes `505k`-param `c7` after epoch 5 (`0.32` vs `0.49` at epoch 15–20) because spatial capacity binds.
+  - **Rotation-equivariant group convolutions (`alphatrain/model_p4m.py`):** Exact $D_4$ group convolutions (`p4m`) learn more slowly per epoch than standard convolutions at equal compute (`0.77` vs `0.44` deaths/100k at epoch 7–8).
+- **Anatomy of a death ("slides") and value-network unfreezing.**
+  - Strong actors rarely blunder on a single turn; deaths are **60–120-move slides** starting around 40–45 balls where the board gradually loses partial lines of $\ge 3$ same-color balls (`AUC 0.19–0.22`) before filling up.
+  - All value heads trained on the *frozen* policy backbone saturated at `~0.75–0.77` within-bin death AUC because the policy trunk discards survival-specific congestion features. Unfreezing the last 6 residual blocks (`--unfreeze-blocks 6 --cat-obs --augment`) jumps short-horizon ($H=25$) within-bin death AUC from **`0.773` to `0.845`** (`+18.7` pp in the `41–45` ball slide-onset bin), while $H=200$ AUC remains at `0.767` due to the intrinsic entropy of 200 turns (`600` random balls) of future spawns.
+- **Two silent bugs caught along the way:**
+  - BatchNorm running variances above 65,504 overflowed to `inf` in `fp16` TorchScript exports. Both `export_ts.py` and `export_policy_value.py` now rescale high-variance channels exactly before folding/exporting.
   - A zero-epoch warmup trained whole runs at 10% of the requested learning rate. Fixed, with a regression test.
 
 ## How it works
 
 - **Game engines:** Python (Numba) in `game/` and C++ in `alphatrain/inference_cpp/`, checked against each other with golden tests.
 - **Input:** 18 channels: 7 color planes, empty cells, next-ball positions, connected-component areas, and line potentials in 4 directions.
-- **Model:** a ResNet trunk plus the PAIR2 policy head. A separate **survival head** is trained on the frozen trunk to predict the probability of surviving the next H turns, at several horizons. Only the search uses it.
-- **Labels:** PUCT MCTS with 400–600 simulations, c_puct 1.5, Q weight 2.0, and the survival head as leaf value. The main source is **crisis mining**: play the policy greedily, then at each death rewind 15 and 30 moves and replay with search to find an escape.
-- **A1 (base model):** trained from scratch on Colab on 12.5M search-labeled positions.
-  - Loss: hard cross-entropy on the search's move, with illegal moves masked.
-  - D4 augmentation.
-  - Batch 32,768; lr 3e-3 with 1 warmup epoch, then cosine; 40 epochs.
-  - Command: `alphatrain/train_path_b.py --policy-head pair2 --legal-mask-loss`.
-- **Flywheel turn** (`scripts/flywheel_turn.sh`), a few hours on one Mac:
-  1. Record the actor's own games.
-  2. Train its survival head on the frozen trunk.
-  3. Mine its deaths with search.
-  4. Fine-tune on the crisis windows with BatchNorm frozen.
-  5. Sweep how far to push along the fine-tune's direction.
-  6. Gate the result.
-- **Evaluation:** greedy policy only, in the C++ engine (MPS, fp16), 1,000 games on the fixed seed bank, capped at 100,000 turns and judged by percentiles and the share of games reaching the cap. The policy plays alone; search is used only to make training labels.
-
-**Second turn (A2 → A3):** the same script from A2, with A2's own survival head. 2,240 deaths in 3,000 probes (760 probes survived 100k turns), 4,480 replays, then **A3 = A2 + 2 · (fine-tuned − A2)**: P10 39,270 and 55.4% of games reaching 100k turns, from A2's 16,085 and 25.3%.
-
-**Escaping trouble:** started from the 5,176 positions 30 and 15 moves before a weaker greedy player (A1) died, A1 itself escapes 54.7% / 27.1%, A2 63.7% / 34.1%, A3 68.0% / 36.6%. This improves much more slowly than survival in the model's own games: the models mostly learn to stay out of trouble.
-
-**Next:** keep turning the flywheel until P1 reaches the 100k-turn cap. Deaths are getting rare, so mining will need more probe seeds or a longer probe cap, and evals a higher turn cap.
+- **Models:** `alphatrain/model.py` (`PolicyNet` 18×96 ResNet + `PAIR2` policy head), `alphatrain/model_c7.py` ($S_7$ color-equivariant slot network), and `alphatrain/model_p4m.py` ($D_4$ group-equivariant network). A separate **survival head** (`ValueHead` or `SpatialValueHead` in `alphatrain/value_head.py`) predicts the probability of surviving the next $H \in \{25, 50, 100, 200\}$ turns for MCTS leaf evaluation.
+- **Labels:** PUCT MCTS (`600–2,400` simulations, `c_puct = 1.5`, `q_weight = 2.0`) in C++ (`build/mcts_crisis`) using the survival head as leaf evaluator. Crisis mining probes thousands of games and rewinds 15 and 30 moves (or 120 moves for slide windows) before each death to search for an escape.
+- **Flywheel turn** (`scripts/flywheel_turn.sh`):
+  1. Export the actor to TorchScript (`export_ts.py`).
+  2. Record 1,000 own games (capped at 100k turns) in C++ (`build/eval --record-dir ...`).
+  3. Train the survival head (`train_value_head.py`) and export the fused policy+value module (`export_policy_value.py`).
+  4. Mine crisis windows in C++ (`build/mcts_crisis` with 256 threads batching onto MPS `fp16`).
+  5. Build the training tensor and run anomaly checks (`anomaly_checks.py`).
+  6. Fine-tune for 4 epochs on MPS (`train_path_b.py --freeze-bn --lr 1e-4 --target-temperature 0.5`).
+  7. Sweep task-arithmetic $\alpha$ (`scripts/ta_sweep.sh`) and gate-evaluate in C++ (`eval_log.py`).
+- **Evaluation:** greedy single-pass policy in the C++ engine (`build/eval`, MPS `fp16` with folded BatchNorms), 2,000–4,000 games on fixed seed banks (`2,600,000–2,603,999`), capped at 100,000 turns.
 
 ## How we got here
 
-| Stage | Mean | Key change |
+| Stage | Metric | Key change |
 |---|---:|---|
-| Heuristic tournament (200 CPU rollouts per move) | 5,700 | Search over a hand-tuned heuristic |
-| pillar2z | 7,460 | First NN-driven AlphaZero loop (V12 corpus) |
-| pillar3a | 14,294 | Sharpened distillation targets (T = 0.25) |
-| pillar3b | 18,865 | V13 self-play corpus |
-| pillar3d_mC | 24,249 | Crisis-mining corrections |
-| pillar3f | 31,617 | Crisis fine-tune merged by task arithmetic |
-| pillar3k (11.9M params) | 43,390 | Decisiveness-weighted crisis distillation |
-| 18b96 e40 (3M params) | 14,296 | Small model trained from scratch on all data (12.5M positions) |
-| A1 (3M params) | 41,938 | PAIR2 policy head + legal-move mask |
-| A2 (3M params) | median 102,938 | First flywheel turn with the fixed search |
-| **A3 (3M params)** | **55.4% reach 100k turns** | **Second flywheel turn** |
+| Heuristic tournament (200 CPU rollouts per move) | 5,700 mean | Search over a hand-tuned heuristic |
+| pillar2z | 7,460 mean | First NN-driven AlphaZero loop (V12 corpus) |
+| pillar3a | 14,294 mean | Sharpened distillation targets (T = 0.25) |
+| pillar3b | 18,865 mean | V13 self-play corpus |
+| pillar3d_mC | 24,249 mean | Crisis-mining corrections |
+| pillar3f | 31,617 mean | Crisis fine-tune merged by task arithmetic |
+| pillar3k (11.9M params) | 43,390 mean | Decisiveness-weighted crisis distillation |
+| 18b96 e40 (3M params) | 14,296 mean | Small model trained from scratch on all data (12.5M positions) |
+| A1 (3M params) | 41,938 mean (1.0% cap) | PAIR2 policy head + legal-move mask |
+| A2 (3M params) | median 102,938 (25.3% cap) | First flywheel turn with the fixed neural-leaf search |
+| A3 (3M params) | 55.4% cap (0.59 / 100k) | Second flywheel turn (600 sims) |
+| A4 (3M params) | 61.1% cap (0.49 / 100k) | Third flywheel turn (600 sims) |
+| A5–A6 (3M params) | 69.1% cap (0.37 / 100k) | 256-thread GPU server batching (`6.1×` faster) + 800-sim teacher |
+| A7–A8 (3M params) | 72.7% cap (0.321 / 100k) | 1,600-sim crisis turn + 120-move slide-window turn |
+| Born-again A8 (3M params) | 72.8% cap (0.318 / 100k) | From-scratch reset on 12.9M 8-view-labeled states ($\alpha=0$, fresh BNs) |
+| **A9 (3M params)** | **78.3% cap (0.244 / 100k)** | **2,400-sim crisis task arithmetic ($\alpha=1.5$) on fresh Born-again A8 (`P25` capped)** |
 
-All rows after the heuristic are greedy policy play without search. Sample sizes and seed banks differ by row (100–5,000 games); HISTORY.md has each one. From A2 on, games are capped at 100,000 turns and compared by percentiles.
+All rows after the heuristic are greedy policy play without search. From A2 on, games are capped at 100,000 turns and compared by deaths per 100k turns, capped share, and lower-tail percentiles.
 
 ## Earlier discoveries
 
@@ -108,15 +117,18 @@ All rows after the heuristic are greedy policy play without search. Sample sizes
 game/                   Python game engine (Numba): board, pathfinding, line clears, spawns, RNG
 alphatrain/
   model.py              ResNet trunk and policy heads (abs / pair / pair2)
-  value_head.py         Survival head (trained on a frozen trunk; used by search)
-  train_path_b.py       Trainer: hard CE, legal-move mask, D4 augmentation
-  dataset.py            GPU-resident training tensors and augmentation
+  model_c7.py           S7 color-equivariant slot trunk + PAIR2 head
+  model_p4m.py          D4 rotation-equivariant group-conv trunk + PAIR2 head
+  model_variants.py     Unified loader for standard, c7, and p4m checkpoints
+  value_head.py         Survival heads (GAP ValueHead and SpatialValueHead)
+  train_path_b.py       Policy trainer: soft/hard CE, legal-move mask, D4 x S7 augmentation
+  dataset.py            GPU-resident training tensors and LUT augmentation
   observation.py        18-channel observation builder
   canonical.py          Canonical form under board symmetries x color relabeling
   inference_cpp/        C++/LibTorch engine: greedy eval, MCTS self-play, crisis mining, relabeling
-  scripts/              Corpus builders, diagnostics, eval_log.py
-  tests/                Unit tests
-  EVAL.md, HISTORY.md   Evaluation log and experiment history
+  scripts/              Corpus builders, value-head trainer, survival/hazard stats, eval_log.py
+  tests/                Unit and equivariance tests
+  EVAL.md, HISTORY.md   Evaluation log and experiment history (285 entries)
 rust_engine/            Rust game engine (earlier data generation)
 play_gui.py             Pygame GUI with AI hints and auto-play
 ```
@@ -129,13 +141,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Requires Python 3.10+, PyTorch 2.0+, and Numba. The C++ engine needs CMake and LibTorch. [`alphatrain/inference_cpp/README.md`](alphatrain/inference_cpp/README.md) covers the model export and build. A gate evaluation, with `--tta 8` for symmetry averaging:
+Requires Python 3.10+, PyTorch 2.0+, and Numba. The C++ engine needs CMake and LibTorch. [`alphatrain/inference_cpp/README.md`](alphatrain/inference_cpp/README.md) covers the model export and build. A standard 2,000-game gate evaluation (or add `--tta 8` for 8-symmetry averaging):
 
 ```bash
-cd alphatrain/inference_cpp
-./build/eval --model data/<model>_ts.pt --device mps --batch 500 --seed-start 2600000 --seed-end 2601000 --max-turns 100000
+python -m alphatrain.scripts.eval_log run --model alphatrain/data/ta_baA8c_e4_a1.5.pt --desc "A9 gate"
 ```
 
 ## Acknowledgments
 
-Built with significant assistance from [Claude Code](https://claude.ai/claude-code) (Anthropic) for code generation, experiment design, and analysis. AI peer review from Google's Gemini informed several architectural decisions. The project demonstrates human-AI collaboration on a complex ML problem: human domain expertise (game intuition, experimental direction, engineering/performance insights) combined with AI capabilities (code implementation, data analysis, systematic diagnosis).
+Built with significant assistance from [Claude Code](https://claude.ai/claude-code) (Anthropic) and Google's Gemini for code generation, experiment design, and analysis. The project demonstrates human-AI collaboration on a complex ML problem: human domain expertise (game intuition, experimental direction, engineering/performance insights) combined with AI capabilities (code implementation, data analysis, systematic diagnosis).

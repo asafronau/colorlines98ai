@@ -42,6 +42,13 @@ def slot_mean(h):
     return h.reshape(b, n, k * hh * ww).mean(1).reshape(b, k, hh, ww)
 
 
+def slot_max(h):
+    """Max over the color slots of (B, 7, K, 9, 9) -> (B, K, 9, 9), reduced on a 3-D view so single-color threats at
+    empty destination cells are not diluted by 1/7."""
+    b, n, k, hh, ww = h.shape
+    return h.reshape(b, n, k * hh * ww).amax(1).reshape(b, k, hh, ww)
+
+
 def own_slot(h, board):
     """Each cell's own color slot: sum_c h[:, c] * board[:, c] -> (B, K, 9, 9) (zero on empty cells), on 4-D views."""
     b, n, k, hh, ww = h.shape
@@ -84,9 +91,7 @@ class SlotBN(nn.Module):
 
     def forward(self, x):
         b, nk, hh, ww = x.shape
-        k = nk // NCOL
-        y = self.bn(x.reshape(b, NCOL, k, hh * ww).transpose(1, 2))        # (B, K, 7, HW): K channels
-        return y.transpose(1, 2).reshape(b, nk, hh, ww)
+        return self.bn(x.reshape(b * NCOL, nk // NCOL, hh, ww)).reshape(b, nk, hh, ww)
 
 
 def tied_bn(x, bnh, bnz, k):
@@ -157,20 +162,23 @@ class PolicyNetC7(nn.Module):
     """Color-equivariant trunk (slot width K, shared width S) + color-selecting PAIR2 head. logits (B, 6561),
     index = source * 81 + destination, exactly invariant to renaming the colors."""
 
-    def __init__(self, num_blocks=18, slot_channels=24, shared_channels=48, policy_channels=64, pair_dim=64):
+    def __init__(self, num_blocks=18, slot_channels=24, shared_channels=48, policy_channels=64, pair_dim=64,
+                 use_smax=False):
         super().__init__()
         k, s, p = slot_channels, shared_channels, policy_channels
         self.num_blocks, self.slot_channels, self.shared_channels = num_blocks, k, s
-        self.policy_channels, self.pair_dim = p, pair_dim
+        self.policy_channels, self.pair_dim, self.use_smax = p, pair_dim, bool(use_smax)
         self.slot_stem = SlotMix(SLOT_IN, len(SHARED_IN), k, s)
         self.stem_bnh, self.stem_bnz = SlotBN(k), nn.BatchNorm2d(s)
         self.blocks = nn.Sequential(*[SlotResBlock(k, s) for _ in range(num_blocks)])
         self.trunk_bnh, self.trunk_bnz = SlotBN(k), nn.BatchNorm2d(s)
-        # Head features: source = [own-color slot, z, mean slot]; destination for color c = [slot c, z, mean slot].
-        self.src_conv = nn.Conv2d(2 * k + s, p, 1, bias=False)
+        # Head features: source = [own-color slot, z, mean slot (, max slot)];
+        # destination for color c = [slot c, z, mean slot (, max slot)].
+        n_agg = 2 if self.use_smax else 1
+        self.src_conv = nn.Conv2d((1 + n_agg) * k + s, p, 1, bias=False)
         self.src_bn = nn.BatchNorm2d(p)
-        self.dst_conv_slot = nn.Conv2d(k, p, 1, bias=False)      # slot c <- slot c
-        self.dst_conv_rest = nn.Conv2d(k + s, p, 1, bias=False)  # slot c <- [z, mean slot]
+        self.dst_conv_slot = nn.Conv2d(k, p, 1, bias=False)              # slot c <- slot c
+        self.dst_conv_rest = nn.Conv2d(n_agg * k + s, p, 1, bias=False)  # slot c <- [z, mean slot (, max slot)]
         self.dst_bn = SlotBN(p)
         for name in ('pair', 'line', 'adj'):
             setattr(self, f'{name}_src', nn.Conv2d(p, pair_dim, 1))
@@ -206,27 +214,34 @@ class PolicyNetC7(nn.Module):
 
     def _invariant_features(self, t, board):
         h, z = self._slots(t)
+        if self.use_smax:
+            return torch.cat([own_slot(h, board), z, slot_mean(h), slot_max(h)], 1)
         return torch.cat([own_slot(h, board), z, slot_mean(h)], 1)   # own color slot (0 on empty cells), shared, mean
 
     def backbone_features(self, x):
-        """Color-invariant per-cell features (B, 2K+S, 9, 9) for frozen-backbone value heads."""
+        """Color-invariant per-cell features (B, (2 or 3)K+S, 9, 9) for frozen-backbone value heads."""
         return self._invariant_features(*self.trunk(x))
 
     def _dst_dense(self):
-        s = self.shared_channels
-        rest = self.dst_conv_rest.weight                              # input channels [z (S), mean slot (K)]
-        w = dense_slot_weight(self.dst_conv_slot.weight, rest[:, s:], rest[:, :s])
+        s, k = self.shared_channels, self.slot_channels
+        rest = self.dst_conv_rest.weight                              # input channels [z (S), mean slot (K) (, max slot (K))]
+        w = dense_slot_weight(self.dst_conv_slot.weight, rest[:, s:s + k], rest[:, :s])
+        if self.use_smax:
+            w_max = rest[:, s + k:].unsqueeze(0).expand(NCOL, -1, -1, -1, -1).reshape(NCOL * self.policy_channels, k, 1, 1)
+            w = torch.cat([w, w_max], 1)
         bias = None if self.dst_conv_rest.bias is None else self.dst_conv_rest.bias.repeat(NCOL)
         return w, bias
 
     def _policy(self, t, board):
         b, n, pdim = t.shape[0], NCOL, self.pair_dim
-        ps = F.relu(self.src_bn(self.src_conv(self._invariant_features(t, board))))             # (B, P, 9, 9)
+        inv = self._invariant_features(t, board)
+        ps = F.relu(self.src_bn(self.src_conv(inv)))                                            # (B, P, 9, 9)
+        t_dst = torch.cat([t, inv[:, -self.slot_channels:]], 1) if self.use_smax else t
         if self.dst_conv is not None:
-            pd = F.relu(self.dst_bn_merged(self.dst_conv(t)))
+            pd = F.relu(self.dst_bn_merged(self.dst_conv(t_dst)))
         else:
             w, bias = self._dst_dense()
-            pd = F.relu(self.dst_bn(F.conv2d(t, w, bias)))                                     # (B, 7P, 9, 9)
+            pd = F.relu(self.dst_bn(F.conv2d(t_dst, w, bias)))                                  # (B, 7P, 9, 9)
         pd = pd.reshape(b * n, -1, 9, 9)                                                        # (B*7, P, 9, 9)
         # Source mask per stacked color block: [color(s) = c] repeated over the pair_dim rows of block c.
         mask = board.reshape(b, n, 1, 81).repeat(1, 1, pdim, 1).reshape(b, n * pdim, 81)
@@ -302,7 +317,12 @@ def c7_kwargs_from_state(state):
     a = next(v for k, v in state.items() if k.endswith('slot_stem.a.weight'))
     g = next(v for k, v in state.items() if k.endswith('slot_stem.g.weight'))
     src = next(v for k, v in state.items() if k.endswith('pair_src.weight'))
+    sc = next(v for k, v in state.items() if k.endswith('src_conv.weight'))
     nb = sum(1 for k in state if k.endswith('.mix1.a.weight'))
     k = int(a.shape[0])
-    return dict(num_blocks=nb, slot_channels=k, shared_channels=int(g.shape[0]) - k,
-                policy_channels=int(src.shape[1]), pair_dim=int(src.shape[0]))
+    s = int(g.shape[0]) - k
+    kw = dict(num_blocks=nb, slot_channels=k, shared_channels=s,
+              policy_channels=int(src.shape[1]), pair_dim=int(src.shape[0]))
+    if int(sc.shape[1]) == 3 * k + s:
+        kw['use_smax'] = True
+    return kw

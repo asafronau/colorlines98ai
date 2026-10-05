@@ -127,3 +127,35 @@ def test_dense_slot_conv_is_the_deepsets_map():
         ref_z = conv(mean, g[5:, :k]) + conv(z, g[5:, k:])
     torch.testing.assert_close(out[:, :35].reshape(2, 7, 5, 9, 9), ref_h, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(out[:, 35:], ref_z, atol=1e-5, rtol=1e-5)
+
+
+def test_smax_invariance_and_bn_fold():
+    """PolicyNetC7 with use_smax=True is S7-invariant, round-trips state_dict, and folds BatchNorms."""
+    from alphatrain.inference_cpp.export_ts import fold_batchnorm
+    torch.manual_seed(2)
+    net = PolicyNetC7(num_blocks=2, slot_channels=4, shared_channels=6,
+                      policy_channels=8, pair_dim=8, use_smax=True)
+    with torch.no_grad():
+        for m in net.modules():
+            if isinstance(m, torch.nn.BatchNorm2d):
+                m.running_mean.uniform_(-0.2, 0.2); m.running_var.uniform_(0.5, 2.0)
+                m.weight.uniform_(0.5, 1.5); m.bias.uniform_(-0.2, 0.2)
+    net.train(False)
+    rng = np.random.default_rng(17)
+    board, nb = _random_state(rng, 0.5)
+    perms = [None] + [rng.permutation(7) for _ in range(4)]
+    obs = torch.from_numpy(np.stack([_obs(board, nb, p) for p in perms]))
+    with torch.no_grad():
+        ref = net(obs)
+        for i in range(1, len(perms)):
+            torch.testing.assert_close(ref[i], ref[0], atol=2e-5, rtol=1e-5)
+        kw = c7_kwargs_from_state(net.state_dict())
+        assert kw == dict(num_blocks=2, slot_channels=4, shared_channels=6,
+                          policy_channels=8, pair_dim=8, use_smax=True)
+        net2 = PolicyNetC7(**kw)
+        net2.load_state_dict(net.state_dict(), strict=True)
+        net2.train(False)
+        torch.testing.assert_close(net2(obs), ref, atol=1e-5, rtol=1e-5)
+        assert fold_batchnorm(net) == 1 + 2 + 2
+        torch.testing.assert_close(net(obs), ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(torch.jit.trace(net, obs[:1])(obs), ref, atol=1e-5, rtol=1e-5)

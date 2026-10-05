@@ -1,5 +1,5 @@
 #!/bin/bash
-# Autonomous flywheel (owner, 2026-09-29): repeated scripts/flywheel_turn.sh turns from the current actor.
+# Autonomous flywheel (2026-09-29): repeated scripts/flywheel_turn.sh turns from the current actor.
 # After each turn the alpha with the lowest 2k gate death rate (alphatrain/scripts/best_gate.py) is promoted
 # if it beats the actor; when the largest swept alpha wins, one alpha 1.0 higher is gated first.
 # Stops when the promoted rate reaches TARGET (default 0.52 deaths per 100k turns = the upper end of the

@@ -625,6 +625,8 @@ def main():
     p.add_argument('--device', default=None, help='cuda / mps / cpu (default: the best available)')
     p.add_argument('--slot-channels', type=int, default=24, help='c7: channels per color slot (x7 colors)')
     p.add_argument('--shared-channels', type=int, default=48, help='c7: color-free shared channels')
+    p.add_argument('--c7-smax', action='store_true',
+                   help='c7: include max-over-slots (slot_max) alongside slot_mean in source/destination head features')
     p.add_argument('--group-channels', type=int, default=16,
                    help='p4m: group channels per block (x8 orientations = actual conv width)')
     p.add_argument('--p4m-expand', type=int, default=64,
@@ -835,8 +837,10 @@ def main():
         if args.policy_head != 'pair2':
             raise SystemExit('--trunk c7 has its own color-selecting PAIR2 head: pass --policy-head pair2')
         model = PolicyNetC7(num_blocks=args.num_blocks, slot_channels=args.slot_channels,
-                            shared_channels=args.shared_channels, pair_dim=args.pair_dim).to(device)
-        arch = f"c7 {args.num_blocks}b x {args.slot_channels}k per color (x7) + {args.shared_channels}s shared"
+                            shared_channels=args.shared_channels, pair_dim=args.pair_dim,
+                            use_smax=args.c7_smax).to(device)
+        smax_str = " + smax" if args.c7_smax else ""
+        arch = f"c7 {args.num_blocks}b x {args.slot_channels}k per color (x7) + {args.shared_channels}s shared{smax_str}"
     else:
         model = AlphaTrainNet(num_blocks=args.num_blocks,
                               channels=args.channels, head=args.policy_head,

@@ -19,6 +19,8 @@ import numpy as np
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--before', type=int, required=True, help='moves before the death (<= the record tail)')
+    ap.add_argument('--cap', type=int, default=0,
+                    help='survival horizon in column 3 for anchor_search (default 0 = want + 100000 for mcts_crisis)')
     ap.add_argument('--out', required=True)
     ap.add_argument('dirs', nargs='+')
     a = ap.parse_args()
@@ -42,7 +44,8 @@ def main():
             nb = [(b['row'], b['col'], b['color']) for b in st['next_balls']][:3]
             nb += [(-1, -1, -1)] * (3 - len(nb))
             balls.append(int(np.count_nonzero(board)))
-            lines.append(' '.join(str(x) for x in [g['seed'], want, want + 100000, *board.tolist(),
+            col3 = a.cap if a.cap > 0 else want + 100000
+            lines.append(' '.join(str(x) for x in [g['seed'], want, col3, *board.tolist(),
                                                      *[v for b in nb for v in b]]))
     with open(a.out, 'w') as fo:
         fo.write('\n'.join(lines) + '\n')
