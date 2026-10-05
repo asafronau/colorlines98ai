@@ -25,7 +25,7 @@ CPP=alphatrain/inference_cpp
 D=alphatrain/data
 PY=.venv/bin/python
 PROBES=${PROBES:-3000}   # crisis probe seeds; raise as deaths get rare (e.g. PROBES=5000 scripts/flywheel_turn.sh ...)
-# Default mining source (owner, 2026-09-28): a WEAKER player's deaths, replayed by the actor's search. The
+# Default mining source (2026-09-28): a WEAKER player's deaths, replayed by the actor's search. The
 # actor's own deaths get rare as it nears infinite play; epoch-4 deaths teach the same (HISTORY 255).
 PROBE_MODEL=${PROBE_MODEL-data/scratch18b96_lr3e3_ckpts_epoch_4_ts.pt}   # empty = the actor probes itself
 PROBE_SLIP=${PROBE_SLIP:-0}   # per-move mouse-slip probability for the probe player

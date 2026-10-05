@@ -6582,3 +6582,49 @@ The MCTS comparison isn't perfectly apples-to-apples because pillar2y2's
      disjoint from A8 and born_again_A8_ep35, and P25 is capped at ~203.7k points on both banks. Periodic born-again
      resets followed by MCTS crisis task arithmetic cleanly prevent task-vector / BatchNorm saturation.
 
+286. **Flywheel turn A9 -> A10 (1,600 sims): 0.244 -> 0.215 [0.201, 0.231] deaths per 100k turns across 4,000
+     confirmation games (775 deaths vs 869 for A9 (-11.8%) and 1,094 for A8 (-33.0%), MTBF 464,080 turns, 80.6%
+     capped at 100k turns).** (2026-10-05) SIMS=1600 scripts/flywheel_turn.sh alphatrain/data/ta_baA8c_e4_a1.5.pt
+     A9 7000000 7100000 "0.5 1.0 1.5": own-games recording on fresh seeds 7,000,000-7,000,999 (1,000 games, cap
+     100k, EVAL.md row 205) achieved 0.21 [0.18, 0.24] per 100k turns (192 deaths, 80.8% capped, MTBF 470,683, P1
+     14,198, P5 53,794, P10 105,167, P25 203,836 capped); survival head trained 5 epochs on value_targets_A9.pt
+     (10.5M states, inner-val 0.0074, mean H=200 within-bin AUC 0.7688); mining 3,000 epoch-4 probes (seeds
+     7,100,000-7,102,999) -> 6,000 crisis windows at 1,600 sims in 13,508 s (29,029 evals/s) -> 247,745 rows
+     (A9_crisis_w45.pt; B 0/20,000; C: actor matches its 1,600-sim search on 73.06% of crisis rows); fine-tune 4
+     epochs (--freeze-bn, lr 1e-4, T 0.5, train 1.2644, val 1.5830 -> checkpoints/A9_ft/epoch_4.pt). Gates at cap
+     100k (EVAL.md rows 206-209):
+       cap 100k gate                      bank / seeds       games  deaths  per 100k turns         MTBF     capped     P1      P5      P10      P25
+       ta_A7_e4_a1.0 (A8)                 bank 1 (2.600M)    2,000     549  0.323 [0.296, 0.351]  309,782    72.55%   7,660  35,610   69,899  180,295
+       ta_baA8c_e4_a1.5 (A9)              bank 1 (2.600M)    2,000     430  0.241 [0.219, 0.265]  414,450    78.50%  10,733  47,060   91,342  203,730 (capped)
+       ta_A9_e4_a0.5 (new A10)            bank 1 (2.600M)    2,000     390  0.217 [0.196, 0.240]  460,720    80.50%  11,746  44,691   98,174  203,769 (capped)
+       ta_A9_e4_a1.0                      bank 1 (2.600M)    2,000     408  0.228 [0.206, 0.251]  439,051    79.60%   7,282  50,408  100,842  203,717 (capped)
+       ta_A9_e4_a1.5                      bank 1 (2.600M)    2,000     405  0.225 [0.203, 0.248]  445,071    79.75%  11,476  54,000  103,155  203,634 (capped)
+       ta_A9_e4_a0.5 (new A10)            bank 2 (2.602M)    2,000     385  0.214 [0.193, 0.236]  467,483    80.75%   9,078  50,149  103,231  203,781 (capped)
+       ta_A7_e4_a1.0 (A8)                 pooled (4k)        4,000   1,094  0.321 [0.302, 0.341]  311,557    72.65%
+       ta_baA8c_e4_a1.5 (A9)              pooled (4k)        4,000     869  0.244 [0.228, 0.261]  409,165    78.28%
+       ta_A9_e4_a0.5 (new A10)            pooled (4k)        4,000     775  0.215 [0.201, 0.231]  464,080    80.63%
+     Hazard by age (0-5k / 5-20k / 20-50k / 50-100k): bank 1 0.15 / 0.25 / 0.22 / 0.21, bank 2 0.22 / 0.21 / 0.21
+     / 0.22 (flat). New champion ta_A9_e4_a0.5.pt (A10) crosses 80% 100k-turn survival on both banks and matches
+     A8's 8-view ensemble rate (0.210) in a single forward pass.
+     **What helped (key lesson for future turns):**
+     (1) *Why the flywheel got stuck at A8 (0.321):* task arithmetic with frozen BatchNorms has a finite stacking
+         budget. By A8, 6 consecutive task vectors (sum of alphas = 7.0: 2.5 + 2.0 + 1.0 + 2.0 + 0.5 + 1.0) had been
+         extrapolated on top of A1's frozen BatchNorm running statistics (eval/train BN agreement on crisis boards
+         had degraded to 56.5%). Adding a 7th task vector (A8c at 2,400 sims, or A8s slide windows) onto that
+         saturated checkpoint produced no gain (0.323 -> 0.314).
+     (2) *Why born_again_A8_ep35 alone stayed at 0.318:* scripts/prep_born_again.sh (--mode tta) had overwritten all
+         MCTS crisis/slide targets with A8's search-free 8-view average and omitted A8c_crisis_w45.pt. However,
+         training from scratch reset the actor to a clean alpha = 0 checkpoint with fresh, calibrated BatchNorm
+         statistics (84.2% eval/train BN agreement).
+     (3) *The two-step breakthrough (0.321 -> 0.244 -> 0.215, -33.0% deaths):*
+         - Step A (Born-again reset + crisis task vector, A8 -> A9): applying the existing 2,400-sim A8c_crisis_w45
+           task vector at alpha = 1.5 onto the fresh born_again_A8_ep35 base immediately succeeded where A8 -> A8c
+           had failed, cutting 4k-game deaths from 1,094 to 869 (-24.0%, 0.244 per 100k turns).
+         - Step B (Standard flywheel turn on the fresh lineage, A9 -> A10): because A9 sat only 1 task vector
+           (alpha = 1.5) away from its born-again base, a 1,600-sim crisis flywheel turn on A9 merged at alpha = 0.5
+           (total stacked alpha = 2.0) cut deaths by another -11.8% (869 -> 775, 0.215 per 100k turns, -33.0% vs A8).
+     (4) *Repeatable recipe:* run 2-3 MCTS crisis task-arithmetic turns until marginal gains diminish (sum of
+         alphas ~ 2-3), then perform a from-scratch born-again reset (keeping MCTS crisis targets in the corpus via
+         --crisis-mode keep while labeling quiet own-game states with the current champion's 8-view ensemble) to
+         re-center weights and BatchNorms at alpha = 0 before starting the next crisis task-arithmetic cycle.
+

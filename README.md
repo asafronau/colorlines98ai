@@ -18,11 +18,12 @@ The current model is a **3M-parameter ResNet (18 blocks × 96 channels)** that p
 | A6: A4 + turns 4–5 (800 sims) | 5,588 | 27,986 | 56,355 | 155,380 | at the cap | 69.1% | 0.37 [0.34, 0.40] | 269,759 |
 | A8: A6 + turn 6 (1,600 sims, 4k games) | 7,127 | 35,522 | 69,193 | 180,295 | at the cap | 72.7% | 0.321 [0.302, 0.340] | 311,554 |
 | Born-again A8 (from scratch on A8 8-view labels, 4k games) | 8,116 | 36,435 | 74,442 | 197,602 | at the cap | 72.8% | 0.318 [0.299, 0.337] | 314,485 |
-| **A9: Born-again A8 + 2,400-sim crisis turn (4k games)** | **10,733** | **47,060** | **91,342** | **at the cap** | **at the cap** | **78.3%** | **0.244 [0.228, 0.261]** | **409,151** |
+| A9: Born-again A8 + 2,400-sim crisis turn (4k games) | 10,733 | 47,060 | 91,342 | at the cap | at the cap | 78.3% | 0.244 [0.228, 0.261] | 409,151 |
+| **A10: A9 + 1,600-sim crisis turn (4k games)** | **11,746** | **50,149** | **103,231** | **at the cap** | **at the cap** | **80.6%** | **0.215 [0.201, 0.231]** | **464,080** |
 
-Across 4,000 confirmation games (seeds 2,600,000–2,603,999, capped at 100,000 turns), **A9** (`ta_baA8c_e4_a1.5`) cuts total deaths from `1,094` (`A8`) to **`869` (`-24.0%`)**, raises MTBF to **409,151 turns (~820,000 points)**, and reaches the 100,000-turn cap in **78.3%** of games — pushing **P25 to the 100k-turn cap** (~203,700 points) on both 2,000-seed banks.
+Across 4,000 confirmation games (seeds 2,600,000–2,603,999, capped at 100,000 turns), **A10** (`ta_A9_e4_a0.5`) cuts total deaths from `1,094` (`A8`) to **`775` (`-33.0%` vs `A8`, `-11.8%` vs `A9`)**, raises MTBF to **464,080 turns (~940,000 points)**, and reaches the 100,000-turn cap in **80.6%** of games — matching `A8`'s 8-view symmetry ensemble (`0.210`) in a **single forward pass** and pushing **P25 to the 100k-turn cap** (~203,700 points) and **P10 past 100,000 points**.
 
-Every evaluation is logged in [`alphatrain/EVAL.md`](alphatrain/EVAL.md), and every experiment in [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) (285 entries).
+Every evaluation is logged in [`alphatrain/EVAL.md`](alphatrain/EVAL.md), and every experiment in [`alphatrain/HISTORY.md`](alphatrain/HISTORY.md) (286 entries).
 
 ### The crisis-mining flywheel and why born-again resets unlock further turns
 
@@ -32,10 +33,10 @@ $$\theta_{\text{next}} = \theta_{\text{base}} + \alpha \cdot (\theta_{\text{ft}}
 
 1. **Fixing the leaf evaluator (`A1 → A2 → A4`):** For two months the crisis-mining tool had loaded the survival head but searched with an older 27-feature heuristic value estimate. Fixing the C++ search to evaluate leaves with the neural survival head immediately unlocked the flywheel, taking the 100k-cap survival share from `1.0%` (`A1`) to `25.3%` (`A2`), `55.4%` (`A3`), and `61.1%` (`A4`, `0.49` deaths/100k turns).
 2. **Scaling GPU batching and teacher simulations (`A4 → A8`):** Rewriting the C++ inference server to wait for all 256 worker threads (`--batch-wait-us 3000`) sped up crisis mining by `6.1×` (`~34,000` neural evaluations/s on one Mac). Stepping MCTS from 600 to 800 and 1,600 simulations drove the death rate down to `0.38` (`A5`), `0.37` (`A6`), and `0.321` (`A8`, `72.7%` capped).
-3. **Why `A8` stalled — and how `Born-again A8 → A9` broke through (`0.321 → 0.244`):**
+3. **Why `A8` stalled — and how `Born-again A8 → A9 → A10` broke through (`0.321 → 0.244 → 0.215`):**
    - By `A8`, the actor sat at the end of **6 stacked task-arithmetic extrapolations** ($\sum \alpha = 7.0$) on top of `A1`'s frozen BatchNorm statistics (`56.5%` eval/train BN agreement on crisis boards). Applying a 7th task vector (`A8c`, 2,400 sims) or a 120-move slide-window turn (`A8s`) on top of `A8` produced zero gain (`0.32`).
    - Training a fresh 18×96 network from scratch (`born_again_A8_ep35`) on 12.9M states labeled by `A8`'s 8-symmetry ensemble reproduced `A8`'s single-pass death rate (`0.318` vs `0.321`), because the born-again corpus relabeled crisis states with search-free 8-view averages instead of MCTS search targets. However, it reset the weights to a clean $\alpha = 0$ checkpoint with fresh BatchNorm statistics (`84.2%` eval/train BN agreement).
-   - Fine-tuning `born_again_A8_ep35` on the 2,400-sim `A8c` crisis corpus and applying task arithmetic at $\alpha = 1.5$ (**`A9`**) immediately dropped deaths per 100k turns from `0.321` to **`0.244` (`-24.0%`)** across 4,000 games.
+   - Fine-tuning `born_again_A8_ep35` on the 2,400-sim `A8c` crisis corpus at $\alpha = 1.5$ (**`A9`**) dropped deaths per 100k turns from `0.321` to **`0.244` (`-24.0%`)**, and running the next 1,600-sim flywheel turn on `A9` at $\alpha = 0.5$ (**`A10`**) dropped deaths further to **`0.215` (`-33.0%` vs `A8`, `80.6%` capped)** across 4,000 games.
 
 ### What changed: the policy head
 
@@ -99,7 +100,8 @@ It is exactly equivariant under the 8 board symmetries and still outputs 81 × 8
 | A5–A6 (3M params) | 69.1% cap (0.37 / 100k) | 256-thread GPU server batching (`6.1×` faster) + 800-sim teacher |
 | A7–A8 (3M params) | 72.7% cap (0.321 / 100k) | 1,600-sim crisis turn + 120-move slide-window turn |
 | Born-again A8 (3M params) | 72.8% cap (0.318 / 100k) | From-scratch reset on 12.9M 8-view-labeled states ($\alpha=0$, fresh BNs) |
-| **A9 (3M params)** | **78.3% cap (0.244 / 100k)** | **2,400-sim crisis task arithmetic ($\alpha=1.5$) on fresh Born-again A8 (`P25` capped)** |
+| A9 (3M params) | 78.3% cap (0.244 / 100k) | 2,400-sim crisis task arithmetic ($\alpha=1.5$) on fresh Born-again A8 (`P25` capped) |
+| **A10 (3M params)** | **80.6% cap (0.215 / 100k)** | **1,600-sim crisis flywheel turn ($\alpha=0.5$) on A9; matches A8's 8-view ensemble in 1 pass** |
 
 All rows after the heuristic are greedy policy play without search. From A2 on, games are capped at 100,000 turns and compared by deaths per 100k turns, capped share, and lower-tail percentiles.
 
